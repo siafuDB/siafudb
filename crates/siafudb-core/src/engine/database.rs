@@ -151,10 +151,10 @@ impl SiafuDB {
 
         let rows_affected = result.rows.len();
 
-        if self.mutation_tracking {
-            if let Ok(mut log) = self.change_log.lock() {
-                log.append(query.to_string(), rows_affected);
-            }
+        if self.mutation_tracking
+            && let Ok(mut log) = self.change_log.lock()
+        {
+            log.append(query.to_string(), rows_affected);
         }
 
         Ok(ExecuteResult { rows_affected })
@@ -201,6 +201,15 @@ impl SiafuDB {
     /// this ID is how the protocol tracks which instance made which change.
     pub fn instance_id(&self) -> Uuid {
         self.instance_id
+    }
+
+    /// Path to the database file on disk, if this instance is persistent.
+    ///
+    /// Returns `None` for in-memory databases. Useful for diagnostics
+    /// and for callers that need to back up, copy, or report the file
+    /// location.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Enable or disable mutation tracking.
