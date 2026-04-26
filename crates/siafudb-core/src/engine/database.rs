@@ -12,10 +12,8 @@
 // - Cryptographic identity (every node knows where it came from)
 // - Multiple access patterns (graph, document, KV, time-series)
 
-use crate::fragment::{Fragment, FragmentConfig};
-use crate::identity::NodeIdentity;
 use crate::error::SiafuError;
-use serde::{Deserialize, Serialize};
+use crate::fragment::Fragment;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -143,7 +141,7 @@ impl SiafuDB {
         // For now, we just execute and return.
 
         Ok(ExecuteResult {
-            rows_affected: result.rows().count(),
+            rows_affected: result.rows.len(),
         })
     }
 
@@ -155,7 +153,9 @@ impl SiafuDB {
         let result = self.engine.execute(query)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
 
-        let rows: Vec<Vec<serde_json::Value>> = result.rows()
+        let rows: Vec<Vec<serde_json::Value>> = result
+            .rows
+            .iter()
             .map(|row| {
                 row.iter()
                     .map(|val| serde_json::Value::String(format!("{:?}", val)))
@@ -164,7 +164,7 @@ impl SiafuDB {
             .collect();
 
         Ok(QueryResult {
-            columns: vec![], // TODO: Extract column names from GrafeoDB result
+            columns: result.columns.clone(),
             rows,
         })
     }
