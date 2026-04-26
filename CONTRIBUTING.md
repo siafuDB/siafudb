@@ -54,15 +54,19 @@ All tests must pass before submitting a pull request.
 
 1. **Create an issue first** for anything beyond trivial fixes. This lets the community discuss the approach before you invest time coding.
 2. **Fork the repository** and create a feature branch from `main`:
+
    ```bash
    git checkout -b feature/your-feature-name
    ```
+
 3. **Write tests** for your changes. New features require tests. Bug fixes require a test that would have caught the bug.
 4. **Follow the code style** (see below).
 5. **Ensure all tests pass:**
+
    ```bash
    cargo test
    ```
+
 6. **Commit with a clear message** and sign off (see below).
 7. **Push to your fork** and submit a pull request against `main`.
 
@@ -155,28 +159,28 @@ The most architecturally significant feature in development. The protocol that e
 
 Start with the [Graph Sync Protocol design discussion](https://github.com/nyuchi/siafudb/discussions).
 
-**Edge & WASM**
+### Edge & WASM
 
 - WASM binary size and performance optimisation for edge runtimes (Cloudflare, Deno, Fastly, Vercel, browser, any WASM environment)
 - Browser-based graph engine improvements
 - Edge subgraph caching with configurable scoping rules
 - Memory optimisation for constrained runtimes
 
-**Web3 & Pod**
+### Web3 & Pod
 
 - Decentralised pod storage engine design
 - Cryptographic identity binding for pod graphs
 - Pod replication across decentralised networks
 - Heritage graph transformation (PII stripping, anonymisation on lifecycle transitions)
 
-**Native Platform Bindings**
+### Native Platform Bindings
 
 - Swift/SwiftUI binding (iOS) via Rust FFI
 - Kotlin/JVM binding (Android) improvements
 - ArkTS/ArkUI binding (HarmonyOS) via N-API
 - React Native and Flutter bridges
 
-**Always Welcome**
+### Always Welcome
 
 - Documentation — tutorials, getting started guides, API reference, architecture docs
 - Testing — expanded test coverage, edge cases, fuzzing, benchmarks
@@ -238,7 +242,7 @@ Major architectural decisions (new extensions, breaking API changes, new support
 
 - **[GitHub Discussions](https://github.com/nyuchi/siafudb/discussions)** — Questions, ideas, design discussions
 - **[GitHub Issues](https://github.com/nyuchi/siafudb/issues)** — Bug reports, feature requests, task tracking
-- **conduct@siafudb.org** — Code of Conduct concerns
+- **`conduct@siafudb.org`** — Code of Conduct concerns
 
 Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before participating in any community space.
 

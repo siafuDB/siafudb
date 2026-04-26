@@ -438,7 +438,7 @@ In the repository settings:
 
 **Description:** Embedded property graph database for device, edge, and Web3. Forked from KuzuDB v0.11.3, relicensed Apache 2.0 — never to change. Cypher queries, vector search, WASM-ready. Named after the African army ant — small, embedded, but the ecosystem collapses without it. Maintained by Nyuchi Africa.
 
-**Website:** https://siafudb.org
+**Website:** <https://siafudb.org>
 
 ## Step 8: Create initial GitHub Issues
 

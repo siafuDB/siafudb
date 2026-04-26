@@ -44,7 +44,7 @@ Looking forward to the conversation.
 
 Bryan Fawcett
 Founder & CEO, Nyuchi Africa
-bryan@nyuchi.com
+<bryan@nyuchi.com>
 github.com/nyuchi/siafudb
 
 ---
@@ -94,7 +94,7 @@ Happy to answer questions, share our architectural thinking, or just connect wit
 
 Bryan Fawcett
 Founder & CEO, Nyuchi Africa
-bryan@nyuchi.com
+<bryan@nyuchi.com>
 github.com/nyuchi/siafudb
 siafudb.org
 

@@ -38,7 +38,11 @@ fn reads_do_not_append() {
     db.query("MATCH (p:Person) RETURN p.name").unwrap();
 
     let log = db.change_log();
-    assert_eq!(log.lock().unwrap().len(), 1, "only the CREATE should be logged");
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "only the CREATE should be logged"
+    );
 }
 
 #[test]

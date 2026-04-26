@@ -154,9 +154,9 @@ impl Fragment {
             kind: FragmentKind::Network,
             owner_identity: None,
             config: FragmentConfig {
-                sync_push: false, // Network fragments don't author data
-                sync_pull: true,  // They receive data from the platform
-                reference_ttl_seconds: Some(24 * 3600), // 24 hours
+                sync_push: false,                           // Network fragments don't author data
+                sync_pull: true,                            // They receive data from the platform
+                reference_ttl_seconds: Some(24 * 3600),     // 24 hours
                 max_storage_bytes: Some(512 * 1024 * 1024), // 512MB cap
             },
         }

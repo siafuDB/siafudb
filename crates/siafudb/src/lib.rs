@@ -5,8 +5,8 @@
 // can `use siafudb::SiafuDB` without juggling sub-crates.
 
 pub use siafudb_core::{
-    DeploymentProfile, Fragment, FragmentConfig, FragmentKind, NodeAuthority, SiafuConfig,
-    SiafuDB, SiafuError,
+    DeploymentProfile, Fragment, FragmentConfig, FragmentKind, NodeAuthority, SiafuConfig, SiafuDB,
+    SiafuError,
 };
 
 pub mod access {

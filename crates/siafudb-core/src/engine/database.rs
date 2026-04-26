@@ -165,7 +165,9 @@ impl SiafuDB {
     /// This is the read path. No mutation tracking, no sync implications.
     /// Just query the local fragment and return results.
     pub fn query(&self, query: &str) -> Result<QueryResult, SiafuError> {
-        let result = self.engine.execute(query)
+        let result = self
+            .engine
+            .execute(query)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
 
         let rows: Vec<Vec<serde_json::Value>> = result
@@ -316,11 +318,7 @@ impl SiafuDB {
     }
 
     /// Find documents in a collection matching a filter.
-    pub fn doc_find(
-        &self,
-        collection: &str,
-        filter: &str,
-    ) -> Result<QueryResult, SiafuError> {
+    pub fn doc_find(&self, collection: &str, filter: &str) -> Result<QueryResult, SiafuError> {
         let query = if filter.is_empty() {
             format!("MATCH (d:_{}) RETURN d", collection)
         } else {

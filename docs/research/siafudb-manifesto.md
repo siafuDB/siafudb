@@ -4,7 +4,7 @@
 
 ---
 
-## I.
+## I
 
 The relational database was built for a world that processed reality in sequential steps. Input, validate, store, retrieve, output. One row at a time. One transaction at a time. One table at a time. It mirrors how early computing understood problems: linearly, procedurally, step by step. And that was correct for the era — when computers were accounting machines, when the digital world was a ledger of transactions, when data meant numbers in columns.
 
@@ -16,7 +16,7 @@ That premise is wrong.
 
 ---
 
-## II.
+## II
 
 When you walk into a room, you don't query a table. You don't send a GET request to your memory and wait for a JSON response. You perceive — instantly, simultaneously, contextually. You recognise Tatenda, which activates your memory of your last conversation, which connects to the project you were discussing, which connects to the deadline, which connects to the emotion you felt about it. All in milliseconds. All through association. All through relationships.
 
@@ -28,7 +28,7 @@ That second question is the one that matters. For AI. For the Digital Twin. For 
 
 ---
 
-## III.
+## III
 
 The API cannot carry this either. An API is a request — a single, isolated, contextless question fired at a single, isolated, contextless endpoint. "Give me user 47's profile." "Give me the events near these coordinates." "Give me the recommendations for this user." Three requests. Three round trips. Three separate answers with no awareness of each other.
 
@@ -38,7 +38,7 @@ This is what intelligence looks like. Not request-response. Not client-server. N
 
 ---
 
-## IV.
+## IV
 
 Two pieces of infrastructure replace the two pillars of the old world.
 
@@ -52,7 +52,7 @@ Together, they are the foundation of a new computing paradigm — one where inte
 
 ---
 
-## V.
+## V
 
 The Graph Sync Protocol — SiafuDB's signature capability — does not use APIs. It does not send HTTP requests. It propagates graph mutations through NTL signals. When you update your profile on your phone, a VERTEX_UPDATED signal propagates through the NTL synapse connecting your device to the network. The signal carries the graph change log — the mutation, the causal ordering, the conflict resolution metadata. The signal reaches your pod, your edge node, the platform graph — not because it was addressed to an endpoint, but because the synapse topology routes it there.
 
@@ -62,7 +62,7 @@ This is how the brain works. A memory doesn't push-notify other memories. A sign
 
 ---
 
-## VI.
+## VI
 
 The relational database asked: "What is the structure of this data?"
 
@@ -78,7 +78,7 @@ The new architecture: a SiafuDB instance holds a graph that represents reality a
 
 ---
 
-## VII.
+## VII
 
 This is not incremental improvement. This is not "a better API" or "a faster database." This is a paradigm shift — the same magnitude of shift as the move from mainframes to personal computers, or from desktop software to the web.
 
@@ -96,7 +96,7 @@ The era beginning now is defined by:
 
 ---
 
-## VIII.
+## VIII
 
 SiafuDB is named after the African army ant — _siafu_ in Swahili. Small. Embedded. Unnoticed. But the ecosystem collapses without it. Millions of instances, each holding a piece of the graph, each connected through NTL synapses, collectively forming the intelligence infrastructure that makes distributed, context-aware, sovereign computing possible.
 
@@ -110,7 +110,7 @@ SiafuDB and NTL are the tools we need for the next century. The graph stores rea
 
 ---
 
-## IX.
+## IX
 
 Build what you need. The graph is yours. The signals are yours. The network is yours.
 

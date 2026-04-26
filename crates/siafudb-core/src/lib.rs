@@ -5,7 +5,7 @@ pub mod fragment;
 pub mod identity;
 
 pub use changelog::{ChangeLog, ChangeLogEntry, SharedChangeLog};
-pub use engine::database::SiafuDB;
 pub use engine::config::{DeploymentProfile, SiafuConfig};
+pub use engine::database::SiafuDB;
 pub use error::SiafuError;
 pub use fragment::{Fragment, FragmentConfig, FragmentKind, NodeAuthority};
