@@ -1,0 +1,279 @@
+---
+title: "01 — SiafuDB Architecture"
+description: "The complete architectural picture — paradigm, fragment model, engine foundation, Graph Sync Protocol, transport architecture."
+---
+
+> The complete architectural picture.
+
+**Status:** WORKING DOCUMENT
+**Decision Owner:** Bryan Fawcett, Founder & CEO, Nyuchi Africa
+**Governance:** Mukoko Foundation (Apache 2.0)
+
+---
+
+## The Paradigm
+
+SiafuDB, NTL, and the Graph Sync Protocol form a computing paradigm modelled on the human nervous system.
+
+**AI is the brain.** Reasons, decides, learns. Runs on device, at the edge, in the cloud.
+
+**SiafuDB is the memory.** Holds context — on every device, at every edge, in every Web3 pod. Distributed, sovereign, local-first. Graph-native. Replaces SQLite.
+
+**NTL is the nervous system.** Carries signals between nodes. Not request-response — neural signal propagation through weighted, learning synapses. Built on actual neural network infrastructure, leveraging hardware neural engines on modern devices.
+
+**The Graph Sync Protocol is how memory stays coherent.** Defines mutations, transformations, conflict resolution. Uses NTL as its neural transport and inherits NTL's machine learning capabilities — the sync protocol learns routing patterns, adapts to traffic, and improves over time.
+
+**Machine learning is not a feature bolted on top. It is the infrastructure itself.** NTL applies the same principles as PyTorch and TensorFlow — nodes, weighted connections, forward propagation, transformation at junctions, learning — but built as part of the transfer layer. The network that carries SiafuDB's sync traffic is a neural network. It learns from the data it carries. On devices with hardware neural engines (every modern phone), the routing computation runs on dedicated neural silicon.
+
+---
+
+## SiafuDB Replaces SQLite
+
+Every app needs a local database. SiafuDB is the graph-native alternative to SQLite: same simplicity (one file, zero config, embed in any app), fundamentally different capability.
+
+The graph is the upgrade path, not the entry requirement.
+
+### Access Patterns (All Graph Underneath)
+
+| Pattern | API | Underneath |
+|---------|-----|-----------|
+| Graph | Cypher / GQL | Native graph operations |
+| Key-Value | `kv_set()` / `kv_get()` | `(:_KV {key, value})` |
+| Document | `doc_insert()` / `doc_find()` | Node with label = collection |
+| Time-Series | `ts_append()` / `ts_range()` | Timestamped nodes + NEXT edges |
+| Vector | Similarity queries | HNSW index on embeddings |
+
+### Deployment Profiles
+
+| Profile | Environment | Memory | Use Case |
+|---------|-------------|--------|----------|
+| Mobile | Phone, tablet | 64 MB | Personal graph, offline AI |
+| Edge | WASM, DOs | 32 MB | Regional cache |
+| Honeycomb Node | Opted-in device | 128 MB | Network fragment hosting |
+| Server | Dev/test | 1 GB | Development |
+| Cloud | Platform | System | Full knowledge graph |
+
+---
+
+## The Fragment Model
+
+Every SiafuDB instance is a fragment — a meaningful subset of a larger graph.
+
+### Physical Separation: Personal vs Network
+
+On a user's device, two completely isolated SiafuDB instances:
+
+**Personal** — sovereign data. Messages, preferences, history. Encrypted with user's keys. Physically isolated from network data.
+
+**Network** — Honeycomb fragment. Platform data hosted in exchange for tokens. Only present when user opts in. Compromise reveals zero personal data.
+
+### Authority Model
+
+| Authority | Meaning | Sync Behaviour |
+|-----------|---------|---------------|
+| Authoritative | Source of truth here | Push outward |
+| Referenced | Source of truth elsewhere | Pull inward |
+| Local | No sync | Stays local |
+
+---
+
+## The Engine Foundation
+
+SiafuDB's engine is built on three open-source projects. Each contributes something different. No code is copied — the implementation is original Rust. The intellectual lineage is credited openly.
+
+### GrafeoDB (Apache 2.0, Rust) — The Core
+
+GrafeoDB is SiafuDB's core engine, taken as a Cargo dependency (not a fork). It provides:
+
+- **Pure Rust engine** — no C dependencies. Memory-safe, WASM-compilable, embeddable everywhere.
+- **Six query languages** — GQL (ISO standard), Cypher, Gremlin, GraphQL, SPARQL, SQL/PGQ. Each parsed to AST, translated to a unified execution plan. Developers use whichever language fits their context.
+- **ACID transactions** — MVCC-based snapshot isolation. Data integrity under concurrent access.
+- **Dual data model** — Labeled Property Graph (LPG) for application data + RDF for semantic web. Both in one engine.
+- **HNSW vector search** — scalar, binary, and product quantization (8-32x compression). Combined graph traversal with semantic similarity in one query.
+- **BM25 full-text search** — built-in with Unicode tokenization.
+- **Change Data Capture** — the foundation for the Graph Sync Protocol's mutation tracking.
+- **Multi-language bindings** — Python (PyO3), Node.js (napi-rs), Go (CGO), C (FFI), C# (.NET P/Invoke), Dart (dart:ffi), WebAssembly (wasm-bindgen).
+- **Embedded and server modes** — same engine, different deployment. SiafuDB on a phone and SiafuDB on a server run the same code.
+- **Bolt v5.x wire protocol** — Neo4j driver compatibility. Existing Neo4j clients work without modification.
+
+**Relationship model:** SiafuDB depends on GrafeoDB as a library. SiafuDB contributes bug fixes and improvements upstream. If the dependency relationship proves insufficient, SiafuDB can fork. The dependency model gives maximum velocity now with fork as a fallback.
+
+### KuzuDB / LadybugDB (MIT, C++) — The Research
+
+KuzuDB was an embedded graph database from the University of Waterloo, archived when Apple acquired Kùzu Inc. LadybugDB is the community fork. The C++ code is not used in SiafuDB. The published academic research is re-implemented in Rust:
+
+- **Worst-Case Optimal Joins (WCOJ)** — 374x faster than Neo4j on path queries. Guarantees optimal worst-case performance for cyclic multi-way joins. The most important algorithmic innovation in embedded graph databases in the last decade.
+- **Factorised execution** — 50-100x compression of intermediate results for multi-hop queries. Critical for constrained environments (phones, edge) where memory is limited.
+- **Morsel-driven parallelism** — work divided into small morsels distributed across CPU cores. Near-linear scaling with core count on modern multi-core devices (including ARM mobile CPUs).
+- **Columnar storage with SIMD** — graph data in columnar format enabling SIMD vectorised operations. Multiple values processed per CPU instruction.
+- **Single-file database format** — one file per database. Easy backup, replication, encryption. Your entire graph is one file.
+- **Typed schema enforcement** — schemas declared at creation time, enforced at write time. Prevents schema drift across millions of devices.
+
+### ArcadeDB (Apache 2.0, Java) — The Design Influence
+
+ArcadeDB is Java/JVM, so no code is usable in Rust. The design principles inform SiafuDB:
+
+- **Native multi-model** — graph, document, KV, vector, time-series in one engine without translation layers. This is why SiafuDB handles all access patterns natively rather than requiring SQLite alongside the graph.
+- **O(1) graph traversal** — edges as direct pointers, not index lookups. Index-free adjacency in Rust where the ownership model prevents dangling pointers.
+- **Graph algorithms** — PageRank, shortest path, community detection, centrality. On-device intelligence without network calls.
+- **Time-series compression** — Gorilla, Delta-of-Delta, Simple-8b achieving 0.4 bytes per sample. Native time-series eliminates separate databases for activity patterns and sensor data.
+- **MCP server** — AI agents query the database through the standardised Model Context Protocol. SiafuDB includes MCP as a first-class feature.
+
+### What SiafuDB Adds (Original to This Project)
+
+On top of these foundations, SiafuDB adds capabilities that no other project offers:
+
+- **Fragment model** — the database knows it's part of a larger graph. Authority, reference, and local semantics.
+- **Cryptographic identity** — every node has provenance tied to its authoritative source.
+- **Graph Sync Protocol** — bidirectional sync with privacy transformations. GSPA and GSPN transport.
+- **NTL integration** — neural signal transport with ML routing and hardware NPU acceleration.
+- **Web3 pod storage** — sovereign personal data with cryptographic identity binding.
+- **Edge deployment profiles** — WASM builds optimised for constrained runtimes.
+
+---
+
+## The Graph Sync Protocol
+
+The sync protocol lives inside the SiafuDB codebase. It handles three concerns:
+
+### Mutation Model
+
+Every graph change is a `Mutation` with a UUID, source identity, operation type (vertex/edge CRUD), vector clock for causal ordering, and optional cryptographic signature. Mutations group into atomic `MutationBatch` structures.
+
+### Transformation Layer
+
+A single mutation produces different projections for different destinations:
+
+| Destination | Receives | Transform |
+|-------------|----------|-----------|
+| User's pod | Full data | None |
+| Platform | Public, PII stripped | `StripPII`, `FilterByLabel` |
+| Analytics | Anonymised | `Anonymise` |
+| Content owner | Anonymous signal | `Anonymise`, `Aggregate` |
+
+Where transformation happens depends on transport:
+- **GSPA (API):** SiafuDB applies transforms before sending
+- **GSPN (NTL):** NTL synapses apply transforms at the network level
+
+### Conflict Resolution
+
+Vector clocks detect concurrent mutations. Strategies: LastWriterWins (personal devices), MergeProperties (collaborative), RejectIncoming (authoritative fragments), AcceptIncoming (caches).
+
+---
+
+## Transport Architecture
+
+### GSPA — Graph Sync Protocol with API
+
+Traditional transport. Channels (point-to-point pipes). Serialisation required. Connections maintained. Ships first.
+
+Transports: HTTP, gRPC, WebSocket, Kafka, Local TCP, In-Process (Rust channel).
+
+### GSPN — Graph Sync Protocol with NTL
+
+Neural transport. Signals (not channels). No destination specified — topology routes. Zero-copy possible. Fire-and-forget. Transformations at synapses, not in SiafuDB.
+
+**GSPN inherits NTL's machine learning capabilities.** The sync protocol's routing isn't hardcoded — it's learned by the neural network that underlies NTL. Frequently synced paths strengthen. Unused paths weaken. The routing model can run on hardware neural engines, making routing decisions in nanoseconds with minimal battery impact.
+
+**GSPN requires IPv6 for cross-network signal propagation.** IPv4 NAT breaks the peer-to-peer signal model. See NTL research docs for the full analysis.
+
+### How SiafuDB Uses NTL
+
+SiafuDB treats NTL as a dependency for GSPN transport. The integration points:
+
+1. **Signal emission:** When the sync engine has mutations to propagate, it emits a signal into the local NTL node. SiafuDB provides the data; NTL handles routing, transformation, and delivery.
+
+2. **Signal reception:** When signals arrive from the NTL network, SiafuDB's sync engine receives them (already transformed by NTL synapses) and applies them to the local graph.
+
+3. **Routing intelligence:** NTL's routing model (which may run on hardware neural engines) determines where signals go. SiafuDB doesn't make routing decisions — it emits signals and the neural network routes them.
+
+4. **Learning feedback:** The sync protocol provides delivery success/failure feedback to NTL, which uses it as training signal for the routing model. Successful deliveries strengthen synapses. Failures weaken them. The sync protocol is the training loop for NTL's routing network.
+
+SiafuDB does not implement the signal primitive, the neural routing, or the hardware acceleration. These live in NTL's codebase (`nyuchi/ntl`). SiafuDB depends on NTL as a library when GSPN is enabled. When GSPN is not available (GSPA-only deployments), SiafuDB has no NTL dependency.
+
+---
+
+## Machine Learning in the Stack
+
+Machine learning is not a feature of one component. It is the operating principle of the entire stack.
+
+| Layer | What Learns | How |
+|-------|-------------|-----|
+| AI (brain) | Reasoning and decision-making | PyTorch/TF trained models |
+| NTL (nervous system) | Signal routing and delivery | Neural network routing model with Hebbian + gradient learning |
+| Graph Sync Protocol | Traffic patterns and sync efficiency | Feedback from delivery success/failure trains NTL's routing model |
+| SiafuDB (memory) | Does not learn independently | Holds what the other layers learn from and about |
+
+The Graph Sync Protocol is the training loop for NTL's neural routing. Every sync cycle produces training data. Every successful delivery is a positive training signal. Every failure is a negative signal. The routing model learns from this feedback and improves over time.
+
+On devices with hardware neural engines, the routing model runs on dedicated silicon — making routing decisions in nanoseconds at a fraction of the CPU's power consumption. SiafuDB benefits from this acceleration without implementing it. The acceleration lives in NTL.
+
+---
+
+## Data Flow: Mukoko Reference Deployment
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Amara's Phone                                           │
+│  ┌──────────────────┐  ┌──────────────────┐              │
+│  │ SiafuDB           │  │ SiafuDB          │              │
+│  │ (Personal)        │  │ (Honeycomb Node) │              │
+│  └────────┬──────────┘  └────────┬─────────┘              │
+│           │ Internal               │ GSPA / GSPN           │
+│           │ (channel/signal)       │                       │
+│  ┌────────▼────────────────────────▼─────────────────┐    │
+│  │  NTL Node (local)                                 │    │
+│  │  Routing model: neural network (runs on NPU)      │    │
+│  │  Synapses: weighted, transforming, learning        │    │
+│  └────────────────────────┬──────────────────────────┘    │
+└───────────────────────────┼───────────────────────────────┘
+                            │ NTL signals (IPv6)
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+      ┌──────────┐  ┌────────────┐  ┌──────────┐
+      │ Pod      │  │ Platform   │  │ Doris    │
+      │ (Web3)   │  │ (Janus +   │  │ (OLAP)   │
+      │          │  │  Scylla +  │  │          │
+      │ Full     │  │  Supabase) │  │ Anon     │
+      │ personal │  │  PII strip │  │ data     │
+      └──────────┘  └────────────┘  └──────────┘
+```
+
+---
+
+## Codebase Structure
+
+```
+siafudb/
+├── crates/
+│   ├── siafudb/                # Unified facade crate
+│   ├── siafudb-core/           # Core engine (GrafeoDB + fragments + identity)
+│   ├── siafudb-sync/           # Graph Sync Protocol (GSPA + GSPN integration)
+│   ├── siafudb-access/         # Access patterns (KV, doc, time-series)
+│   └── siafudb-server/         # Optional standalone server
+├── docs/research/              # These documents
+├── Cargo.toml
+├── README.md
+├── LICENSE                     # Apache 2.0
+├── CONTRIBUTING.md
+└── CODE_OF_CONDUCT.md
+```
+
+**NTL lives separately** at `github.com/nyuchi/ntl` with its own research, documentation, and crate structure including `ntl-signal`.
+
+---
+
+## What's Next
+
+| Priority | Milestone |
+|----------|-----------|
+| 1 | Engine runs — GrafeoDB integration, Cypher queries end-to-end |
+| 2 | Change log captures mutations automatically |
+| 3 | Internal sync — two instances in same process, channel transport |
+| 4 | GSPA sync — two instances over HTTP with conflict resolution |
+| 5 | GSPN integration — SiafuDB emits signals through NTL |
+| 6 | Hardware acceleration — routing model on neural engine (NTL milestone) |
+
+---
+
+*April 2026 — Nyuchi Africa / Mukoko Foundation*

@@ -1,0 +1,90 @@
+---
+title: "03 — Decision Log"
+description: "Every key architectural decision with reasoning preserved."
+---
+
+> Every key architectural decision with reasoning preserved.
+
+---
+
+## Decision 1: SiafuDB Replaces SQLite
+
+SiafuDB is an embedded graph database replacing SQLite. Graph-native, with KV/doc/time-series access patterns (all graph underneath). The graph is the upgrade path, not the entry requirement.
+
+## Decision 2: Brain / Memory / Nervous System Model
+
+AI is the brain. SiafuDB is the memory. NTL is the nervous system. The Graph Sync Protocol is memory coherence. This is the design pattern.
+
+## Decision 3: Personal and Network Data Physically Separated
+
+Separate SiafuDB instances on each device. Personal data and Honeycomb network data have separate files, keys, and sync configs. Physical isolation, not logical.
+
+## Decision 4: Sync Protocol Lives Inside SiafuDB
+
+The Graph Sync Protocol is part of the SiafuDB codebase. At least one end of every sync relationship is SiafuDB. Protocol may generalise later.
+
+## Decision 5: GrafeoDB as Core Engine (Dependency, Not Fork)
+
+GrafeoDB is a Cargo dependency. KuzuDB/LadybugDB innovations re-implemented in Rust from published research. Fork only if dependency proves insufficient.
+
+## Decision 6: Sync Protocol Transforms Data in Transit
+
+Built-in transformation layer. Same mutation → full to pod, PII-stripped to platform, anonymised to analytics. Privacy is inherent in the protocol.
+
+## Decision 7: GSPA and GSPN — Two Transports, One Protocol
+
+GSPA (API) ships first, works with everything. GSPN (NTL) ships second, delivers neural advantages. Both coexist long-term. Migration per-relationship.
+
+## Decision 8: Rust Channel as Primitive for GSPA
+
+`tokio::sync::mpsc` is the universal primitive for all GSPA transports. Correct abstraction for point-to-point addressed data flow.
+
+## Decision 9: Channels Are NOT the Primitive for NTL
+
+NTL uses a signal primitive, not channels. Channels are axons (passive). Signals are impulses (weighted, typed). Synapses are intelligent junctions. Forcing NTL into channels would produce "HTTP with different syntax."
+
+## Decision 10: Signal Primitive as New Concurrency Paradigm
+
+`ntl-signal` crate provides Node, Signal, Synapse as a new concurrency primitive. Lives in the NTL repo. General-purpose, not SiafuDB-specific.
+
+## Decision 11: SiafuDB Internal Execution Will Eventually Be Signal-Based
+
+Future phase: internal components become signal nodes. Mutations propagate as continuous signals through internal nodes and external NTL nodes with no paradigm boundary.
+
+## Decision 12: GSPN Requires IPv6 for Cross-Network Transport
+
+IPv4 NAT breaks peer-to-peer signal propagation. IPv6 gives every device a routable address. Only the fabric layer requires IPv6; inner layers work on IPv4. GSPA works on IPv4.
+
+## Decision 13: The Neural Network IS the Base Layer
+
+**Context:** Initial signal primitive design simulated neural behaviour in imperative Rust code. The question was raised: why simulate a neural network when you can use an actual neural network?
+
+**Decision:** NTL's routing is not code that mimics a neural network. It IS a neural network. The synapse topology is represented as a neural network model that can be executed by neural network runtimes (ONNX Runtime) and hardware neural engines (Apple Neural Engine, Qualcomm Hexagon NPU, etc.). Signal routing becomes neural network inference. Learning becomes model training.
+
+**Rationale:** This is not a performance optimisation. It is an architectural statement. The transfer layer IS machine learning infrastructure, not code that borrows ML concepts. This enables hardware acceleration on every modern phone's NPU, gradient-based learning (not just Hebbian), context-aware routing (the model considers signal type, weight, source, time, device state simultaneously), and transfer learning (pre-trained routing models for new deployments).
+
+## Decision 14: Hardware Neural Engine Acceleration
+
+**Context:** Every modern phone ships with a dedicated neural processing unit (NPU) — Apple Neural Engine, Qualcomm Hexagon, Samsung NPU, Huawei Da Vinci. These chips are mostly idle except for camera and keyboard prediction.
+
+**Decision:** NTL's routing model runs on hardware neural engines where available. Signal routing — "which synapses should this signal propagate through?" — is neural network inference, which is exactly what NPUs are built to accelerate. The routing computation moves from CPU (microseconds, high power) to NPU (nanoseconds, low power).
+
+**Rationale:** This gives NTL hardware-accelerated routing on billions of existing devices without requiring any new hardware. It also means NTL consumes less battery than traditional API transport, because NPU operations are orders of magnitude more power-efficient than CPU operations for the same computation. For African markets where battery life matters enormously, this is a concrete user benefit.
+
+## Decision 15: The Twelve Neural Principles
+
+**Context:** The initial ML mapping identified five PyTorch principles that NTL implements. The question was raised: the brain doesn't run on just five principles.
+
+**Decision:** NTL's architecture draws from twelve neural principles, not just five. The original five (weighted graph, forward propagation, junction transformation, learning, improvement over time) plus seven additional: inhibition (signals suppressing other signals), recurrence (feedback loops), neuromodulation (meta-signals changing network behaviour), rich plasticity (spike-timing-dependent learning, structural plasticity), hierarchical processing (multiple abstraction levels), sparse activation (most nodes dormant, minimal power), and multi-scale temporal dynamics (millisecond to month-scale processes).
+
+**Rationale:** PyTorch simplified the brain to five principles because it was optimising for GPU computation. NTL runs on infrastructure, not GPUs, and can implement the full repertoire. Not all twelve are needed in v1, but the architecture must be capable of expressing all of them.
+
+## Decision 16: SiafuDB and NTL Are Separate Repos
+
+**Decision:** SiafuDB lives at `nyuchitech/siafudb`. NTL lives at `nyuchi/ntl`. Each has its own documentation, research, and release cycle. SiafuDB depends on NTL as a library when GSPN is enabled. The signal primitive (`ntl-signal`) lives in the NTL repo. Research that spans both projects is cross-referenced, not duplicated.
+
+**Rationale:** Each is independently useful. Separate repos enable independent adoption, independent contribution, and clear ownership. Engineers interested in the database contribute to SiafuDB. Engineers interested in the signal primitive or transfer layer contribute to NTL.
+
+---
+
+*Decision Log — April 2026 — Nyuchi Africa*

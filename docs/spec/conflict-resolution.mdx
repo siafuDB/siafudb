@@ -1,0 +1,38 @@
+---
+title: "Conflict Resolution"
+description: "Vector clocks, resolution strategies, and tie-breaking rules for concurrent mutations."
+---
+Two fragments may commit mutations that touch the same vertex concurrently. Conflict resolution decides which mutation wins, and how — deterministically, so every fragment in the deployment reaches the same answer.
+
+## Vector clocks
+
+Every mutation carries a vector clock keyed by fragment identity. Comparing two clocks yields one of:
+
+- **Happens-before** — one mutation causally precedes the other. Apply in order.
+- **Concurrent** — neither precedes the other. A conflict, resolved by strategy.
+
+## Strategies
+
+Strategies are declared on the schema or the fragment:
+
+| Strategy | When to use | Behaviour |
+|----------|-------------|-----------|
+| `LastWriterWins` | Personal devices | Highest wall-clock wins; ties broken by `source` UUID |
+| `MergeProperties` | Collaborative content | Non-conflicting property changes merge; conflicting ones fall to `LastWriterWins` |
+| `RejectIncoming` | Authoritative fragments (e.g. platform truth) | Incoming is dropped; a notification may be emitted |
+| `AcceptIncoming` | Caches and read replicas | Incoming wins; local is discarded |
+
+## Deterministic tie-breaking
+
+Wall-clock ties are broken by `source` identity (lexicographic UUID comparison). This is deterministic across fragments without clock sync.
+
+## Authority interaction
+
+See [Authority](/concepts/authority). Writes against `Referenced` vertices either fail outright or get rewritten as **change proposals** — a separate mutation type that the authoritative fragment may accept, reject, or merge. Change proposals bypass `RejectIncoming` by design.
+
+## Open questions
+
+- CRDT overlay for specific property types (counters, sets)?
+- User-visible conflict markers when `MergeProperties` cannot reconcile?
+
+Tracked in the [Decision Log](/research/03-decision-log).

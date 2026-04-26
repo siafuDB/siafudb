@@ -1,0 +1,25 @@
+---
+title: "Specification — Overview"
+description: "Protocol-level specifications for SiafuDB — mutations, conflict resolution, transport contracts."
+---
+This section holds the **protocol-level specifications** for SiafuDB. They are the contract between implementations — anything speaking the Graph Sync Protocol must conform to these documents regardless of language or runtime.
+
+<CardGroup cols={2}>
+  <Card title="Mutation Format" icon="file-code" href="/spec/mutation-format">
+    The wire format for a `Mutation` and `MutationBatch` — fields, encoding, signature scheme.
+  </Card>
+  <Card title="Conflict Resolution" icon="code-branch" href="/spec/conflict-resolution">
+    Vector clocks, resolution strategies, tie-breaking rules.
+  </Card>
+  <Card title="Transport Contract" icon="network-wired" href="/spec/transport-contract">
+    What GSPA and GSPN transports must guarantee — ordering, delivery, idempotency.
+  </Card>
+</CardGroup>
+
+## Stability
+
+The specifications versioned in this section are **normative**. Breaking changes require a major-version bump and a migration path. Non-breaking clarifications can land under the same version.
+
+## Research vs. specification
+
+The [Research](/research/overview) section carries the reasoning — why the model is shaped the way it is. The Specification section carries the **rules** — exactly what an implementation must do. If the two conflict, the specification wins; file an issue to correct the research document.

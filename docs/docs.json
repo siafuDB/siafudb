@@ -1,0 +1,133 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "SiafuDB",
+  "theme": "mint",
+  "logo": {
+    "dark": "/logo/siafudb-dark.svg",
+    "light": "/logo/siafudb-light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#C1440E",
+    "light": "#E8743B",
+    "dark": "#C1440E"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/nyuchitech/siafudb"
+      },
+      {
+        "type": "discord",
+        "href": "https://discord.gg/nyuchi"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Get Started",
+      "href": "/guides/quickstart"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": [
+              "introduction",
+              "why-siafudb",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/fragments",
+              "concepts/graph-model",
+              "concepts/mutations",
+              "concepts/authority"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/quickstart",
+              "guides/first-query",
+              "guides/first-sync",
+              "guides/ntl-integration"
+            ]
+          },
+          {
+            "group": "Sync",
+            "pages": [
+              "sync/overview",
+              "sync/gspa",
+              "sync/gspn"
+            ]
+          },
+          {
+            "group": "Governance",
+            "pages": [
+              "governance/contributing",
+              "governance/roadmap",
+              "governance/foundation"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Specification",
+        "groups": [
+          {
+            "group": "Specification",
+            "pages": [
+              "spec/overview",
+              "spec/mutation-format",
+              "spec/conflict-resolution",
+              "spec/transport-contract"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "API Reference",
+            "pages": [
+              "api-reference/overview",
+              "api-reference/database",
+              "api-reference/query",
+              "api-reference/sync"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Research",
+        "groups": [
+          {
+            "group": "Research",
+            "pages": [
+              "research/overview",
+              "research/01-architecture",
+              "research/02-graph-sync-protocol",
+              "research/03-decision-log",
+              "research/04-first-steps"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "x": "https://x.com/nyuchiafrica",
+      "github": "https://github.com/nyuchitech",
+      "linkedin": "https://linkedin.com/company/nyuchi-africa"
+    }
+  }
+}

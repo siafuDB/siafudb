@@ -1,0 +1,65 @@
+---
+title: "Query API"
+description: "Cypher execution, convenience APIs, result types."
+---
+## Cypher
+
+```rust
+let rows = db.query("MATCH (p:Person) WHERE p.email = $email RETURN p.name")
+    .param("email", "bryan@nyuchi.com")
+    .fetch()?;
+
+for row in rows {
+    let name: &str = row.get("p.name")?;
+    println!("{name}");
+}
+```
+
+Parameters are bound by name. The `Row` type exposes typed accessors (`get::<T>`) that downcast from the GrafeoDB value model.
+
+## Convenience APIs
+
+Same graph underneath, tighter surface on top:
+
+### Key-Value
+
+```rust
+db.kv_set("user:bryan", &bryan)?;
+let v: User = db.kv_get("user:bryan")?;
+```
+
+Backed by `(:_KV {key, value})`.
+
+### Document
+
+```rust
+let id = db.doc_insert("people", &person)?;
+let hits = db.doc_find("people", doc! { "email": "bryan@nyuchi.com" })?;
+```
+
+Backed by nodes labelled with the collection name.
+
+### Time-series
+
+```rust
+db.ts_append("metrics.cpu", now, 0.42)?;
+let window = db.ts_range("metrics.cpu", start, end)?;
+```
+
+Backed by timestamped nodes linked by `NEXT` edges.
+
+### Vector
+
+```rust
+let neighbours = db.vector_search("embeddings", &query_vec, k = 10)?;
+```
+
+HNSW index over property-bag vectors.
+
+## Result types
+
+All query results funnel through `QueryResult` — a streaming iterator over `Row`. Materialise with `.collect::<Vec<_>>()` if you need a concrete list; otherwise stream for large results.
+
+## Reference
+
+Full signatures: `cargo doc --package siafudb --open`.

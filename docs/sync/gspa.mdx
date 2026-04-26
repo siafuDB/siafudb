@@ -1,0 +1,38 @@
+---
+title: "GSPA — Graph Sync with API"
+description: "Traditional transport for the Graph Sync Protocol. HTTP, gRPC, WebSocket, Kafka."
+---
+GSPA is the traditional transport mode for the Graph Sync Protocol. It uses **channels** — point-to-point pipes — with explicit connections and serialisation.
+
+Transports supported at launch:
+
+- **HTTP** — request/response for small mutation batches.
+- **gRPC** — streaming, bidirectional, efficient for large deltas.
+- **WebSocket** — long-lived push channels for near-real-time sync.
+- **Kafka** — durable log for platform ingestion at scale.
+- **Local TCP** — same-machine, cross-process.
+- **In-process** — Rust channel for co-located instances.
+
+## When to use GSPA
+
+Ship GSPA first. It works today — no IPv6 requirement, no hardware neural engine, no NTL dependency. Anything that already speaks HTTP or gRPC can reach a SiafuDB instance through GSPA.
+
+## Shape
+
+```
+┌──────────────────────┐        GSPA channel          ┌──────────────────────┐
+│  SiafuDB (fragment)  │ ───────────────────────────▶ │  SiafuDB (fragment)  │
+│  Mutation emitter    │    (HTTP / gRPC / WS / Kafka) │  Mutation applier    │
+│  + transform layer   │                              │                      │
+└──────────────────────┘                              └──────────────────────┘
+```
+
+Transformations are applied in the emitter before the mutation hits the wire.
+
+## Endpoints
+
+GSPA endpoints follow a small, stable surface. See [02 — Graph Sync Protocol §5](/research/02-graph-sync-protocol) for the endpoint-level spec.
+
+## What GSPA doesn't do
+
+GSPA does not learn. Routes are configured, not discovered. Weights are absent. If you need adaptive routing, hardware-accelerated forwarding, or synapse-level transformations, use GSPN.

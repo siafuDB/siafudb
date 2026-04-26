@@ -1,0 +1,27 @@
+---
+title: "Authority"
+description: "Who owns this vertex, and which way does the data flow?"
+---
+Every vertex and edge in a fragment has an **authority**. Authority determines who owns the data and which direction it flows through sync.
+
+| Authority | Meaning | Sync behaviour |
+|-----------|---------|---------------|
+| **Authoritative** | Source of truth here | Push outward |
+| **Referenced** | Source of truth elsewhere | Pull inward |
+| **Local** | No sync | Stays local |
+
+## Why authority matters
+
+Authority is what prevents sync from turning into chaos. Without it, two instances that both believe they own a vertex can produce conflicting updates and no clear winner. With it, one instance is the authoritative source and the other is a reference that pulls in changes. Writes against Referenced vertices either fail or get rewritten as change proposals, depending on strategy.
+
+## Setting authority
+
+Authority is set at write time. Most apps don't have to think about this — `siafudb-core` sets sensible defaults based on fragment type:
+
+- **Personal fragments** mark everything the user authors as Authoritative.
+- **Network fragments** mark everything as Referenced against the platform graph.
+- **Transient state** (session tokens, UI state, caches) is marked Local.
+
+You can override at write time through the mutation API.
+
+See [02 — Graph Sync Protocol §3](/research/02-graph-sync-protocol) for the full enforcement rules.

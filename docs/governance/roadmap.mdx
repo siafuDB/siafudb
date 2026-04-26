@@ -1,0 +1,55 @@
+---
+title: "Roadmap"
+description: "What ships when — milestones from alpha to 1.0."
+---
+Dates are soft; ordering is firm.
+
+## Alpha — in progress
+
+- Crates scaffolded: `siafudb`, `siafudb-core`, `siafudb-sync`, `siafudb-access`, `siafudb-server`.
+- Fragment open/close, schema DDL, Cypher read/write against a single fragment.
+- Mutation model — in-memory only, no wire format yet.
+- Mintlify docs live.
+
+## 0.1.0 — first public release
+
+- GSPA over HTTP and in-process transports.
+- Mutation wire format frozen (CBOR canonical encoding).
+- `StripPII` and `FilterByLabel` transforms.
+- `LastWriterWins` and `RejectIncoming` conflict strategies.
+- Convenience APIs: KV, document.
+- Quickstart runnable in under five minutes.
+
+## 0.2.0
+
+- GSPA over gRPC and WebSocket.
+- `MergeProperties` strategy.
+- Time-series and vector convenience APIs.
+- Signature verification (Ed25519).
+- Edge fragment kind.
+
+## 0.3.0
+
+- GSPA over Kafka.
+- Durable Objects bridge for Cloudflare ingress (platform-side).
+- CDC subscriber API stabilised.
+- First external deployment validates the protocol at scale.
+
+## 0.5.0
+
+- GSPN prototype against NTL alpha.
+- Synapse-level transforms.
+- Dual-transport deployments (GSPA + GSPN) tested end-to-end.
+
+## 1.0.0
+
+- GSPN production-ready.
+- Wire format stable under SemVer.
+- Full Cypher coverage for declared schema subset.
+- CII Best Practices badge; SLSA level 2 builds.
+
+## Beyond 1.0
+
+- Hardware-accelerated neural forwarding (research).
+- Multi-writer authoritative fragments with CRDT overlays.
+- First-class RDF overlay with SPARQL.

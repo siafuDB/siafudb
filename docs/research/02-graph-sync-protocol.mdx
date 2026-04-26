@@ -1,0 +1,186 @@
+---
+title: "02 — Graph Sync Protocol"
+description: "Draft specification for bidirectional graph synchronisation with neural routing."
+---
+
+> Draft specification for bidirectional graph synchronisation with neural routing.
+
+**Version:** 0.1.0-draft
+**Licence:** Apache 2.0
+
+---
+
+## Abstract
+
+The Graph Sync Protocol (GSP) enables bidirectional graph synchronisation between SiafuDB instances and between SiafuDB and other graph databases. The protocol defines a mutation model, a transformation layer with privacy projections, conflict resolution via vector clocks, and two transport modes: GSPA (traditional API) and GSPN (NTL neural transport with machine learning routing).
+
+The protocol's routing and delivery intelligence improves over time through NTL's neural learning mechanisms. The sync protocol is the training loop — every sync cycle produces training data that makes the routing network smarter.
+
+---
+
+## 1. Core Concepts
+
+| Concept | Definition |
+|---------|-----------|
+| Fragment | A SiafuDB instance participating in sync |
+| Mutation | An atomic graph change — the unit of synchronisation |
+| Mutation Batch | Mutations applied atomically (all-or-nothing) |
+| Change Log | Append-only log of mutation batches |
+| Vector Clock | Causal ordering across all fragments |
+| Sync Relationship | Configured connection with transport, rules, and direction |
+
+---
+
+## 2. Mutation Model
+
+### Structure
+
+```
+Mutation {
+    id:               UUID
+    source_instance:  UUID
+    source_fragment:  UUID
+    operation:        MutationType    — VertexCreated/Updated/Deleted, EdgeCreated/Updated/Deleted
+    vector_clock:     VectorClock
+    timestamp_ms:     u64             — Advisory only
+    signature:        Option<bytes>   — Cryptographic provenance
+}
+```
+
+### Node Identity
+
+```
+NodeIdentity {
+    origin_fragment: UUID
+    local_id:        UUID
+}
+```
+
+Globally unique without coordination.
+
+---
+
+## 3. Transformation Layer
+
+| Rule | Effect | Use Case |
+|------|--------|----------|
+| FilterByLabel | Include/exclude by label | Only sync public content |
+| FilterByProperty | Include/exclude by value | Only sync purchases |
+| StripPII | Deterministic hash of PII fields | Analytics pipeline |
+| Anonymise | Remove all identity | Engagement signals |
+| Aggregate | Batch in time windows | "5 likes this hour" |
+| Remap | Rename properties, inject fields | Schema adaptation |
+
+**Where transformation runs:**
+- GSPA: Inside SiafuDB (last code before wire)
+- GSPN: At NTL synapses (network handles privacy). Synapse transformations can eventually be learned rather than configured — the synapse observes what the receiver uses and strips what it doesn't. This is attention applied to data transfer.
+
+---
+
+## 4. Conflict Resolution
+
+| Strategy | Behaviour | Default For |
+|----------|-----------|-------------|
+| LastWriterWins | Higher vector clock wins | Personal across own devices |
+| MergeProperties | Non-overlapping kept | Collaborative data |
+| RejectIncoming | Keep local | Authoritative fragments |
+| AcceptIncoming | Overwrite local | Caches |
+
+---
+
+## 5. GSPA — API Transport
+
+Traditional request-response. Ships first.
+
+### Endpoints
+
+```
+POST   /sync/push          — Push mutation batch
+GET    /sync/pull?after=N   — Pull after sequence N
+GET    /sync/status         — Instance status
+POST   /sync/negotiate      — Capability exchange
+```
+
+### Transports
+
+HTTP, gRPC, WebSocket, Kafka, Local TCP, In-Process (Rust channel).
+
+---
+
+## 6. GSPN — NTL Neural Transport
+
+Signal-native transport through NTL. SiafuDB emits signals; NTL's neural routing network determines delivery.
+
+### How the Sync Protocol Uses NTL
+
+The sync protocol integrates with NTL at four points:
+
+**Signal emission.** The sync engine wraps mutation batches in NTL signals with a type (e.g., `graph.sync.vertex.created.review`) and weight (priority level). NTL routes based on type and weight.
+
+**Signal reception.** Incoming signals arrive already transformed by NTL synapses. The sync engine applies them directly — no additional transformation needed.
+
+**Training feedback.** After applying a received mutation (or failing to apply it), the sync engine reports delivery outcome back to NTL. Successful delivery = positive training signal (strengthen the synapse path). Conflict or failure = negative signal (adjust routing). The sync protocol is NTL's training loop.
+
+**Routing model queries.** For diagnostic purposes, the sync engine can query NTL's routing model to understand why signals are being routed to specific destinations. This enables debugging sync issues through the same tools used for neural network analysis.
+
+### Neural Routing
+
+NTL's routing is not hardcoded. It is a neural network that learns from traffic:
+
+- A freshly deployed network has uniform weights — no routing preferences
+- After real traffic, frequently-used paths strengthen
+- After weeks, the network routes efficiently based on learned patterns
+- On devices with hardware neural engines (NPU), routing runs on dedicated silicon
+
+The routing model considers: signal type, signal weight, source fragment, time of day, device state (battery, connectivity), receiver activity patterns. This is richer than weight-based routing because a neural network can evaluate all these factors simultaneously.
+
+### Signal Types
+
+```
+graph.sync.vertex.created.{label}
+graph.sync.vertex.updated
+graph.sync.vertex.deleted
+graph.sync.edge.created.{type}
+graph.sync.edge.updated
+graph.sync.edge.deleted
+graph.sync.batch
+```
+
+### IPv6 Requirement
+
+GSPN requires IPv6 for cross-network signal propagation. IPv4 NAT breaks peer-to-peer signal delivery. See NTL research docs for analysis and fallback strategies.
+
+---
+
+## 7. Local Discovery
+
+mDNS service `_siafudb._tcp.local.` for same-network discovery. Same owner key = auto-sync. Authorised peer = shared sync. Unknown = ignore. Mutual TLS authentication with ed25519 keys.
+
+---
+
+## 8. The Sync Protocol as Training Loop
+
+The Graph Sync Protocol is not just a data synchronisation mechanism. It is the training loop for NTL's neural routing network.
+
+```
+┌─────────────────────────────────────────────┐
+│  The Training Cycle                         │
+│                                             │
+│  1. SiafuDB produces mutation               │
+│  2. Sync protocol emits signal into NTL     │
+│  3. NTL routing model decides path          │
+│  4. Signal propagates through synapses      │
+│  5. Receiver applies mutation               │
+│  6. Sync protocol reports outcome to NTL    │
+│  7. NTL updates routing model weights       │
+│  8. Next signal routes more efficiently     │
+│                                             │
+│  Every sync cycle = one training step       │
+│  The network gets smarter with every sync   │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+*Graph Sync Protocol — Draft 0.1.0 — April 2026*
+*Nyuchi Africa / Mukoko Foundation*

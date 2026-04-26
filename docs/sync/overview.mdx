@@ -1,0 +1,47 @@
+---
+title: "Graph Sync Protocol"
+description: "How SiafuDB instances stay coherent — mutation model, transforms, and conflict resolution."
+---
+The **Graph Sync Protocol (GSP)** lives inside the SiafuDB codebase and handles three concerns: the mutation model, the transformation layer, and conflict resolution. GSP keeps distributed graph fragments coherent across devices, pods, edge nodes, and platform servers.
+
+## Mutation Model
+
+Every graph change is a `Mutation`. Mutations group into atomic `MutationBatch` structures. Each carries causal metadata (vector clocks) and optional cryptographic signatures.
+
+See [Mutations](/concepts/mutations) for the data model. See [02 — Graph Sync Protocol](/research/02-graph-sync-protocol) for the full spec.
+
+## Transformation Layer
+
+A single mutation produces different projections for different destinations:
+
+| Destination | Receives | Transform |
+|-------------|----------|-----------|
+| User's pod | Full data | None |
+| Platform | Public fields, PII stripped | `StripPII`, `FilterByLabel` |
+| Analytics | Anonymised | `Anonymise` |
+| Content owner | Anonymous signal | `Anonymise`, `Aggregate` |
+
+Where transformation happens depends on transport:
+
+- **GSPA:** SiafuDB applies transforms before sending.
+- **GSPN:** NTL synapses apply transforms at the network level.
+
+## Conflict Resolution
+
+Vector clocks detect concurrent mutations. Resolution strategies:
+
+- `LastWriterWins` — personal devices.
+- `MergeProperties` — collaborative content.
+- `RejectIncoming` — authoritative fragments.
+- `AcceptIncoming` — caches.
+
+## Transport Modes
+
+<CardGroup cols={2}>
+  <Card title="GSPA — Graph Sync with API" icon="plug" href="/sync/gspa">
+    HTTP, gRPC, WebSocket, Kafka. Channels, serialisation, connections. Ships first.
+  </Card>
+  <Card title="GSPN — Graph Sync with NTL" icon="brain" href="/sync/gspn">
+    Neural signal transport through NTL. Signals, synapses, learned routing. Ships second.
+  </Card>
+</CardGroup>

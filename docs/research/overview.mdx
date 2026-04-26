@@ -1,0 +1,18 @@
+---
+title: "Research"
+description: "The architectural and protocol research behind SiafuDB — the memory layer of a nervous-system computing model."
+---
+Research and architectural decisions for SiafuDB. These documents are rawer than the polished guides — they capture the *why* behind the engine choices, the fragment model, and the Graph Sync Protocol.
+
+Read these when you want to understand why SiafuDB is built on GrafeoDB rather than forking KuzuDB, why personal and network fragments are physically separate on every device, and why the sync protocol's training loop lives inside NTL rather than in the database.
+
+| # | Document | What it covers |
+|---|----------|----------------|
+| 01 | [Architecture](/research/01-architecture) | The complete picture. Paradigm, fragment model, engine foundation, transport. **Read first.** |
+| 02 | [Graph Sync Protocol](/research/02-graph-sync-protocol) | Mutation model, transformation layer, conflict resolution, GSPA/GSPN transport. |
+| 03 | [Decision Log](/research/03-decision-log) | Every key architectural decision with reasoning preserved. |
+| 04 | [First Steps](/research/04-first-steps) | The actionable plan from now to research preview. |
+
+---
+
+*Cross-referenced with NTL's research at [`ntl.nyuchi.com/research`](https://ntl.nyuchi.com/research). The signal primitive, neural base layer, and IPv6 transport docs live there.*

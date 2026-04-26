@@ -1,0 +1,15 @@
+{
+  "name": "siafudb-docs",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Mintlify documentation site for SiafuDB.",
+  "scripts": {
+    "install:mintlify": "npm install -g mintlify",
+    "dev": "mintlify dev --port 11300",
+    "build": "mintlify build",
+    "broken-links": "mintlify broken-links"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

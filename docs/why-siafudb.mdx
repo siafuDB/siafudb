@@ -1,0 +1,30 @@
+---
+title: "Why SiafuDB"
+description: "Why the device, the edge, and the Web3 pod need a graph-native database — not a row store with graph features bolted on."
+---
+Every major platform — Facebook, Google, Amazon, Netflix — started with relational databases and spent billions building graph layers on top. The relational model was designed in 1970 for accounting ledgers. The human brain is a graph. AI systems reason over graphs. The world is connected through relationships, not rows.
+
+Server-side graph databases (Neo4j, JanusGraph, TigerGraph) solved this for the cloud. But the **device**, the **edge**, and the **decentralised web** have been left behind — still running SQLite, still thinking in tables.
+
+SiafuDB brings graph-native intelligence to every environment where data actually lives:
+
+- **On your phone.** Your AI assistant reasons over your personal knowledge graph locally, even offline.
+- **At the edge.** Cloudflare Workers and Durable Objects hold cached regional subgraphs via WASM.
+- **In your pod.** Sovereign personal data stored as a graph, cryptographically bound to your identity.
+- **In the browser.** WASM-compiled graph engine running client-side with zero server dependency.
+
+## The Four Promises
+
+**Graph-native.** Relationships are first-class. No JOIN tables. Traversal in microseconds through index-free adjacency.
+
+**SQLite-simple.** One file. Zero config. Embed in any app, in any language binding.
+
+**Sync-ready.** Graph Sync Protocol with privacy transformations — PII stripping, anonymisation — applied per destination, not per app.
+
+**Sovereign.** Cryptographic identity. Your data, your graph, your device. Personal and network fragments physically separate on disk.
+
+## What SiafuDB is not
+
+SiafuDB is not ArangoDB-in-Rust. It is not a multi-model database in the old-school sense where four engines sit behind one API. The graph is the storage; KV, document, and time-series are convenience access patterns on top of graph primitives.
+
+The graph is the upgrade path, not the entry requirement.

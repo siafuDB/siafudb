@@ -1,0 +1,119 @@
+---
+title: "04 — First Steps"
+description: "What to do from now. SiafuDB-specific actions."
+---
+
+> What to do from now. SiafuDB-specific actions.
+
+**Status:** ACTIVE — Start immediately
+
+---
+
+## Repository Setup
+
+### SiafuDB (`nyuchitech/siafudb`)
+
+1. Push scaffolded codebase (crates/, Cargo.toml, README.md)
+2. Add LICENSE (Apache 2.0), CONTRIBUTING.md, CODE_OF_CONDUCT.md, THIRD_PARTY_NOTICES
+3. Create `docs/` for Mintlify content (hosted at `siafu.nyuchi.com`)
+4. Move research `.mdx` files into `docs/research/`
+5. Enable GitHub Discussions, Issues, branch protection on `main`
+6. Topics: `graph-database`, `embedded-database`, `rust`, `edge-computing`, `web3`, `sync-protocol`, `apache-2`, `open-source`, `africa`
+
+### NTL (`nyuchi/ntl`) — Separate Actions
+
+NTL has its own first-steps document in its repo. SiafuDB-relevant NTL actions:
+- Create `ntl-signal` crate with Node, Signal, Synapse types
+- Implement channel transport layer (in-process foundation)
+- Define the GSPN signal interface that SiafuDB will integrate with
+
+---
+
+## Outreach Sequence
+
+| Priority | Target | When | Purpose |
+|----------|--------|------|---------|
+| 1 | GrafeoDB maintainers | This week | Core engine dependency relationship |
+| 2 | LadybugDB community | After GrafeoDB | Collaborative peer, research acknowledgment |
+| 3 | Rust community | When `ntl-signal` has working code | Signal primitive generates Rust community interest |
+| 4 | Graph database community | When GSPA sync works | Demo of graph-to-graph sync |
+
+---
+
+## Engineering Milestones
+
+| # | Milestone | Target | Description |
+|---|-----------|--------|-------------|
+| 1 | Engine runs | 2 weeks | GrafeoDB integration, `SiafuDB::open()` + Cypher end-to-end |
+| 2 | Change log captures | 3 weeks | Every mutation auto-logged with vector clock |
+| 3 | Internal sync | 5 weeks | Two instances in same process, channel transport, transformation |
+| 4 | GSPA sync | 8 weeks | Two instances over HTTP with conflict resolution |
+| 5 | GSPN integration | 10 weeks | SiafuDB emits signals through NTL (depends on `ntl-signal`) |
+| 6 | Research preview | 12 weeks | Public launch: working engine, GSPA sync, docs, research |
+
+---
+
+## Documentation (Mintlify at `siafu.nyuchi.com`)
+
+```
+Navigation:
+├── Introduction
+├── Quick Start
+├── Concepts
+│   ├── SQLite Replacement
+│   ├── Fragment Model
+│   ├── Identity
+│   └── Access Patterns
+├── Graph Sync Protocol
+│   ├── Overview
+│   ├── Mutation Model
+│   ├── Transformation
+│   ├── Conflict Resolution
+│   ├── GSPA (API)
+│   └── GSPN (NTL)
+├── Research                    ← Open from day one
+│   ├── Architecture
+│   ├── Graph Sync Protocol
+│   ├── Decision Log
+│   └── Cross-ref to NTL research
+├── API Reference
+├── Examples
+└── Roadmap
+```
+
+NTL research (signal primitive, ML principles, neural engines, IPv6, twelve principles) lives in NTL's docs at `ntl.nyuchi.com`. SiafuDB docs cross-reference where relevant.
+
+---
+
+## Week-by-Week Checklist
+
+### This Week
+- [ ] Push codebase to `nyuchitech/siafudb`
+- [ ] Add LICENSE, CONTRIBUTING, CODE_OF_CONDUCT, THIRD_PARTY_NOTICES
+- [ ] Set up Mintlify for `siafu.nyuchi.com`
+- [ ] Publish research docs
+- [ ] Send GrafeoDB outreach
+
+### Weeks 2-3
+- [ ] GrafeoDB integration working (Milestone 1)
+- [ ] Change log captures (Milestone 2)
+- [ ] Write introduction and quickstart docs
+- [ ] Send LadybugDB outreach
+
+### Weeks 4-5
+- [ ] Internal sync working (Milestone 3)
+- [ ] Write concept docs (fragments, identity, access patterns)
+
+### Weeks 6-8
+- [ ] GSPA sync over HTTP (Milestone 4)
+- [ ] Write examples
+- [ ] GSPN integration begins (depends on NTL's `ntl-signal`)
+
+### Weeks 9-12
+- [ ] Polish docs, examples, research
+- [ ] Research Preview Launch (Milestone 6)
+- [ ] Blog post, community engagement
+
+---
+
+*April 2026 — Nyuchi Africa*

@@ -1,0 +1,70 @@
+---
+title: "Quickstart"
+description: "Install SiafuDB, open a fragment, and run your first query in under five minutes."
+---
+Five minutes from `cargo add` to a working fragment. This guide assumes you have a Rust toolchain (1.75+) and a working editor.
+
+## Install
+
+Add SiafuDB to your `Cargo.toml`:
+
+```toml
+[dependencies]
+siafudb = "0.1"
+```
+
+<Note>
+During the alpha, pull from the workspace path: `siafudb = { git = "https://github.com/nyuchi-africa/siafudb", branch = "main" }`.
+</Note>
+
+## Open a fragment
+
+```rust
+use siafudb::{Siafu, FragmentKind};
+
+fn main() -> siafudb::Result<()> {
+    let mut db = Siafu::open("./my-fragment.siafu", FragmentKind::Personal)?;
+    println!("Opened {} vertices", db.vertex_count());
+    Ok(())
+}
+```
+
+A `.siafu` file is a single-file fragment. The `FragmentKind::Personal` tag marks this as a personal fragment — all writes default to Authoritative here.
+
+## Declare a schema
+
+```rust
+db.execute(r#"
+    CREATE NODE TABLE Person(
+        name STRING,
+        email STRING,
+        PRIMARY KEY (email)
+    );
+"#)?;
+```
+
+See [Graph Model](/concepts/graph-model) for the full schema language.
+
+## Insert and query
+
+```rust
+db.execute(r#"
+    CREATE (:Person { name: 'Bryan', email: 'bryan@nyuchi.com' });
+"#)?;
+
+let rows = db.query("MATCH (p:Person) RETURN p.name, p.email")?;
+for row in rows {
+    println!("{:?}", row);
+}
+```
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Run your first query" icon="code" href="/guides/first-query">
+    Cypher basics against the fragment you just created.
+  </Card>
+  <Card title="Connect two fragments" icon="arrows-rotate" href="/guides/first-sync">
+    Stand up a second fragment and sync with GSPA.
+  </Card>
+</CardGroup>
