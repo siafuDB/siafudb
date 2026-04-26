@@ -192,6 +192,22 @@ For detailed build instructions, see the [Developer Guide](https://siafudb.org/d
 - [ ] ArkTS/ArkUI binding (HarmonyOS) via N-API
 - [ ] React Native and Flutter bridges
 
+## Engine Roadmap
+
+SiafuDB's storage and query engine is [Grafeo](https://grafeo.dev) — pure Rust, Apache 2.0, embedded — and Grafeo remains the primary engine throughout. The direction is to bring the published research and design of three further open-source graph databases into the SiafuDB stack as Rust work *around* Grafeo first; Grafeo itself is touched last, only once the other lineages are integrated and the convergence is concrete.
+
+### Stage 1 — KuzuDB and LadybugDB algorithms into Rust
+
+[KuzuDB](https://github.com/kuzudb/kuzu) (MIT, archived after Apple's acquisition of Kùzu Inc.) and the community fork [LadybugDB](https://github.com/ladybugdb/ladybug) ship the algorithmic state of the art for embedded graph databases — Worst-Case Optimal Joins (~374× faster than Neo4j on path queries), factorised execution (50–100× compression of intermediate results), morsel-driven parallelism, and columnar storage with SIMD vectorisation. The C++ code is not used; the published academic research is re-implemented in Rust.
+
+### Stage 2 — ArcadeDB design influence into Rust
+
+[ArcadeDB](https://github.com/ArcadeData/arcadedb) (Apache 2.0, JVM) demonstrates native multi-model engines — graph + document + KV + vector + time-series in a single storage layer without translation. JVM means no code reuse; the design principles (O(1) graph traversal via direct edge pointers, Gorilla / Delta-of-Delta / Simple-8b time-series compression, MCP as a first-class feature) inform the Rust implementation.
+
+### Stage 3 — Convergence into a unified Foundation-owned engine
+
+Once Stages 1 and 2 are integrated, the engine — including Grafeo — converges into a single Foundation-owned Rust engine. Pure Rust, no FFI dependencies, Apache 2.0, drawing the best of all four lineages. Until that convergence is concrete, Grafeo remains the primary engine and is not modified.
+
 ## Contributing
 
 We welcome contributions to SiafuDB. Whether it's bug fixes, performance improvements, documentation, or new features — every contribution strengthens the colony.

@@ -1,3 +1,10 @@
+// Copyright (C) 2026 The Bundu Foundation
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 //! Milestone 1 smoke test — engine runs end-to-end via GrafeoDB.
 //!
 //! Proves that opening a SiafuDB, writing nodes via Cypher, and

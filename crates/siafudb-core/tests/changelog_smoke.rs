@@ -1,3 +1,10 @@
+// Copyright (C) 2026 The Bundu Foundation
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 //! Milestone 2 smoke test — change log captures mutations automatically.
 
 use siafudb_core::SiafuDB;
