@@ -20,13 +20,13 @@ The protocol's routing and delivery intelligence improves over time through NTL'
 
 ## 1. Core Concepts
 
-| Concept | Definition |
-|---------|-----------|
-| Fragment | A SiafuDB instance participating in sync |
-| Mutation | An atomic graph change — the unit of synchronisation |
-| Mutation Batch | Mutations applied atomically (all-or-nothing) |
-| Change Log | Append-only log of mutation batches |
-| Vector Clock | Causal ordering across all fragments |
+| Concept           | Definition                                                 |
+| ----------------- | ---------------------------------------------------------- |
+| Fragment          | A SiafuDB instance participating in sync                   |
+| Mutation          | An atomic graph change — the unit of synchronisation       |
+| Mutation Batch    | Mutations applied atomically (all-or-nothing)              |
+| Change Log        | Append-only log of mutation batches                        |
+| Vector Clock      | Causal ordering across all fragments                       |
 | Sync Relationship | Configured connection with transport, rules, and direction |
 
 ---
@@ -62,16 +62,17 @@ Globally unique without coordination.
 
 ## 3. Transformation Layer
 
-| Rule | Effect | Use Case |
-|------|--------|----------|
-| FilterByLabel | Include/exclude by label | Only sync public content |
-| FilterByProperty | Include/exclude by value | Only sync purchases |
-| StripPII | Deterministic hash of PII fields | Analytics pipeline |
-| Anonymise | Remove all identity | Engagement signals |
-| Aggregate | Batch in time windows | "5 likes this hour" |
-| Remap | Rename properties, inject fields | Schema adaptation |
+| Rule             | Effect                           | Use Case                 |
+| ---------------- | -------------------------------- | ------------------------ |
+| FilterByLabel    | Include/exclude by label         | Only sync public content |
+| FilterByProperty | Include/exclude by value         | Only sync purchases      |
+| StripPII         | Deterministic hash of PII fields | Analytics pipeline       |
+| Anonymise        | Remove all identity              | Engagement signals       |
+| Aggregate        | Batch in time windows            | "5 likes this hour"      |
+| Remap            | Rename properties, inject fields | Schema adaptation        |
 
 **Where transformation runs:**
+
 - GSPA: Inside SiafuDB (last code before wire)
 - GSPN: At NTL synapses (network handles privacy). Synapse transformations can eventually be learned rather than configured — the synapse observes what the receiver uses and strips what it doesn't. This is attention applied to data transfer.
 
@@ -79,12 +80,12 @@ Globally unique without coordination.
 
 ## 4. Conflict Resolution
 
-| Strategy | Behaviour | Default For |
-|----------|-----------|-------------|
-| LastWriterWins | Higher vector clock wins | Personal across own devices |
-| MergeProperties | Non-overlapping kept | Collaborative data |
-| RejectIncoming | Keep local | Authoritative fragments |
-| AcceptIncoming | Overwrite local | Caches |
+| Strategy        | Behaviour                | Default For                 |
+| --------------- | ------------------------ | --------------------------- |
+| LastWriterWins  | Higher vector clock wins | Personal across own devices |
+| MergeProperties | Non-overlapping kept     | Collaborative data          |
+| RejectIncoming  | Keep local               | Authoritative fragments     |
+| AcceptIncoming  | Overwrite local          | Caches                      |
 
 ---
 
@@ -182,5 +183,5 @@ The Graph Sync Protocol is not just a data synchronisation mechanism. It is the 
 
 ---
 
-*Graph Sync Protocol — Draft 0.1.0 — April 2026*
-*Nyuchi Africa / Mukoko Foundation*
+_Graph Sync Protocol — Draft 0.1.0 — April 2026_
+_Nyuchi Africa / Bundu Foundation_

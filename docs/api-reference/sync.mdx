@@ -2,6 +2,7 @@
 title: "Sync API"
 description: "GSPA and GSPN builders, CDC hooks, transforms."
 ---
+
 The sync layer lives in `siafudb-sync` and is re-exported under `siafudb::sync`.
 
 ## GSPA
@@ -53,12 +54,12 @@ while let Some(mutation) = cdc.recv().await {
 
 Built-in transforms:
 
-| Transform | Effect |
-|-----------|--------|
-| `StripPII` | Removes properties marked `@pii` in the schema |
+| Transform       | Effect                                           |
+| --------------- | ------------------------------------------------ |
+| `StripPII`      | Removes properties marked `@pii` in the schema   |
 | `FilterByLabel` | Drops mutations whose target label doesn't match |
-| `Anonymise` | Replaces identities with stable pseudonyms |
-| `Aggregate` | Rolls up events into summary vertices |
+| `Anonymise`     | Replaces identities with stable pseudonyms       |
+| `Aggregate`     | Rolls up events into summary vertices            |
 
 Custom transforms implement the `Transform` trait:
 

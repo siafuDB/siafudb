@@ -2,6 +2,7 @@
 title: "Graph Model"
 description: "The data model — labeled property graph, vertices and edges, typed schemas, RDF overlay."
 ---
+
 SiafuDB stores a **Labeled Property Graph (LPG)**. Every vertex has a label (its type) and a property bag. Every edge has a label (its relationship type), a direction, and an optional property bag. An RDF overlay is available for semantic-web workloads; both models share the same storage.
 
 ## Vertex
@@ -45,12 +46,12 @@ CREATE REL TABLE Knows(
 
 The same graph underneath, different APIs on top:
 
-| Pattern | API | Underneath |
-|---------|-----|-----------|
-| Graph | Cypher / GQL | Native graph operations |
-| Key-Value | `kv_set()` / `kv_get()` | `(:_KV {key, value})` |
-| Document | `doc_insert()` / `doc_find()` | Node with label = collection |
-| Time-Series | `ts_append()` / `ts_range()` | Timestamped nodes + `NEXT` edges |
-| Vector | Similarity queries | HNSW index on embeddings |
+| Pattern     | API                           | Underneath                       |
+| ----------- | ----------------------------- | -------------------------------- |
+| Graph       | Cypher / GQL                  | Native graph operations          |
+| Key-Value   | `kv_set()` / `kv_get()`       | `(:_KV {key, value})`            |
+| Document    | `doc_insert()` / `doc_find()` | Node with label = collection     |
+| Time-Series | `ts_append()` / `ts_range()`  | Timestamped nodes + `NEXT` edges |
+| Vector      | Similarity queries            | HNSW index on embeddings         |
 
 See [01 — SiafuDB Architecture](/research/01-architecture#siafudb-replaces-sqlite) for the full rationale.

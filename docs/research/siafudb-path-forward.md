@@ -5,8 +5,8 @@
 **Date:** April 2026
 **Status:** LOCKED — Engineering strategy
 **Decision Owner:** Bryan Fawcett, Founder & CEO, Nyuchi Africa
-**Governance:** Mukoko Foundation (Apache 2.0 licence)
-**Repository:** github.com/nyuchitech/siafudb
+**Governance:** Bundu Foundation (Apache 2.0 licence)
+**Repository:** github.com/nyuchi/siafudb
 
 ---
 
@@ -118,7 +118,7 @@ Combining the best from all three projects, SiafuDB's architecture is:
 
 **Language:** Pure Rust. No C, no C++, no Java, no JVM dependencies.
 
-**Licence:** Apache 2.0. Governed by the Mukoko Foundation. Structurally guaranteed to never change.
+**Licence:** Apache 2.0. Governed by the Bundu Foundation. Structurally guaranteed to never change.
 
 **Deployment targets:** Mobile (iOS, Android, HarmonyOS), edge (any WASM-capable runtime), Web3 (Honeycomb nodes, any decentralised network), browser (WASM), server (standalone binary for development/testing).
 
@@ -246,9 +246,9 @@ At the end of this engineering path, SiafuDB is:
 
 **The fastest embedded graph database for multi-hop queries.** WCOJ, factorised execution, and morsel-driven parallelism — the algorithmic innovations from KuzuDB's research, implemented in Rust with SIMD vectorisation.
 
-**Platform-agnostic infrastructure.** Runs on iOS, Android, HarmonyOS, in any browser, in any WASM edge runtime, on any Web3 node. Not locked to any platform, any cloud provider, or any ecosystem. Apache 2.0, governed by the Mukoko Foundation, structurally guaranteed to never change.
+**Platform-agnostic infrastructure.** Runs on iOS, Android, HarmonyOS, in any browser, in any WASM edge runtime, on any Web3 node. Not locked to any platform, any cloud provider, or any ecosystem. Apache 2.0, governed by the Bundu Foundation, structurally guaranteed to never change.
 
-**Open-source infrastructure built in Africa, shared with the world.** Nyuchi Africa maintains it. The Mukoko Foundation governs it. Anyone can use it. The army ant carries the graph.
+**Open-source infrastructure built in Africa, shared with the world.** Nyuchi Africa maintains it. The Bundu Foundation governs it. Anyone can use it. The army ant carries the graph.
 
 ---
 
@@ -305,8 +305,8 @@ multi-model design principles.
 
 ---
 
-*SiafuDB Path Forward — April 2026*
-*Bryan Fawcett, Founder & CEO*
-*Nyuchi Africa / Mukoko Foundation*
+_SiafuDB Path Forward — April 2026_
+_Bryan Fawcett, Founder & CEO_
+_Nyuchi Africa / Bundu Foundation_
 
-*"Three projects. Three licences. One vision. The army ant takes the best from everywhere and builds something that didn't exist before."*
+_"Three projects. Three licences. One vision. The army ant takes the best from everywhere and builds something that didn't exist before."_

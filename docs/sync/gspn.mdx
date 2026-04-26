@@ -2,6 +2,7 @@
 title: "GSPN — Graph Sync with NTL"
 description: "Neural signal transport for the Graph Sync Protocol. Synapses, signals, learned routing."
 ---
+
 GSPN is the neural transport mode for the Graph Sync Protocol. Instead of channels, GSPN emits **signals** through **synapses** — adaptive junctions provided by the [Nyuchi Transfer Layer (NTL)](https://ntl.nyuchi.com).
 
 Where GSPA is a pipe you configure, GSPN is a nervous system that learns. Synapses carry weights. Weights adapt with use. Routes emerge rather than being declared.
@@ -34,13 +35,13 @@ The emitter does not serialise for a specific destination. It hands the mutation
 
 ## Signals vs. channels
 
-| GSPA channel | GSPN signal |
-|-------------|-------------|
-| Point-to-point | Propagated through a mesh |
-| Configured endpoint | Learned route |
+| GSPA channel                   | GSPN signal                                   |
+| ------------------------------ | --------------------------------------------- |
+| Point-to-point                 | Propagated through a mesh                     |
+| Configured endpoint            | Learned route                                 |
 | Serialise once per destination | Single signal, multiple transforms downstream |
-| No weight | Weighted, adaptive |
-| Stateless transport | Synapses retain state (weights, decay) |
+| No weight                      | Weighted, adaptive                            |
+| Stateless transport            | Synapses retain state (weights, decay)        |
 
 ## Relationship to NTL
 

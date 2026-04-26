@@ -2,6 +2,7 @@
 title: "Graph Sync Protocol"
 description: "How SiafuDB instances stay coherent — mutation model, transforms, and conflict resolution."
 ---
+
 The **Graph Sync Protocol (GSP)** lives inside the SiafuDB codebase and handles three concerns: the mutation model, the transformation layer, and conflict resolution. GSP keeps distributed graph fragments coherent across devices, pods, edge nodes, and platform servers.
 
 ## Mutation Model
@@ -14,12 +15,12 @@ See [Mutations](/concepts/mutations) for the data model. See [02 — Graph Sync 
 
 A single mutation produces different projections for different destinations:
 
-| Destination | Receives | Transform |
-|-------------|----------|-----------|
-| User's pod | Full data | None |
-| Platform | Public fields, PII stripped | `StripPII`, `FilterByLabel` |
-| Analytics | Anonymised | `Anonymise` |
-| Content owner | Anonymous signal | `Anonymise`, `Aggregate` |
+| Destination   | Receives                    | Transform                   |
+| ------------- | --------------------------- | --------------------------- |
+| User's pod    | Full data                   | None                        |
+| Platform      | Public fields, PII stripped | `StripPII`, `FilterByLabel` |
+| Analytics     | Anonymised                  | `Anonymise`                 |
+| Content owner | Anonymous signal            | `Anonymise`, `Aggregate`    |
 
 Where transformation happens depends on transport:
 

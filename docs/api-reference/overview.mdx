@@ -2,6 +2,7 @@
 title: "API Reference — Overview"
 description: "Rust crate reference for SiafuDB — database, query, sync, access."
 ---
+
 Reference documentation for the `siafudb` umbrella crate and its internals. This is not a tutorial — see [Guides](/guides/quickstart) for that. This is the surface.
 
 <CardGroup cols={2}>
@@ -18,12 +19,12 @@ Reference documentation for the `siafudb` umbrella crate and its internals. This
 
 ## Crate layout
 
-| Crate | Responsibility |
-|-------|---------------|
-| `siafudb` | Umbrella — re-exports the public API |
-| `siafudb-core` | Engine, fragments, schema, mutations |
-| `siafudb-sync` | GSP, transforms, conflict resolution |
-| `siafudb-access` | Convenience APIs (KV, doc, ts, vector) |
+| Crate            | Responsibility                                     |
+| ---------------- | -------------------------------------------------- |
+| `siafudb`        | Umbrella — re-exports the public API               |
+| `siafudb-core`   | Engine, fragments, schema, mutations               |
+| `siafudb-sync`   | GSP, transforms, conflict resolution               |
+| `siafudb-access` | Convenience APIs (KV, doc, ts, vector)             |
 | `siafudb-server` | Optional standalone server — GSPA endpoints, admin |
 
 See [01 — SiafuDB Architecture](/research/01-architecture) for the full crate rationale.

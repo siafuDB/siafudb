@@ -34,9 +34,9 @@ KuzuDB was an embedded property graph database developed by Kùzu Inc., based on
 
 Nyuchi Africa forks KuzuDB at version 0.11.3 (the final release) directly from the archived `kuzudb/kuzu` repository. All new code contributed by Nyuchi is licensed under **Apache 2.0** — the same licence as JanusGraph, Cassandra, CouchDB, Flink, Doris, Maestro, Ray, MLflow, Feast, and Great Expectations. The original KuzuDB MIT copyright notice is preserved in a `THIRD_PARTY_NOTICES` file as required by the MIT licence terms.
 
-The project is governed by the **Mukoko Foundation** (Mauritius, Foundations Act 2012) — the same legal entity that governs MIT tokens, MXT tokens, and pod sovereignty. The Foundation has no shareholders and exists for the community. The Apache 2.0 licence is protected by the Foundation's Reserved Powers — it cannot be changed to a proprietary or restrictive licence without triggering the same governance process that protects the token economics and the platform charter. This is a structural guarantee, not a corporate promise.
+The project is governed by the **Bundu Foundation** (Zimbabwean Company Limited by Guarantee) — the same legal entity that governs MIT tokens, MXT tokens, and pod sovereignty. The Foundation has no shareholders and exists for the community. The Apache 2.0 licence is protected by the Foundation's Reserved Powers — it cannot be changed to a proprietary or restrictive licence without triggering the same governance process that protects the token economics and the platform charter. This is a structural guarantee, not a corporate promise.
 
-The "Kuzu" trademark is not used (Apple likely holds the trademark through the acquisition of Kùzu Inc.). The project is named **SiafuDB** — after the African army ant (*Dorylus*), known in Swahili as *siafu*. Small, embedded, unnoticed, but the ecosystem collapses without it. The Swahili name is pan-African (serving 54 countries, not a single-language choice), and the metaphor is precise: millions of small instances, each holding a piece of the graph, collectively forming the intelligence infrastructure of the platform. The name follows the universal naming principle (utility apps and tools use universal names, not Shona) since SiafuDB is cross-continental infrastructure, not a concept with irreplaceable Shona cultural weight. Repository: `github.com/nyuchitech/siafudb`. Primary domain: `siafudb.org`.
+The "Kuzu" trademark is not used (Apple likely holds the trademark through the acquisition of Kùzu Inc.). The project is named **SiafuDB** — after the African army ant (_Dorylus_), known in Swahili as _siafu_. Small, embedded, unnoticed, but the ecosystem collapses without it. The Swahili name is pan-African (serving 54 countries, not a single-language choice), and the metaphor is precise: millions of small instances, each holding a piece of the graph, collectively forming the intelligence infrastructure of the platform. The name follows the universal naming principle (utility apps and tools use universal names, not Shona) since SiafuDB is cross-continental infrastructure, not a concept with irreplaceable Shona cultural weight. Repository: `github.com/nyuchi/siafudb`. Primary domain: `siafudb.org`.
 
 ### Architecture: Grafeo Core + SiafuDB Extensions
 
@@ -168,7 +168,7 @@ With two graph engines and the Graph Sync Protocol, every data-holding layer of 
 
 **Query language:** Cypher. Shamwari reasons over the personal graph natively.
 
-**Sovereignty:** The person owns their pod graph. Cryptographically bound to MIT token. Accessible only with their keys. Apache 2.0 engine governed by the Mukoko Foundation.
+**Sovereignty:** The person owns their pod graph. Cryptographically bound to MIT token. Accessible only with their keys. Apache 2.0 engine governed by the Bundu Foundation.
 
 ### Layer 2 — The ACID Ledger (Supabase/PostgreSQL)
 
@@ -323,7 +323,7 @@ schemas for graph sync events.
 The embedded graph database that powers every device, every edge node, and every
 sovereign pod is forked from KuzuDB — originally built by researchers at the
 University of Waterloo, archived when Apple acquired its creator, and reborn under
-Apache 2.0 governance by the Mukoko Foundation. The Foundation's charter guarantees
+Apache 2.0 governance by the Bundu Foundation. The Foundation's charter guarantees
 the licence can never change. No corporation can acquire, archive, or relicense the
 database that holds your personal graph. Your device, your edge, your pod — all run
 on sovereign graph infrastructure that the community owns permanently.
@@ -347,16 +347,16 @@ you are.
 
 ## Sovereignty Audit (Addendum)
 
-| Component | Licence | Layer(s) | Source of Truth? | Sovereign? |
-|-----------|---------|----------|-----------------|------------|
-| JanusGraph | Apache 2.0 | 3, 7 | Yes (platform graph, analytical graph) | Fully sovereign (Apache foundation) |
-| SiafuDB | Apache 2.0 | 1, 5, 6 | Yes (pod — personal), No (edge, device — caches) | Fully sovereign (Mukoko Foundation) |
-| Graph Sync Protocol | Apache 2.0 (Nyuchi) | 4 (transport) | No (sync mechanism) | Fully sovereign (Nyuchi proprietary → open-source) |
-| ScyllaDB | Source-available | 3 (hot) | Yes (storage backend) | Cassandra fallback (zero-cost migration) |
-| Apache Cassandra | Apache 2.0 | 3 (cold) | Yes (storage backend) | IS the sovereign fallback |
-| Supabase/PostgreSQL | PostgreSQL licence | 2 | Yes (ACID ledger) | Self-hostable if needed |
+| Component           | Licence             | Layer(s)      | Source of Truth?                                 | Sovereign?                                         |
+| ------------------- | ------------------- | ------------- | ------------------------------------------------ | -------------------------------------------------- |
+| JanusGraph          | Apache 2.0          | 3, 7          | Yes (platform graph, analytical graph)           | Fully sovereign (Apache foundation)                |
+| SiafuDB             | Apache 2.0          | 1, 5, 6       | Yes (pod — personal), No (edge, device — caches) | Fully sovereign (Bundu Foundation)                 |
+| Graph Sync Protocol | Apache 2.0 (Nyuchi) | 4 (transport) | No (sync mechanism)                              | Fully sovereign (Nyuchi proprietary → open-source) |
+| ScyllaDB            | Source-available    | 3 (hot)       | Yes (storage backend)                            | Cassandra fallback (zero-cost migration)           |
+| Apache Cassandra    | Apache 2.0          | 3 (cold)      | Yes (storage backend)                            | IS the sovereign fallback                          |
+| Supabase/PostgreSQL | PostgreSQL licence  | 2             | Yes (ACID ledger)                                | Self-hostable if needed                            |
 
-Every graph engine in the architecture is Apache 2.0. JanusGraph is governed by the Apache Foundation. SiafuDB is governed by the Mukoko Foundation. The Nyuchi Honeycomb is governed by Nyuchi Africa. No component of the graph fabric can be relicensed, acquired, or held hostage by a corporation.
+Every graph engine in the architecture is Apache 2.0. JanusGraph is governed by the Apache Foundation. SiafuDB is governed by the Bundu Foundation. The Nyuchi Honeycomb is governed by Nyuchi Africa. No component of the graph fabric can be relicensed, acquired, or held hostage by a corporation.
 
 ---
 
@@ -364,7 +364,7 @@ Every graph engine in the architecture is Apache 2.0. JanusGraph is governed by 
 
 SiafuDB is not proprietary infrastructure and is not product-specific tooling. It is an independent open-source project that Nyuchi Africa maintains and contributes to the global graph database ecosystem. The capabilities Nyuchi builds — the Graph Sync Protocol, WASM edge compilation, Web3 pod integration — are general-purpose infrastructure contributions that benefit anyone building applications that need embedded graph with sync, edge, or decentralised capabilities.
 
-SiafuDB is governed by the **Mukoko Foundation** (licence governance and community stewardship). It is maintained by **Nyuchi Africa** (engineering and release management). The **Nyuchi Honeycomb** decentralised network is separately managed and governed by Nyuchi Africa. **Mukoko** the product is independently governed and operates as one of many applications that may be built on this infrastructure. These are three distinct governance domains.
+SiafuDB is governed by the **Bundu Foundation** (licence governance and community stewardship). It is maintained by **Nyuchi Africa** (engineering and release management). The **Nyuchi Honeycomb** decentralised network is separately managed and governed by Nyuchi Africa. **Mukoko** the product is independently governed and operates as one of many applications that may be built on this infrastructure. These are three distinct governance domains.
 
 Any developer, company, or project can use SiafuDB without any dependency on Mukoko, the Honeycomb, or Nyuchi's services. SiafuDB is infrastructure for the world. Nyuchi happens to be the company that builds and maintains it. Mukoko happens to be the flagship product that demonstrates its capabilities.
 
@@ -388,9 +388,9 @@ The tri-mode principle is preserved across the entire graph fabric:
 
 ---
 
-*Graph-First Amendment — Addendum: The Graph Fabric*
-*April 2026*
-*Drafted for Bryan Fawcett*
-*Nyuchi Africa / The Bundu Family*
+_Graph-First Amendment — Addendum: The Graph Fabric_
+_April 2026_
+_Drafted for Bryan Fawcett_
+_Nyuchi Africa / The Bundu Family_
 
-*"Two engines. Seven layers. One graph. The relational era is over. The graph era begins here — on every device, at every edge, in every pod, across the entire platform. Built in Africa. Shared with the world."*
+_"Two engines. Seven layers. One graph. The relational era is over. The graph era begins here — on every device, at every edge, in every pod, across the entire platform. Built in Africa. Shared with the world."_

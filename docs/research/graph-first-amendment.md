@@ -92,101 +92,101 @@ The `identity.person` table shrinks to an authentication stub. Only the columns 
 
 Columns retained in `identity.person`:
 
-| Column | Reason |
-|--------|--------|
-| `id` | Primary identifier. UUID. Referenced by JWT `sub` claim. |
-| `stytch_user_id` | Stytch authentication binding. ACID-critical — must never have stale reads. |
-| `email` | Authentication identifier. Unique constraint. |
-| `telephone` | Authentication identifier. Unique constraint. |
-| `name` | Display name — cached here for JWT claims and fast UI rendering. Authoritative copy is the Person vertex in JanusGraph. |
-| `alternatename` | Username/handle. Unique constraint requires ACID enforcement. |
-| `role` | Platform access control role. RBAC enforcement. |
-| `auth_method` | Last authentication method used. |
-| `email_verified` | Verification status for email auth. |
-| `email_verified_at` | Timestamp. |
-| `phone_verified` | Verification status for phone auth. |
-| `phone_verified_at` | Timestamp. |
-| `mit_status` | MIT lifecycle state (living/ancestral). Governs platform-wide behaviour. |
-| `last_liveness_verified_at` | MIT Ancestral Lifecycle Protocol. |
-| `next_liveness_due_at` | MIT Ancestral Lifecycle Protocol. |
-| `liveness_grace_expires_at` | MIT Ancestral Lifecycle Protocol. |
-| `liveness_extension_granted` | MIT Ancestral Lifecycle Protocol. |
-| `death_verified_at` | MIT Ancestral Lifecycle Protocol. |
-| `death_verification_method` | MIT Ancestral Lifecycle Protocol. |
-| `ancestral_transition_at` | MIT Ancestral Lifecycle Protocol. |
-| `ancestral_reversal_count` | MIT Ancestral Lifecycle Protocol. |
-| `beneficiary_person_id` | MIT Ancestral Lifecycle Protocol. Beneficiary FK. |
-| `beneficiary_type` | MIT Ancestral Lifecycle Protocol. |
-| `heritage_opt_out` | MIT Ancestral Lifecycle Protocol. |
-| `pod_provisioned` | Pod lifecycle tracking. |
-| `pod_endpoint` | Pod connection. |
-| `pod_stream_id` | Pod identity binding. |
-| `pod_provisioned_at` | Pod lifecycle timestamp. |
-| `last_login_at` | Session tracking. |
-| `last_login_method` | Session tracking. |
-| `last_login_platform` | Session tracking. |
-| `last_seen_at` | Activity tracking. |
-| `profile_completed` | Onboarding state. |
-| `onboarding_completed` | Onboarding state. |
-| `created_at` | System timestamp. |
-| `updated_at` | System timestamp. |
+| Column                       | Reason                                                                                                                  |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `id`                         | Primary identifier. UUID. Referenced by JWT `sub` claim.                                                                |
+| `stytch_user_id`             | Stytch authentication binding. ACID-critical — must never have stale reads.                                             |
+| `email`                      | Authentication identifier. Unique constraint.                                                                           |
+| `telephone`                  | Authentication identifier. Unique constraint.                                                                           |
+| `name`                       | Display name — cached here for JWT claims and fast UI rendering. Authoritative copy is the Person vertex in JanusGraph. |
+| `alternatename`              | Username/handle. Unique constraint requires ACID enforcement.                                                           |
+| `role`                       | Platform access control role. RBAC enforcement.                                                                         |
+| `auth_method`                | Last authentication method used.                                                                                        |
+| `email_verified`             | Verification status for email auth.                                                                                     |
+| `email_verified_at`          | Timestamp.                                                                                                              |
+| `phone_verified`             | Verification status for phone auth.                                                                                     |
+| `phone_verified_at`          | Timestamp.                                                                                                              |
+| `mit_status`                 | MIT lifecycle state (living/ancestral). Governs platform-wide behaviour.                                                |
+| `last_liveness_verified_at`  | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `next_liveness_due_at`       | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `liveness_grace_expires_at`  | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `liveness_extension_granted` | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `death_verified_at`          | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `death_verification_method`  | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `ancestral_transition_at`    | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `ancestral_reversal_count`   | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `beneficiary_person_id`      | MIT Ancestral Lifecycle Protocol. Beneficiary FK.                                                                       |
+| `beneficiary_type`           | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `heritage_opt_out`           | MIT Ancestral Lifecycle Protocol.                                                                                       |
+| `pod_provisioned`            | Pod lifecycle tracking.                                                                                                 |
+| `pod_endpoint`               | Pod connection.                                                                                                         |
+| `pod_stream_id`              | Pod identity binding.                                                                                                   |
+| `pod_provisioned_at`         | Pod lifecycle timestamp.                                                                                                |
+| `last_login_at`              | Session tracking.                                                                                                       |
+| `last_login_method`          | Session tracking.                                                                                                       |
+| `last_login_platform`        | Session tracking.                                                                                                       |
+| `last_seen_at`               | Activity tracking.                                                                                                      |
+| `profile_completed`          | Onboarding state.                                                                                                       |
+| `onboarding_completed`       | Onboarding state.                                                                                                       |
+| `created_at`                 | System timestamp.                                                                                                       |
+| `updated_at`                 | System timestamp.                                                                                                       |
 
 Columns removed from `identity.person` (moved to Person vertex in JanusGraph):
 
-| Column | Graph Representation |
-|--------|---------------------|
-| `givenname` | Person vertex property |
-| `familyname` | Person vertex property |
-| `additionalname` | Person vertex property |
-| `honorificprefix` | Person vertex property |
-| `honorificsuffix` | Person vertex property |
-| `image` | Person vertex property |
-| `url` | Person vertex property |
-| `birthdate` | Person vertex property |
-| `deathdate` | Person vertex property |
-| `gender` | Person vertex property |
-| `address` | Person vertex property (jsonb → structured properties) |
-| `nationality` | Person vertex property (jsonb → structured properties) |
-| `jobtitle` | EMPLOYED_BY edge property |
-| `worksfor` | EMPLOYED_BY edge to Organisation vertex |
-| `affiliation` | AFFILIATED_WITH edge(s) to Organisation vertices |
-| `alumniof` | ALUMNI_OF edge(s) to Organisation vertices |
-| `knowslanguage` | KNOWS_LANGUAGE edge(s) to Language vertices |
-| `knowsabout` | KNOWS_ABOUT edge(s) to Topic/Interest vertices |
-| `hasoccupation` | HAS_OCCUPATION edge to Occupation vertex |
-| `award` | HAS_AWARD edge(s) to Award vertices |
-| `contactpoint` | Person vertex property |
-| `description` | Person vertex property |
-| `bio` | Person vertex property |
-| `cover_image` | Person vertex property |
-| `portfolio_url` | Person vertex property |
-| `social_links` | LINKED_ON edge(s) to Platform vertices |
-| `memberof_summary` | Derived from MEMBER_OF edges (no longer stored — computed from graph) |
-| `active_roles` | Derived from HAS_ROLE edges (no longer stored — computed from graph) |
+| Column                | Graph Representation                                                            |
+| --------------------- | ------------------------------------------------------------------------------- |
+| `givenname`           | Person vertex property                                                          |
+| `familyname`          | Person vertex property                                                          |
+| `additionalname`      | Person vertex property                                                          |
+| `honorificprefix`     | Person vertex property                                                          |
+| `honorificsuffix`     | Person vertex property                                                          |
+| `image`               | Person vertex property                                                          |
+| `url`                 | Person vertex property                                                          |
+| `birthdate`           | Person vertex property                                                          |
+| `deathdate`           | Person vertex property                                                          |
+| `gender`              | Person vertex property                                                          |
+| `address`             | Person vertex property (jsonb → structured properties)                          |
+| `nationality`         | Person vertex property (jsonb → structured properties)                          |
+| `jobtitle`            | EMPLOYED_BY edge property                                                       |
+| `worksfor`            | EMPLOYED_BY edge to Organisation vertex                                         |
+| `affiliation`         | AFFILIATED_WITH edge(s) to Organisation vertices                                |
+| `alumniof`            | ALUMNI_OF edge(s) to Organisation vertices                                      |
+| `knowslanguage`       | KNOWS_LANGUAGE edge(s) to Language vertices                                     |
+| `knowsabout`          | KNOWS_ABOUT edge(s) to Topic/Interest vertices                                  |
+| `hasoccupation`       | HAS_OCCUPATION edge to Occupation vertex                                        |
+| `award`               | HAS_AWARD edge(s) to Award vertices                                             |
+| `contactpoint`        | Person vertex property                                                          |
+| `description`         | Person vertex property                                                          |
+| `bio`                 | Person vertex property                                                          |
+| `cover_image`         | Person vertex property                                                          |
+| `portfolio_url`       | Person vertex property                                                          |
+| `social_links`        | LINKED_ON edge(s) to Platform vertices                                          |
+| `memberof_summary`    | Derived from MEMBER_OF edges (no longer stored — computed from graph)           |
+| `active_roles`        | Derived from HAS_ROLE edges (no longer stored — computed from graph)            |
 | `total_contributions` | Derived from graph metrics (no longer stored — computed from CONTRIBUTED edges) |
-| `total_published` | Derived from graph metrics (no longer stored — computed from CREATED edges) |
-| `ubuntu_score` | Derived from graph algorithms (PageRank, centrality — computed by JanusGraph) |
-| `theme_id` | Person vertex property |
-| `registered_devices` | Person vertex property |
-| `sameas` | Person vertex property (social profile URLs) |
+| `total_published`     | Derived from graph metrics (no longer stored — computed from CREATED edges)     |
+| `ubuntu_score`        | Derived from graph algorithms (PageRank, centrality — computed by JanusGraph)   |
+| `theme_id`            | Person vertex property                                                          |
+| `registered_devices`  | Person vertex property                                                          |
+| `sameas`              | Person vertex property (social profile URLs)                                    |
 
 Columns removed from `identity.person` (stale references — deleted, not migrated):
 
-| Column | Reason |
-|--------|--------|
-| `d1_person_id` | D1 removed from architecture. Dead reference. |
-| `d1_synced_at` | D1 removed from architecture. Dead reference. |
-| `sync_version` | References D1/PouchDB sync. Dead reference. |
-| `personal_d1_database_id` | D1 removed from architecture. Dead reference. |
-| `personal_d1_database_name` | D1 removed from architecture. Dead reference. |
-| `nft_identity_token_id` | Moves to MIT token management (wallet schema or pod). |
-| `nft_identity_blockchain` | Moves to MIT token management. |
-| `nft_identity_contract_address` | Moves to MIT token management. |
-| `nft_identity_token_uri` | Moves to MIT token management. |
-| `nft_identity_ipfs_hash` | Moves to MIT token management. |
-| `couchdb_doc_id` | CouchDB is sync-only. Not a source of truth reference. |
-| `ceramic_did` | Superseded by Nyuchi Honeycomb pod architecture. |
-| `scylladb_doc_id` | No longer needed — the Person vertex IS the ScyllaDB/JanusGraph record. |
+| Column                          | Reason                                                                  |
+| ------------------------------- | ----------------------------------------------------------------------- |
+| `d1_person_id`                  | D1 removed from architecture. Dead reference.                           |
+| `d1_synced_at`                  | D1 removed from architecture. Dead reference.                           |
+| `sync_version`                  | References D1/PouchDB sync. Dead reference.                             |
+| `personal_d1_database_id`       | D1 removed from architecture. Dead reference.                           |
+| `personal_d1_database_name`     | D1 removed from architecture. Dead reference.                           |
+| `nft_identity_token_id`         | Moves to MIT token management (wallet schema or pod).                   |
+| `nft_identity_blockchain`       | Moves to MIT token management.                                          |
+| `nft_identity_contract_address` | Moves to MIT token management.                                          |
+| `nft_identity_token_uri`        | Moves to MIT token management.                                          |
+| `nft_identity_ipfs_hash`        | Moves to MIT token management.                                          |
+| `couchdb_doc_id`                | CouchDB is sync-only. Not a source of truth reference.                  |
+| `ceramic_did`                   | Superseded by Nyuchi Honeycomb pod architecture.                        |
+| `scylladb_doc_id`               | No longer needed — the Person vertex IS the ScyllaDB/JanusGraph record. |
 
 **2. Financial Ledger (wallet schema — unchanged)**
 
@@ -208,28 +208,28 @@ The system schema remains in Supabase: verification tiers, verification subject 
 
 **Identity tables that become graph structures:**
 
-| Supabase Table | Graph Representation | Reasoning |
-|---------------|---------------------|-----------|
-| `identity.interest` | `INTERESTED_IN` edge (Person → InterestCategory) with `interest_strength` as edge property | This is literally a weighted edge stored as a join table. |
-| `identity.credential` | `HAS_CREDENTIAL` edge (Person → Credential vertex) with all credential properties on the vertex | A credential is an entity connected to a person. The issuer is another edge (Credential → Organisation). |
-| `identity.family` + `identity.family_member` | Family subgraph: `FAMILY_MEMBER_OF` edges between Person vertices with `relationship` as edge property | Family relationships are the purest graph structure. Parent-child, spouse, sibling — these are edges. |
-| `identity.person_role` | `HAS_ROLE` edge (Person → Role vertex) with context, status, verification as edge properties | A role is a relationship between a person and a context (organisation, schema, entity). |
-| `identity.oauth_connection` | `AUTHENTICATED_VIA` edge (Person → OAuthProvider vertex) with tokens as encrypted edge properties | Authentication connections are relationships. |
-| `identity.wallet_address` | `HAS_WALLET` edge (Person → WalletAddress vertex) with blockchain, type as vertex properties | Wallet addresses are entities connected to people. |
-| `identity.digital_document` | `HAS_DOCUMENT` edge (Person → Document vertex) | Documents are entities connected to people. |
-| `identity.verification` | `VERIFIED_AT` edge properties on Person vertex, or dedicated Verification vertex for audit trail | Verification is a state of the person node. The audit trail (who verified, when, what evidence) is a subgraph. |
-| `identity.moderation_action` | `MODERATED` edge (Moderator Person → Target entity) with action, reason, timestamps | Moderation is a relationship between a moderator and a target. |
-| `identity.liveness_verification` | Subgraph of Person vertex: `LIVENESS_CHECK` edges with outcomes and timestamps | Liveness is a lifecycle event connected to a person. |
-| `identity.death_verification` + `identity.death_attestation` | `DEATH_VERIFIED` edge (Person → DeathVerification vertex), `ATTESTED_BY` edges from attesters | Death verification is a subgraph of relationships — the deceased, the submitter, the attesters, the verifier. |
+| Supabase Table                                               | Graph Representation                                                                                   | Reasoning                                                                                                      |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `identity.interest`                                          | `INTERESTED_IN` edge (Person → InterestCategory) with `interest_strength` as edge property             | This is literally a weighted edge stored as a join table.                                                      |
+| `identity.credential`                                        | `HAS_CREDENTIAL` edge (Person → Credential vertex) with all credential properties on the vertex        | A credential is an entity connected to a person. The issuer is another edge (Credential → Organisation).       |
+| `identity.family` + `identity.family_member`                 | Family subgraph: `FAMILY_MEMBER_OF` edges between Person vertices with `relationship` as edge property | Family relationships are the purest graph structure. Parent-child, spouse, sibling — these are edges.          |
+| `identity.person_role`                                       | `HAS_ROLE` edge (Person → Role vertex) with context, status, verification as edge properties           | A role is a relationship between a person and a context (organisation, schema, entity).                        |
+| `identity.oauth_connection`                                  | `AUTHENTICATED_VIA` edge (Person → OAuthProvider vertex) with tokens as encrypted edge properties      | Authentication connections are relationships.                                                                  |
+| `identity.wallet_address`                                    | `HAS_WALLET` edge (Person → WalletAddress vertex) with blockchain, type as vertex properties           | Wallet addresses are entities connected to people.                                                             |
+| `identity.digital_document`                                  | `HAS_DOCUMENT` edge (Person → Document vertex)                                                         | Documents are entities connected to people.                                                                    |
+| `identity.verification`                                      | `VERIFIED_AT` edge properties on Person vertex, or dedicated Verification vertex for audit trail       | Verification is a state of the person node. The audit trail (who verified, when, what evidence) is a subgraph. |
+| `identity.moderation_action`                                 | `MODERATED` edge (Moderator Person → Target entity) with action, reason, timestamps                    | Moderation is a relationship between a moderator and a target.                                                 |
+| `identity.liveness_verification`                             | Subgraph of Person vertex: `LIVENESS_CHECK` edges with outcomes and timestamps                         | Liveness is a lifecycle event connected to a person.                                                           |
+| `identity.death_verification` + `identity.death_attestation` | `DEATH_VERIFIED` edge (Person → DeathVerification vertex), `ATTESTED_BY` edges from attesters          | Death verification is a subgraph of relationships — the deceased, the submitter, the attesters, the verifier.  |
 
 **Business tables that become graph structures:**
 
-| Supabase Table | Graph Representation | Reasoning |
-|---------------|---------------------|-----------|
+| Supabase Table          | Graph Representation                                                                                                                                                                                      | Reasoning                                                                                                |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | `business.organization` | Organisation vertex with properties. Edges: `FOUNDED_BY` (→ Person), `LOCATED_IN` (→ Place), `CATEGORIZED_AS` (→ Industry/Type), `IN_COUNTRY` (→ Country), `IN_PROVINCE` (→ Province), `IN_CITY` (→ City) | An organisation is a node defined by its connections. Its type, location, industry, founder — all edges. |
-| `business.membership` | `MEMBER_OF` edge (Person → Organisation) with role, permissions, capabilities, verification status as edge properties | Membership is the textbook graph edge use case. |
-| `business.verification` | `VERIFICATION_REQUEST` edge (Person → Organisation) with workflow state, evidence, reviewer as properties | Business verification is a relationship workflow between a person and an organisation. |
-| `business.api_key` | `HAS_API_KEY` edge (Organisation → APIKey vertex) with scopes, limits, status | API keys are entities bound to organisations and issued to people. |
+| `business.membership`   | `MEMBER_OF` edge (Person → Organisation) with role, permissions, capabilities, verification status as edge properties                                                                                     | Membership is the textbook graph edge use case.                                                          |
+| `business.verification` | `VERIFICATION_REQUEST` edge (Person → Organisation) with workflow state, evidence, reviewer as properties                                                                                                 | Business verification is a relationship workflow between a person and an organisation.                   |
+| `business.api_key`      | `HAS_API_KEY` edge (Organisation → APIKey vertex) with scopes, limits, status                                                                                                                             | API keys are entities bound to organisations and issued to people.                                       |
 
 **Organisation vertex — columns retained as vertex properties vs. derived from edges:**
 
@@ -243,40 +243,40 @@ Note: Verification and capability flags could remain in Supabase as an alternati
 
 **Engagement tables that become graph structures:**
 
-| Supabase Table | Graph Representation | Reasoning |
-|---------------|---------------------|-----------|
-| `engagement.follow_action` | `FOLLOWS` edge (Person → Person/Organisation/Place) | Following is a relationship. |
-| `engagement.review` | `REVIEWED` edge (Person → Entity) with rating, headline, body as edge properties | A review is a relationship between a reviewer and a reviewed entity. |
-| `engagement.unverified_interaction` | Untyped interaction edges, flowing to Doris for analytics | Interactions are relationships. |
-| `engagement.user_action` | Action edges (Person → Entity) with action type, timestamp | Actions are relationships between people and content. |
-| `engagement.interaction_counter` | Derived from edge counts (no longer stored — computed from graph) | Counters are graph metrics, not stored values. |
-| `engagement.recommendation` | `RECOMMENDED` edge from system to Person, with item reference | Recommendations are relationships. |
+| Supabase Table                      | Graph Representation                                                             | Reasoning                                                            |
+| ----------------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `engagement.follow_action`          | `FOLLOWS` edge (Person → Person/Organisation/Place)                              | Following is a relationship.                                         |
+| `engagement.review`                 | `REVIEWED` edge (Person → Entity) with rating, headline, body as edge properties | A review is a relationship between a reviewer and a reviewed entity. |
+| `engagement.unverified_interaction` | Untyped interaction edges, flowing to Doris for analytics                        | Interactions are relationships.                                      |
+| `engagement.user_action`            | Action edges (Person → Entity) with action type, timestamp                       | Actions are relationships between people and content.                |
+| `engagement.interaction_counter`    | Derived from edge counts (no longer stored — computed from graph)                | Counters are graph metrics, not stored values.                       |
+| `engagement.recommendation`         | `RECOMMENDED` edge from system to Person, with item reference                    | Recommendations are relationships.                                   |
 
 Note: Tables marked "DORIS DOMAIN" in Supabase (`user_action`, `interaction_counter`, `unverified_interaction`, `recommendation`) are already caches. In the graph-first model, the authoritative engagement data flows through JanusGraph (as edges) → Redpanda (Layer 4) → Flink → Doris (Layer 7). The Supabase cache tables for these can be dropped entirely.
 
 **Ubuntu tables that become graph structures:**
 
-| Supabase Table | Graph Representation | Reasoning |
-|---------------|---------------------|-----------|
-| `ubuntu.contribution` | `CONTRIBUTED` edge (Person → Entity) with contribution type (content, review, verification, moderation, translation, curation, mentorship) as edge property | Contributions are relationships. The seven types map to seven edge subtypes. |
-| `ubuntu.impact_scores` | Derived from graph algorithms — PageRank, betweenness centrality, community detection | Impact is a graph metric, not a stored value. |
-| `ubuntu.leaderboards` | Derived from graph metrics | Rankings are computed from the graph. |
-| `ubuntu.user_badges` | `EARNED` edge (Person → Badge vertex) | Badge awards are relationships. |
-| `ubuntu.mission_progress` | `PROGRESSING` edge (Person → Mission vertex) with completion state | Mission progress is a relationship. |
-| `ubuntu.dao_proposals` | `PROPOSED` edge (Person → Proposal vertex) | Governance proposals are relationships. |
+| Supabase Table            | Graph Representation                                                                                                                                        | Reasoning                                                                    |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `ubuntu.contribution`     | `CONTRIBUTED` edge (Person → Entity) with contribution type (content, review, verification, moderation, translation, curation, mentorship) as edge property | Contributions are relationships. The seven types map to seven edge subtypes. |
+| `ubuntu.impact_scores`    | Derived from graph algorithms — PageRank, betweenness centrality, community detection                                                                       | Impact is a graph metric, not a stored value.                                |
+| `ubuntu.leaderboards`     | Derived from graph metrics                                                                                                                                  | Rankings are computed from the graph.                                        |
+| `ubuntu.user_badges`      | `EARNED` edge (Person → Badge vertex)                                                                                                                       | Badge awards are relationships.                                              |
+| `ubuntu.mission_progress` | `PROGRESSING` edge (Person → Mission vertex) with completion state                                                                                          | Mission progress is a relationship.                                          |
+| `ubuntu.dao_proposals`    | `PROPOSED` edge (Person → Proposal vertex)                                                                                                                  | Governance proposals are relationships.                                      |
 
 Note: `ubuntu.badges` (badge definitions) and `ubuntu.missions` (mission definitions) stay in Supabase as platform configuration — they are reference data, not user data.
 
 **Shamwari tables that become graph structures:**
 
-| Supabase Table | Graph Representation | Reasoning |
-|---------------|---------------------|-----------|
-| `shamwari.preference` | Person vertex properties or `PREFERS` edges | AI preferences are personal attributes. |
-| `shamwari.user_preferences` | Person vertex properties | AI preferences are personal attributes. |
-| `shamwari.suggestions` | `SUGGESTED` edge (System → Person) with suggestion content | Suggestions are relationships. |
-| `shamwari.context_windows` | Ephemeral — lives in ScyllaDB as session data, not graph | Context windows are temporary computation state. |
-| `shamwari.tool_usage` | `USED_TOOL` edge (Person → Tool) with timestamp, context | Tool usage is a relationship. |
-| `shamwari.feedback` | `GAVE_FEEDBACK` edge (Person → Conversation) | Feedback is a relationship. |
+| Supabase Table              | Graph Representation                                       | Reasoning                                        |
+| --------------------------- | ---------------------------------------------------------- | ------------------------------------------------ |
+| `shamwari.preference`       | Person vertex properties or `PREFERS` edges                | AI preferences are personal attributes.          |
+| `shamwari.user_preferences` | Person vertex properties                                   | AI preferences are personal attributes.          |
+| `shamwari.suggestions`      | `SUGGESTED` edge (System → Person) with suggestion content | Suggestions are relationships.                   |
+| `shamwari.context_windows`  | Ephemeral — lives in ScyllaDB as session data, not graph   | Context windows are temporary computation state. |
+| `shamwari.tool_usage`       | `USED_TOOL` edge (Person → Tool) with timestamp, context   | Tool usage is a relationship.                    |
+| `shamwari.feedback`         | `GAVE_FEEDBACK` edge (Person → Conversation)               | Feedback is a relationship.                      |
 
 Note: `shamwari.conversation` already stores only metadata in Supabase (messages are in ScyllaDB). In the graph-first model, conversation metadata becomes a Conversation vertex with `PARTICIPATED_IN` edges from Person vertices. The Supabase record is dropped.
 
@@ -330,58 +330,58 @@ The Layer 3 Amendment defined six primary node types. The graph-first amendment 
 
 ### Vertex Types
 
-| Vertex Label | Source | Key Properties |
-|-------------|--------|---------------|
-| Person | `identity.person` (auth stub in Supabase, full profile in graph) | id, givenname, familyname, birthdate, gender, bio, image, description |
-| Organisation | `business.organization` (governance in Supabase, profile in graph) | id, name, description, url, logo, foundingdate, registration_number |
-| Place | `places.places` + `places.places_geo` | id, name, schema_type, latitude, longitude, geo |
-| Country | `places.countries` | id, name, iso_code |
-| Province | `places.provinces` | id, name |
-| Content | `content.creative_work` + all mini-app content types | id, type, name, headline, datepublished |
-| InterestCategory | `engagement.interest_category` (definition in Supabase, vertex in graph) | id, name, slug, icon |
-| Circle | `circles.circle` | id, name, description, circle_type |
-| Conversation | `campfire.conversation` metadata | id, type, name, created_at |
-| Event | `events.event` metadata | id, name, startdate, enddate, location |
-| Credential | `identity.credential` | id, name, category, issuer_name, date_issued |
-| Badge | `ubuntu.badges` | id, name, description, category |
-| Mission | `ubuntu.missions` | id, name, type, status |
-| Language | New — language reference vertices | id, name, iso_code |
-| Occupation | New — occupation reference vertices (Schema.org Occupation) | id, name, occupational_category |
-| Industry | New — industry reference vertices | id, name |
+| Vertex Label     | Source                                                                   | Key Properties                                                        |
+| ---------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| Person           | `identity.person` (auth stub in Supabase, full profile in graph)         | id, givenname, familyname, birthdate, gender, bio, image, description |
+| Organisation     | `business.organization` (governance in Supabase, profile in graph)       | id, name, description, url, logo, foundingdate, registration_number   |
+| Place            | `places.places` + `places.places_geo`                                    | id, name, schema_type, latitude, longitude, geo                       |
+| Country          | `places.countries`                                                       | id, name, iso_code                                                    |
+| Province         | `places.provinces`                                                       | id, name                                                              |
+| Content          | `content.creative_work` + all mini-app content types                     | id, type, name, headline, datepublished                               |
+| InterestCategory | `engagement.interest_category` (definition in Supabase, vertex in graph) | id, name, slug, icon                                                  |
+| Circle           | `circles.circle`                                                         | id, name, description, circle_type                                    |
+| Conversation     | `campfire.conversation` metadata                                         | id, type, name, created_at                                            |
+| Event            | `events.event` metadata                                                  | id, name, startdate, enddate, location                                |
+| Credential       | `identity.credential`                                                    | id, name, category, issuer_name, date_issued                          |
+| Badge            | `ubuntu.badges`                                                          | id, name, description, category                                       |
+| Mission          | `ubuntu.missions`                                                        | id, name, type, status                                                |
+| Language         | New — language reference vertices                                        | id, name, iso_code                                                    |
+| Occupation       | New — occupation reference vertices (Schema.org Occupation)              | id, name, occupational_category                                       |
+| Industry         | New — industry reference vertices                                        | id, name                                                              |
 
 ### Edge Types
 
-| Edge Label | From → To | Key Properties |
-|-----------|-----------|---------------|
-| INTERESTED_IN | Person → InterestCategory | interest_strength, added_at |
-| MEMBER_OF | Person → Organisation | role, business_role, permissions, status, joined_at, can_manage_org, can_publish, can_transact |
-| MEMBER_OF | Person → Circle | role, joined_at, status |
-| FOUNDED_BY | Organisation → Person | |
-| EMPLOYED_BY | Person → Organisation | jobtitle, role_title, start_date, end_date |
-| LOCATED_IN | Organisation/Event/Place → Place/City/Province/Country | |
-| CONTAINS | Country → Province, Province → City, City → Place | |
-| PART_OF | Place → Place (geographic hierarchy) | relation_type |
-| CREATED | Person → Content | role (author, editor, contributor), datepublished |
-| FOLLOWS | Person → Person/Organisation/Place | created_at |
-| MESSAGES_WITH | Person → Person (via Conversation) | last_message_at |
-| PARTICIPATES_IN | Person → Conversation/Event/Circle | role, joined_at |
-| HAS_CREDENTIAL | Person → Credential | verification_level, verified_at |
-| ISSUED_BY | Credential → Organisation | |
-| ALUMNI_OF | Person → Organisation | |
-| AFFILIATED_WITH | Person → Organisation | |
-| KNOWS_LANGUAGE | Person → Language | proficiency |
-| HAS_OCCUPATION | Person → Occupation | |
-| CATEGORIZED_AS | Organisation/Content/Event → InterestCategory/Industry | |
-| REVIEWED | Person → Content/Organisation/Place | rating, headline, body |
-| CONTRIBUTED | Person → Entity | contribution_type (7 Ubuntu types), created_at |
-| EARNED | Person → Badge | earned_at |
-| CONFIRMED | Person → Place | confirmed_at |
-| OWNS | Person → Place | verified, verified_at |
-| FAMILY_OF | Person → Person | relationship (parent, child, spouse, sibling, relatedTo) |
-| HAS_WALLET | Person → WalletAddress | blockchain, wallet_type, is_primary |
-| VERIFIED_BY | Organisation/Place/Person → Person | verification_tier, verified_at |
-| TRANSACTS_WITH | Person → Person/Organisation | transaction_type, last_transaction_at |
-| AUTHENTICATED_VIA | Person → OAuthProvider | provider, connected_at |
+| Edge Label        | From → To                                              | Key Properties                                                                                 |
+| ----------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| INTERESTED_IN     | Person → InterestCategory                              | interest_strength, added_at                                                                    |
+| MEMBER_OF         | Person → Organisation                                  | role, business_role, permissions, status, joined_at, can_manage_org, can_publish, can_transact |
+| MEMBER_OF         | Person → Circle                                        | role, joined_at, status                                                                        |
+| FOUNDED_BY        | Organisation → Person                                  |                                                                                                |
+| EMPLOYED_BY       | Person → Organisation                                  | jobtitle, role_title, start_date, end_date                                                     |
+| LOCATED_IN        | Organisation/Event/Place → Place/City/Province/Country |                                                                                                |
+| CONTAINS          | Country → Province, Province → City, City → Place      |                                                                                                |
+| PART_OF           | Place → Place (geographic hierarchy)                   | relation_type                                                                                  |
+| CREATED           | Person → Content                                       | role (author, editor, contributor), datepublished                                              |
+| FOLLOWS           | Person → Person/Organisation/Place                     | created_at                                                                                     |
+| MESSAGES_WITH     | Person → Person (via Conversation)                     | last_message_at                                                                                |
+| PARTICIPATES_IN   | Person → Conversation/Event/Circle                     | role, joined_at                                                                                |
+| HAS_CREDENTIAL    | Person → Credential                                    | verification_level, verified_at                                                                |
+| ISSUED_BY         | Credential → Organisation                              |                                                                                                |
+| ALUMNI_OF         | Person → Organisation                                  |                                                                                                |
+| AFFILIATED_WITH   | Person → Organisation                                  |                                                                                                |
+| KNOWS_LANGUAGE    | Person → Language                                      | proficiency                                                                                    |
+| HAS_OCCUPATION    | Person → Occupation                                    |                                                                                                |
+| CATEGORIZED_AS    | Organisation/Content/Event → InterestCategory/Industry |                                                                                                |
+| REVIEWED          | Person → Content/Organisation/Place                    | rating, headline, body                                                                         |
+| CONTRIBUTED       | Person → Entity                                        | contribution_type (7 Ubuntu types), created_at                                                 |
+| EARNED            | Person → Badge                                         | earned_at                                                                                      |
+| CONFIRMED         | Person → Place                                         | confirmed_at                                                                                   |
+| OWNS              | Person → Place                                         | verified, verified_at                                                                          |
+| FAMILY_OF         | Person → Person                                        | relationship (parent, child, spouse, sibling, relatedTo)                                       |
+| HAS_WALLET        | Person → WalletAddress                                 | blockchain, wallet_type, is_primary                                                            |
+| VERIFIED_BY       | Organisation/Place/Person → Person                     | verification_tier, verified_at                                                                 |
+| TRANSACTS_WITH    | Person → Person/Organisation                           | transaction_type, last_transaction_at                                                          |
+| AUTHENTICATED_VIA | Person → OAuthProvider                                 | provider, connected_at                                                                         |
 
 ### Tri-Mode for the Knowledge Graph
 
@@ -623,8 +623,8 @@ Each phase is independently deployable. Each phase can be rolled back. The platf
 
 ---
 
-*Graph-First Architectural Amendment — April 2026*
-*Drafted for Bryan Fawcett*
-*Nyuchi Africa / The Bundu Family*
+_Graph-First Architectural Amendment — April 2026_
+_Drafted for Bryan Fawcett_
+_Nyuchi Africa / The Bundu Family_
 
-*"The relational database was the best tool we had. The graph database is the tool we need. Frontier infrastructure does not inherit the constraints of the previous era."*
+_"The relational database was the best tool we had. The graph database is the tool we need. Frontier infrastructure does not inherit the constraints of the previous era."_

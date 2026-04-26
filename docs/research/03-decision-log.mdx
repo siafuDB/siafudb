@@ -81,10 +81,10 @@ IPv4 NAT breaks peer-to-peer signal propagation. IPv6 gives every device a routa
 
 ## Decision 16: SiafuDB and NTL Are Separate Repos
 
-**Decision:** SiafuDB lives at `nyuchitech/siafudb`. NTL lives at `nyuchi/ntl`. Each has its own documentation, research, and release cycle. SiafuDB depends on NTL as a library when GSPN is enabled. The signal primitive (`ntl-signal`) lives in the NTL repo. Research that spans both projects is cross-referenced, not duplicated.
+**Decision:** SiafuDB lives at `nyuchi/siafudb`. NTL lives at `nyuchi/ntl`. Each has its own documentation, research, and release cycle. SiafuDB depends on NTL as a library when GSPN is enabled. The signal primitive (`ntl-signal`) lives in the NTL repo. Research that spans both projects is cross-referenced, not duplicated.
 
 **Rationale:** Each is independently useful. Separate repos enable independent adoption, independent contribution, and clear ownership. Engineers interested in the database contribute to SiafuDB. Engineers interested in the signal primitive or transfer layer contribute to NTL.
 
 ---
 
-*Decision Log — April 2026 — Nyuchi Africa*
+_Decision Log — April 2026 — Nyuchi Africa_

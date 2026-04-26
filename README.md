@@ -4,13 +4,13 @@
 
 **The embedded graph database for device, edge, and Web3.**
 
-*Named after the African army ant (Dorylus) — small, embedded, unnoticed,*
-*but the ecosystem collapses without it.*
+_Named after the African army ant (Dorylus) — small, embedded, unnoticed,_
+_but the ecosystem collapses without it._
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/nyuchitech/siafudb.svg)](https://github.com/nyuchitech/siafudb/stargazers)
+[![GitHub Stars](https://img.shields.io/github/stars/nyuchi/siafudb.svg)](https://github.com/nyuchi/siafudb/stargazers)
 
-[Website](https://siafudb.org) · [Documentation](https://siafudb.org/docs) · [Getting Started](https://siafudb.org/docs/getting-started) · [Community](https://github.com/nyuchitech/siafudb/discussions)
+[Website](https://siafudb.org) · [Documentation](https://siafudb.org/docs) · [Getting Started](https://siafudb.org/docs/getting-started) · [Community](https://github.com/nyuchi/siafudb/discussions)
 
 </div>
 
@@ -39,6 +39,7 @@ SiafuDB is built on [Grafeo](https://grafeo.dev), a pure-Rust embedded graph eng
 ### Key Features
 
 **Core engine (via Grafeo):**
+
 - Embedded Rust engine — in-process, zero network overhead, sub-millisecond queries
 - Six query languages — GQL (ISO standard), Cypher, Gremlin, GraphQL, SPARQL, SQL/PGQ
 - ACID transactions with configurable isolation levels
@@ -51,6 +52,7 @@ SiafuDB is built on [Grafeo](https://grafeo.dev), a pure-Rust embedded graph eng
 - LPG and RDF dual data model support
 
 **SiafuDB extensions (in development):**
+
 - **Graph Sync Protocol** — CRDT-inspired bidirectional subgraph replication between SiafuDB instances and server-side graph databases
 - **Web3 pod storage** — embedded graph store for decentralised personal data pods with cryptographic identity binding
 - **Edge deployment profiles** — optimised WASM builds for edge runtimes, browsers, and constrained environments
@@ -59,6 +61,7 @@ SiafuDB is built on [Grafeo](https://grafeo.dev), a pure-Rust embedded graph eng
 ## Quick Start
 
 ### Python
+
 ```bash
 pip install siafudb
 ```
@@ -88,18 +91,21 @@ for row in result:
 ```
 
 ### Rust
+
 ```bash
 cargo add siafudb
 ```
 
 ### Node.js
+
 ```bash
 npm install siafudb
 ```
 
 ### Go
+
 ```bash
-go get github.com/nyuchitech/siafudb-go
+go get github.com/nyuchi/siafudb-go
 ```
 
 ## Use Cases
@@ -120,37 +126,41 @@ SiafuDB is general-purpose infrastructure. Some examples of what you can build:
 
 SiafuDB is designed as one half of a two-engine architecture. Server-side graph databases (JanusGraph, Grafeo Server, or any graph database) handle the platform-scale graph. SiafuDB handles the embedded graph — on device, at the edge, in the pod, in the browser.
 
-| Environment | Engine | Role |
-|-------------|--------|------|
-| Server (cloud) | JanusGraph, Grafeo Server, or any graph DB | Platform graph (billions of nodes) |
-| Device (mobile) | **SiafuDB** (native) | Personal subgraph, offline AI reasoning |
-| Edge (CDN) | **SiafuDB** (WASM) | Cached regional subgraphs |
-| Web3 (pod) | **SiafuDB** (embedded) | Sovereign personal data graph |
-| Browser (web) | **SiafuDB** (WASM) | Client-side graph cache |
+| Environment     | Engine                                     | Role                                    |
+| --------------- | ------------------------------------------ | --------------------------------------- |
+| Server (cloud)  | JanusGraph, Grafeo Server, or any graph DB | Platform graph (billions of nodes)      |
+| Device (mobile) | **SiafuDB** (native)                       | Personal subgraph, offline AI reasoning |
+| Edge (CDN)      | **SiafuDB** (WASM)                         | Cached regional subgraphs               |
+| Web3 (pod)      | **SiafuDB** (embedded)                     | Sovereign personal data graph           |
+| Browser (web)   | **SiafuDB** (WASM)                         | Client-side graph cache                 |
 
 The **Graph Sync Protocol** connects SiafuDB instances to each other and to server-side graph databases. The protocol is transport-agnostic — it works over HTTP, WebSocket, CouchDB replication, Kafka-compatible streaming, or any custom transport.
 
 ## Building from Source
 
 ### Prerequisites
+
 - Rust 1.75+ (with cargo)
 - CMake 3.15+ (for native bindings)
 - Python 3.9+ (for Python bindings)
 - wasm-pack (for WASM builds)
 
 ### Build
+
 ```bash
-git clone https://github.com/nyuchitech/siafudb.git
+git clone https://github.com/nyuchi/siafudb.git
 cd siafudb
 cargo build --release
 ```
 
 ### Run Tests
+
 ```bash
 cargo test
 ```
 
 ### Build WASM
+
 ```bash
 wasm-pack build --target web siafudb-edge
 ```
@@ -160,6 +170,7 @@ For detailed build instructions, see the [Developer Guide](https://siafudb.org/d
 ## Roadmap
 
 ### Phase 1 — Foundation (Current)
+
 - [x] Establish SiafuDB project under Apache 2.0
 - [ ] Integrate Grafeo core as the embedded engine
 - [ ] Publish initial SiafuDB releases (Python, Node.js, Rust, Go)
@@ -167,6 +178,7 @@ For detailed build instructions, see the [Developer Guide](https://siafudb.org/d
 - [ ] Launch siafudb.org documentation site
 
 ### Phase 2 — Graph Sync Protocol
+
 - [ ] Design graph change log format (vertex/edge CRUD events)
 - [ ] Implement local change log capture
 - [ ] Implement bidirectional sync between SiafuDB instances
@@ -175,18 +187,21 @@ For detailed build instructions, see the [Developer Guide](https://siafudb.org/d
 - [ ] Sync with JanusGraph and other server-side graph databases
 
 ### Phase 3 — Edge & WASM
+
 - [ ] Optimised WASM builds for edge runtimes (Cloudflare, Deno, Fastly, Vercel, browser)
 - [ ] Browser-based graph engine with persistent storage
 - [ ] Edge subgraph caching with configurable scoping rules
 - [ ] Memory and binary size optimisation for constrained runtimes
 
 ### Phase 4 — Web3 & Pod
+
 - [ ] Decentralised pod storage engine
 - [ ] Cryptographic identity binding for pod graphs
 - [ ] Pod replication across decentralised networks
 - [ ] Heritage graph transformation (PII stripping, anonymisation)
 
 ### Phase 5 — Native Platform Bindings
+
 - [ ] Swift/SwiftUI binding (iOS) via C FFI
 - [ ] Kotlin/JVM binding (Android)
 - [ ] ArkTS/ArkUI binding (HarmonyOS) via N-API
@@ -194,7 +209,7 @@ For detailed build instructions, see the [Developer Guide](https://siafudb.org/d
 
 ## Engine Roadmap
 
-SiafuDB's storage and query engine is [Grafeo](https://grafeo.dev) — pure Rust, Apache 2.0, embedded — and Grafeo remains the primary engine throughout. The direction is to bring the published research and design of three further open-source graph databases into the SiafuDB stack as Rust work *around* Grafeo first; Grafeo itself is touched last, only once the other lineages are integrated and the convergence is concrete.
+SiafuDB's storage and query engine is [Grafeo](https://grafeo.dev) — pure Rust, Apache 2.0, embedded — and Grafeo remains the primary engine throughout. The direction is to bring the published research and design of three further open-source graph databases into the SiafuDB stack as Rust work _around_ Grafeo first; Grafeo itself is touched last, only once the other lineages are integrated and the convergence is concrete.
 
 ### Stage 1 — KuzuDB and LadybugDB algorithms into Rust
 
@@ -216,19 +231,19 @@ Please read our [Contributing Guide](CONTRIBUTING.md) before submitting a pull r
 
 ### Code of Conduct
 
-SiafuDB is built on the Ubuntu philosophy — *I am because we are*. We are committed to providing a welcoming and inclusive environment for everyone. Please read our [Code of Conduct](CODE_OF_CONDUCT.md).
+SiafuDB is built on the Ubuntu philosophy — _I am because we are_. We are committed to providing a welcoming and inclusive environment for everyone. Please read our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Licence
 
 SiafuDB is licensed under the [Apache License, Version 2.0](LICENSE).
 
-**The Apache 2.0 licence will never change.** SiafuDB is governed by the [Mukoko Foundation](https://mukoko.com/foundation) (Mauritius, Foundations Act 2012) — a legal entity with no shareholders that exists for the community. The Foundation's charter structurally prevents relicensing. This is not a promise. It is a legal guarantee.
+**The Apache 2.0 licence will never change.** SiafuDB is governed by the **The Bundu Foundation** (Zimbabwean Company Limited by Guarantee) — a legal entity with no shareholders that exists for the community. The Foundation's charter structurally prevents relicensing. This is not a promise. It is a legal guarantee.
 
 ## About
 
-SiafuDB is open-source infrastructure maintained by [Nyuchi Africa](https://nyuchi.com) and governed by the [Mukoko Foundation](https://mukoko.com/foundation).
+SiafuDB is open-source infrastructure maintained by [Nyuchi Africa](https://nyuchi.com) and governed by the **The Bundu Foundation**.
 
-It is part of the broader open infrastructure ecosystem built by Nyuchi Africa, alongside the [Nyuchi Honeycomb](https://nyuchi.com/honeycomb) decentralised compute and storage network and the [Nyuchi API Platform](https://nyuchi.com/api). Each is independently governed — Nyuchi Africa manages the Honeycomb network and enterprise infrastructure, the Mukoko Foundation governs SiafuDB and the Mukoko token ecosystem, and [Mukoko](https://mukoko.com) operates independently as a product built on this infrastructure.
+It is part of the broader open infrastructure ecosystem built by Nyuchi Africa, alongside the [Nyuchi Honeycomb](https://nyuchi.com/honeycomb) decentralised compute and storage network and the [Nyuchi API Platform](https://nyuchi.com/api). Each is independently governed — Nyuchi Africa manages the Honeycomb network and enterprise infrastructure, the Bundu Foundation governs SiafuDB and the Mukoko token ecosystem, and [Mukoko](https://mukoko.com) operates independently as a product built on this infrastructure.
 
 SiafuDB is not a product-specific tool. It is infrastructure for anyone building applications that need graph-native intelligence on device, at the edge, or in decentralised networks. Build what you need. The graph is yours.
 
@@ -236,8 +251,8 @@ SiafuDB is not a product-specific tool. It is infrastructure for anyone building
 
 <div align="center">
 
-*The army ant carries the graph.*
+_The army ant carries the graph._
 
-**[Website](https://siafudb.org)** · **[Documentation](https://siafudb.org/docs)** · **[GitHub](https://github.com/nyuchitech/siafudb)** · **[Community](https://github.com/nyuchitech/siafudb/discussions)**
+**[Website](https://siafudb.org)** · **[Documentation](https://siafudb.org/docs)** · **[GitHub](https://github.com/nyuchi/siafudb)** · **[Community](https://github.com/nyuchi/siafudb/discussions)**
 
 </div>

@@ -2,6 +2,7 @@
 title: "Database API"
 description: "Opening fragments, schemas, transactions, lifecycle."
 ---
+
 The `Siafu` type is the entry point. Everything else hangs off it.
 
 ## Opening a fragment
@@ -14,12 +15,12 @@ let db = Siafu::open("./my.siafu", FragmentKind::Personal)?;
 
 `FragmentKind` values:
 
-| Kind | Default authority | Typical use |
-|------|-------------------|-------------|
-| `Personal` | Authoritative | On-device pod, personal sovereign data |
-| `Network` | Referenced | Platform-side mirror |
-| `Edge` | Referenced | Read-through cache at edge locations |
-| `Transient` | Local | UI state, sessions — never synced |
+| Kind        | Default authority | Typical use                            |
+| ----------- | ----------------- | -------------------------------------- |
+| `Personal`  | Authoritative     | On-device pod, personal sovereign data |
+| `Network`   | Referenced        | Platform-side mirror                   |
+| `Edge`      | Referenced        | Read-through cache at edge locations   |
+| `Transient` | Local             | UI state, sessions — never synced      |
 
 ## Schema
 

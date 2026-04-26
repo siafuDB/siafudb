@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to SiafuDB. Every contribution strengthens the colony.
 
-SiafuDB is open-source infrastructure — an embedded graph database for device, edge, and Web3 environments. It is maintained by [Nyuchi Africa](https://nyuchi.com) and governed by the [Mukoko Foundation](https://mukoko.com/foundation). We welcome contributions from everyone — whether you're fixing a typo, improving documentation, reporting a bug, or building a major new feature.
+SiafuDB is open-source infrastructure — an embedded graph database for device, edge, and Web3 environments. It is maintained by [Nyuchi Africa](https://nyuchi.com) and governed by the **The Bundu Foundation**. We welcome contributions from everyone — whether you're fixing a typo, improving documentation, reporting a bug, or building a major new feature.
 
 ## Getting Started
 
@@ -16,6 +16,7 @@ cd siafudb
 ### 2. Build from Source
 
 **Prerequisites:**
+
 - Rust 1.75+ (with cargo)
 - CMake 3.15+ (for native bindings)
 - Python 3.9+ (for Python bindings)
@@ -37,7 +38,7 @@ All tests must pass before submitting a pull request.
 
 ### Reporting Bugs
 
-- Use [GitHub Issues](https://github.com/nyuchitech/siafudb/issues) to report bugs
+- Use [GitHub Issues](https://github.com/nyuchi/siafudb/issues) to report bugs
 - Search existing issues first to avoid duplicates
 - Include your environment details: OS, Rust version, language binding, SiafuDB version
 - Provide a minimal reproduction case — the smallest possible code that demonstrates the bug
@@ -45,7 +46,7 @@ All tests must pass before submitting a pull request.
 
 ### Suggesting Features
 
-- Use [GitHub Discussions](https://github.com/nyuchitech/siafudb/discussions) for feature ideas and design discussions
+- Use [GitHub Discussions](https://github.com/nyuchi/siafudb/discussions) for feature ideas and design discussions
 - Describe the problem you're trying to solve, not just the solution you want
 - Explain how the feature fits SiafuDB's mission: embedded graph with sync, edge, and Web3 capabilities
 
@@ -81,6 +82,7 @@ Signed-off-by: Your Name <your.email@example.com>
 **Components:** `core`, `sync`, `edge`, `pod`, `wasm`, `vector`, `fts`, `algo`, `gql`, `cypher`, `gremlin`, `python`, `nodejs`, `rust`, `go`, `swift`, `kotlin`, `arkts`, `dart`, `docs`, `ci`, `build`
 
 **Examples:**
+
 ```
 sync: Implement graph change log capture for vertex mutations
 
@@ -116,11 +118,13 @@ Signed-off-by: Amara Diallo <amara@example.com>
 SiafuDB uses the [Developer Certificate of Origin](https://developercertificate.org/) (DCO). Every commit must include a `Signed-off-by` line certifying that you have the right to submit the code under the Apache 2.0 licence.
 
 Add it automatically with:
+
 ```bash
 git commit -s -m "your commit message"
 ```
 
 Or add it manually to your commit message:
+
 ```
 Signed-off-by: Your Name <your.email@example.com>
 ```
@@ -141,6 +145,7 @@ These are the capabilities that make SiafuDB unique. We especially welcome contr
 
 **Graph Sync Protocol (highest priority)**
 The most architecturally significant feature in development. The protocol that enables bidirectional subgraph replication between SiafuDB instances and server-side graph databases. Areas include:
+
 - Graph change log format design and implementation
 - CRDT-based conflict resolution for concurrent edits
 - Transport adapters (HTTP, WebSocket, CouchDB replication, Kafka-compatible streaming)
@@ -148,27 +153,31 @@ The most architecturally significant feature in development. The protocol that e
 - Sync with JanusGraph, Grafeo Server, and other server-side graph databases
 - Performance optimisation for constrained environments (mobile bandwidth, edge memory)
 
-Start with the [Graph Sync Protocol design discussion](https://github.com/nyuchitech/siafudb/discussions).
+Start with the [Graph Sync Protocol design discussion](https://github.com/nyuchi/siafudb/discussions).
 
 **Edge & WASM**
+
 - WASM binary size and performance optimisation for edge runtimes (Cloudflare, Deno, Fastly, Vercel, browser, any WASM environment)
 - Browser-based graph engine improvements
 - Edge subgraph caching with configurable scoping rules
 - Memory optimisation for constrained runtimes
 
 **Web3 & Pod**
+
 - Decentralised pod storage engine design
 - Cryptographic identity binding for pod graphs
 - Pod replication across decentralised networks
 - Heritage graph transformation (PII stripping, anonymisation on lifecycle transitions)
 
 **Native Platform Bindings**
+
 - Swift/SwiftUI binding (iOS) via Rust FFI
 - Kotlin/JVM binding (Android) improvements
 - ArkTS/ArkUI binding (HarmonyOS) via N-API
 - React Native and Flutter bridges
 
 **Always Welcome**
+
 - Documentation — tutorials, getting started guides, API reference, architecture docs
 - Testing — expanded test coverage, edge cases, fuzzing, benchmarks
 - CI/CD — build pipeline improvements, release automation, cross-platform testing
@@ -221,14 +230,14 @@ Don't be discouraged by review feedback — it's how we maintain quality togethe
 
 ## Governance
 
-SiafuDB is governed by the **Mukoko Foundation** (Mauritius, Foundations Act 2012), which protects the Apache 2.0 licence and ensures the project remains community-governed. SiafuDB is maintained by **Nyuchi Africa** (Pvt) Ltd, which provides engineering resources and release management. These are separate responsibilities — the Foundation governs the licence and community stewardship, Nyuchi provides the engineering.
+SiafuDB is governed by the **Bundu Foundation** (Zimbabwean Company Limited by Guarantee), which protects the Apache 2.0 licence and ensures the project remains community-governed. SiafuDB is maintained by **Nyuchi Africa** (Pvt) Ltd, which provides engineering resources and release management. These are separate responsibilities — the Foundation governs the licence and community stewardship, Nyuchi provides the engineering.
 
 Major architectural decisions (new extensions, breaking API changes, new supported platforms) are discussed openly in GitHub Discussions before implementation. The community has a voice in the project's direction.
 
 ## Community
 
-- **[GitHub Discussions](https://github.com/nyuchitech/siafudb/discussions)** — Questions, ideas, design discussions
-- **[GitHub Issues](https://github.com/nyuchitech/siafudb/issues)** — Bug reports, feature requests, task tracking
+- **[GitHub Discussions](https://github.com/nyuchi/siafudb/discussions)** — Questions, ideas, design discussions
+- **[GitHub Issues](https://github.com/nyuchi/siafudb/issues)** — Bug reports, feature requests, task tracking
 - **conduct@siafudb.org** — Code of Conduct concerns
 
 Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before participating in any community space.
@@ -237,10 +246,10 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before participating in an
 
 By contributing to SiafuDB, you agree that your contributions will be licensed under the [Apache License, Version 2.0](LICENSE). You retain copyright over your contributions.
 
-The Apache 2.0 licence will never change. This is structurally guaranteed by the Mukoko Foundation's charter — not a corporate promise that can be reversed.
+The Apache 2.0 licence will never change. This is structurally guaranteed by the Bundu Foundation's charter — not a corporate promise that can be reversed.
 
 ---
 
-*Every contribution strengthens the colony. Every ant matters.*
+_Every contribution strengthens the colony. Every ant matters._
 
-*Built with Ubuntu — I am because we are.*
+_Built with Ubuntu — I am because we are._

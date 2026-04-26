@@ -2,6 +2,7 @@
 title: "Conflict Resolution"
 description: "Vector clocks, resolution strategies, and tie-breaking rules for concurrent mutations."
 ---
+
 Two fragments may commit mutations that touch the same vertex concurrently. Conflict resolution decides which mutation wins, and how — deterministically, so every fragment in the deployment reaches the same answer.
 
 ## Vector clocks
@@ -15,12 +16,12 @@ Every mutation carries a vector clock keyed by fragment identity. Comparing two 
 
 Strategies are declared on the schema or the fragment:
 
-| Strategy | When to use | Behaviour |
-|----------|-------------|-----------|
-| `LastWriterWins` | Personal devices | Highest wall-clock wins; ties broken by `source` UUID |
-| `MergeProperties` | Collaborative content | Non-conflicting property changes merge; conflicting ones fall to `LastWriterWins` |
-| `RejectIncoming` | Authoritative fragments (e.g. platform truth) | Incoming is dropped; a notification may be emitted |
-| `AcceptIncoming` | Caches and read replicas | Incoming wins; local is discarded |
+| Strategy          | When to use                                   | Behaviour                                                                         |
+| ----------------- | --------------------------------------------- | --------------------------------------------------------------------------------- |
+| `LastWriterWins`  | Personal devices                              | Highest wall-clock wins; ties broken by `source` UUID                             |
+| `MergeProperties` | Collaborative content                         | Non-conflicting property changes merge; conflicting ones fall to `LastWriterWins` |
+| `RejectIncoming`  | Authoritative fragments (e.g. platform truth) | Incoming is dropped; a notification may be emitted                                |
+| `AcceptIncoming`  | Caches and read replicas                      | Incoming wins; local is discarded                                                 |
 
 ## Deterministic tie-breaking
 

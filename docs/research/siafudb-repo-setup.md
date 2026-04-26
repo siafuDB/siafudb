@@ -1,21 +1,22 @@
 # SiafuDB Repository Setup Prompt
 
-Use this prompt to transform the forked KuzuDB repository into SiafuDB. Run these steps against the repo at `github.com/nyuchitech/siafudb`.
+Use this prompt to transform the forked KuzuDB repository into SiafuDB. Run these steps against the repo at `github.com/nyuchi/siafudb`.
 
 ---
 
 ## Context for AI Assistant / Developer
 
-You are setting up **SiafuDB** — an embedded, high-performance property graph database for device, edge, and Web3 environments. SiafuDB is forked from KuzuDB v0.11.3 (MIT-licensed, archived by Apple in October 2025). All new code is Apache 2.0. The project is maintained by Nyuchi Africa (Pvt) Ltd and governed by the Mukoko Foundation (Mauritius).
+You are setting up **SiafuDB** — an embedded, high-performance property graph database for device, edge, and Web3 environments. SiafuDB is forked from KuzuDB v0.11.3 (MIT-licensed, archived by Apple in October 2025). All new code is Apache 2.0. The project is maintained by Nyuchi Africa (Pvt) Ltd and governed by the The Bundu Foundation (Zimbabwe).
 
-SiafuDB is named after the African army ant (*Dorylus*), known in Swahili as *siafu* — small, embedded, unnoticed, but the ecosystem collapses without it.
+SiafuDB is named after the African army ant (_Dorylus_), known in Swahili as _siafu_ — small, embedded, unnoticed, but the ecosystem collapses without it.
 
 **Key facts:**
+
 - Original source: `github.com/kuzudb/kuzu` (archived, MIT License)
-- New repo: `github.com/nyuchitech/siafudb`
+- New repo: `github.com/nyuchi/siafudb`
 - New licence: Apache 2.0 for all new code. Original KuzuDB MIT notice preserved.
 - Maintainer: Nyuchi Africa (Pvt) Ltd, Harare, Zimbabwe
-- Governance: Mukoko Foundation Ltd, Mauritius (Foundations Act 2012)
+- Governance: The Bundu Foundation (Zimbabwean Company Limited by Guarantee)
 - Website: `siafudb.org` (primary), `siafudb.dev`, `siafudb.io`, `siafudb.com`
 - Part of the Mukoko platform ecosystem — Africa's super app targeting one billion users
 
@@ -26,6 +27,7 @@ SiafuDB is named after the African army ant (*Dorylus*), known in Swahili as *si
 Replace the existing `LICENSE` file with an Apache 2.0 licence. The copyright holder is "Nyuchi Africa (Pvt) Ltd and SiafuDB Contributors". The year is 2026.
 
 Create the standard Apache 2.0 LICENSE file with:
+
 ```
 Copyright 2026 Nyuchi Africa (Pvt) Ltd and SiafuDB Contributors
 ```
@@ -67,7 +69,7 @@ SOFTWARE.
 
 Replace the entire README.md with the following:
 
-```markdown
+````markdown
 <div align="center">
 
 # SiafuDB
@@ -78,9 +80,9 @@ Replace the entire README.md with the following:
 *but the ecosystem collapses without it.*
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/nyuchitech/siafudb.svg)](https://github.com/nyuchitech/siafudb/stargazers)
+[![GitHub Stars](https://img.shields.io/github/stars/nyuchi/siafudb.svg)](https://github.com/nyuchi/siafudb/stargazers)
 
-[Website](https://siafudb.org) · [Documentation](https://siafudb.org/docs) · [Getting Started](https://siafudb.org/docs/getting-started) · [Community](https://github.com/nyuchitech/siafudb/discussions)
+[Website](https://siafudb.org) · [Documentation](https://siafudb.org/docs) · [Getting Started](https://siafudb.org/docs/getting-started) · [Community](https://github.com/nyuchi/siafudb/discussions)
 
 </div>
 
@@ -90,7 +92,7 @@ Replace the entire README.md with the following:
 
 SiafuDB is an embedded, high-performance property graph database purpose-built for environments where server-side databases cannot reach — mobile devices, edge runtimes, Web3 nodes, and browsers.
 
-SiafuDB is forked from [KuzuDB](https://github.com/kuzudb/kuzu) v0.11.3, which was archived when Apple acquired Kùzu Inc. in October 2025. The original MIT-licensed codebase has been relicensed under **Apache 2.0** — and will never change. This is a structural guarantee enforced by the [Mukoko Foundation](https://mukoko.com/foundation), not a corporate promise.
+SiafuDB is forked from [KuzuDB](https://github.com/kuzudb/kuzu) v0.11.3, which was archived when Apple acquired Kùzu Inc. in October 2025. The original MIT-licensed codebase has been relicensed under **Apache 2.0** — and will never change. This is a structural guarantee enforced by the **The Bundu Foundation**, not a corporate promise.
 
 ### Why SiafuDB?
 
@@ -130,7 +132,7 @@ SiafuDB brings graph-native intelligence to every environment where data lives:
 ### Python
 ```bash
 pip install siafudb
-```
+````
 
 ```python
 import siafudb
@@ -154,16 +156,19 @@ while result.has_next():
 ```
 
 ### Node.js
+
 ```bash
 npm install siafudb
 ```
 
 ### Rust
+
 ```bash
 cargo add siafudb
 ```
 
 ### Java
+
 ```xml
 <dependency>
     <groupId>com.siafudb</groupId>
@@ -175,31 +180,34 @@ cargo add siafudb
 
 SiafuDB is designed as one half of a two-engine graph fabric:
 
-| Environment | Engine | Query Language | Role |
-|-------------|--------|---------------|------|
-| Server (cloud) | JanusGraph on ScyllaDB/Cassandra | Gremlin + Cypher | Platform knowledge graph (billions of nodes) |
-| Device (mobile) | **SiafuDB** (native) | Cypher | Personal subgraph, offline AI reasoning |
-| Edge (CDN) | **SiafuDB** (WASM) | Cypher | Cached regional subgraphs |
-| Web3 (pod) | **SiafuDB** (embedded) | Cypher | Sovereign personal data graph |
-| Browser (web) | **SiafuDB** (WASM) | Cypher | Client-side graph cache |
+| Environment     | Engine                           | Query Language   | Role                                         |
+| --------------- | -------------------------------- | ---------------- | -------------------------------------------- |
+| Server (cloud)  | JanusGraph on ScyllaDB/Cassandra | Gremlin + Cypher | Platform knowledge graph (billions of nodes) |
+| Device (mobile) | **SiafuDB** (native)             | Cypher           | Personal subgraph, offline AI reasoning      |
+| Edge (CDN)      | **SiafuDB** (WASM)               | Cypher           | Cached regional subgraphs                    |
+| Web3 (pod)      | **SiafuDB** (embedded)           | Cypher           | Sovereign personal data graph                |
+| Browser (web)   | **SiafuDB** (WASM)               | Cypher           | Client-side graph cache                      |
 
 The **Graph Sync Protocol** connects SiafuDB instances to the server-side JanusGraph, enabling bidirectional subgraph replication. Write on your phone, sync to the cloud. Update on the platform, sync to your device. One graph, expressed everywhere.
 
 ## Building from Source
 
 ### Prerequisites
+
 - CMake 3.15+
 - C++20 compiler (GCC 11+, Clang 14+, MSVC 2022+)
 - Python 3.9+ (for Python bindings)
 
 ### Build
+
 ```bash
-git clone https://github.com/nyuchitech/siafudb.git
+git clone https://github.com/nyuchi/siafudb.git
 cd siafudb
 make release
 ```
 
 ### Run Tests
+
 ```bash
 make test
 ```
@@ -209,6 +217,7 @@ For detailed build instructions, see the [Developer Guide](https://siafudb.org/d
 ## Roadmap
 
 ### Phase 1 — Foundation (Current)
+
 - [x] Fork KuzuDB v0.11.3 under Apache 2.0
 - [ ] Rebrand codebase (package names, imports, documentation)
 - [ ] Publish initial SiafuDB releases (Python, Node.js, Rust, Java)
@@ -216,6 +225,7 @@ For detailed build instructions, see the [Developer Guide](https://siafudb.org/d
 - [ ] Launch siafudb.org documentation site
 
 ### Phase 2 — Graph Sync Protocol
+
 - [ ] Design graph change log format (vertex/edge CRUD events)
 - [ ] Implement local change log capture
 - [ ] Implement bidirectional sync with JanusGraph
@@ -223,24 +233,28 @@ For detailed build instructions, see the [Developer Guide](https://siafudb.org/d
 - [ ] Integration with CouchDB replication protocol
 
 ### Phase 3 — Edge & WASM
+
 - [ ] Optimised WASM compilation for Cloudflare Workers/DOs
 - [ ] Geographic subgraph caching in Durable Objects
 - [ ] User subgraph caching in Durable Objects
 - [ ] Browser-based graph engine improvements
 
 ### Phase 4 — Web3 & Pod
+
 - [ ] Nyuchi Honeycomb node integration
 - [ ] Cryptographic binding to identity tokens
 - [ ] Pod replication across Honeycomb nodes
 - [ ] Heritage graph transformation (PII stripping on ancestral transition)
 
 ### Phase 5 — Multi-Model Extensions
+
 - [ ] Document storage (JSON/JSONB as vertex properties)
 - [ ] Key-value operations
 - [ ] Enhanced vector search (multiple dimensions, configurable metrics)
 - [ ] Time-series support
 
 ### Phase 6 — Native Platform Bindings
+
 - [ ] Swift/SwiftUI binding (iOS) via C interop
 - [ ] Kotlin/JVM binding (Android) improvements
 - [ ] ArkTS/ArkUI binding (HarmonyOS) via N-API
@@ -254,7 +268,7 @@ Please read our [Contributing Guide](CONTRIBUTING.md) before submitting a pull r
 
 ### Code of Conduct
 
-SiafuDB is built on the Ubuntu philosophy — *I am because we are*. We are committed to providing a welcoming and inclusive environment for everyone. Please read our [Code of Conduct](CODE_OF_CONDUCT.md).
+SiafuDB is built on the Ubuntu philosophy — _I am because we are_. We are committed to providing a welcoming and inclusive environment for everyone. Please read our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Licence
 
@@ -262,11 +276,11 @@ SiafuDB is licensed under the [Apache License, Version 2.0](LICENSE).
 
 The original KuzuDB source code is licensed under the [MIT License](THIRD_PARTY_NOTICES). The MIT copyright notice is preserved as required.
 
-**The Apache 2.0 licence will never change.** SiafuDB is governed by the [Mukoko Foundation](https://mukoko.com/foundation) (Mauritius, Foundations Act 2012) — a legal entity with no shareholders that exists for the community. The Foundation's charter structurally prevents relicensing. This is not a promise. It is a legal guarantee.
+**The Apache 2.0 licence will never change.** SiafuDB is governed by the **The Bundu Foundation** (Zimbabwean Company Limited by Guarantee) — a legal entity with no shareholders that exists for the community. The Foundation's charter structurally prevents relicensing. This is not a promise. It is a legal guarantee.
 
 ## About
 
-SiafuDB is maintained by [Nyuchi Africa](https://nyuchi.com) and governed by the [Mukoko Foundation](https://mukoko.com/foundation).
+SiafuDB is maintained by [Nyuchi Africa](https://nyuchi.com) and governed by the **The Bundu Foundation**.
 
 Nyuchi Africa is building [Mukoko](https://mukoko.com) — Africa's super app, targeting one billion users across 54 African countries. SiafuDB is the embedded graph engine that powers every device, every edge node, and every sovereign data pod in the Mukoko ecosystem. Built in Africa. Shared with the world.
 
@@ -274,9 +288,9 @@ Nyuchi Africa is building [Mukoko](https://mukoko.com) — Africa's super app, t
 
 <div align="center">
 
-*The army ant carries the graph.*
+_The army ant carries the graph._
 
-**[Website](https://siafudb.org)** · **[Documentation](https://siafudb.org/docs)** · **[GitHub](https://github.com/nyuchitech/siafudb)** · **[Community](https://github.com/nyuchitech/siafudb/discussions)**
+**[Website](https://siafudb.org)** · **[Documentation](https://siafudb.org/docs)** · **[GitHub](https://github.com/nyuchi/siafudb)** · **[Community](https://github.com/nyuchi/siafudb/discussions)**
 
 </div>
 ```
@@ -285,7 +299,7 @@ Nyuchi Africa is building [Mukoko](https://mukoko.com) — Africa's super app, t
 
 Create a `CONTRIBUTING.md` file:
 
-```markdown
+````markdown
 # Contributing to SiafuDB
 
 Thank you for your interest in contributing to SiafuDB. Every contribution strengthens the colony.
@@ -306,11 +320,11 @@ Thank you for your interest in contributing to SiafuDB. Every contribution stren
 
 ### Development Setup
 ```bash
-git clone https://github.com/nyuchitech/siafudb.git
+git clone https://github.com/nyuchi/siafudb.git
 cd siafudb
 make release
 make test
-```
+````
 
 ## Contribution Areas
 
@@ -338,8 +352,9 @@ By contributing to SiafuDB, you agree that your contributions will be licensed u
 - GitHub Discussions for questions and ideas
 - GitHub Issues for bugs and feature requests
 
-Built with Ubuntu — *I am because we are*.
-```
+Built with Ubuntu — _I am because we are_.
+
+````
 
 ## Step 5: Create CODE_OF_CONDUCT.md
 
@@ -374,24 +389,27 @@ Instances of abusive, harassing, or otherwise unacceptable behaviour may be repo
 ## Attribution
 
 This Code of Conduct is adapted from the [Contributor Covenant](https://www.contributor-covenant.org/), version 2.1.
-```
+````
 
 ## Step 6: Update package references
 
 The following files in the repository contain "kuzu" or "kuzudb" references that should be updated to "siafudb". This is a gradual process — do NOT attempt to rename everything in one commit, as it will break the build. Instead, create a tracking issue for the rebrand and address it incrementally:
 
 **Priority 1 — User-facing (do immediately):**
+
 - `README.md` (replaced in Step 3)
 - `LICENSE` (replaced in Step 1)
 - Package metadata files: `setup.py`, `pyproject.toml`, `package.json`, `Cargo.toml`, `pom.xml`
 - Documentation files in `docs/`
 
 **Priority 2 — Build system (do carefully with CI):**
+
 - CMakeLists.txt project name
 - CI/CD workflow files in `.github/workflows/`
 - Docker files
 
 **Priority 3 — Source code (do incrementally):**
+
 - C++ namespace references
 - Python module names
 - Java package names
@@ -406,12 +424,14 @@ In the repository settings:
 **Topics:** `graph-database`, `embedded-database`, `property-graph`, `cypher`, `openCypher`, `wasm`, `web3`, `edge-computing`, `mobile-database`, `vector-search`, `graph-sync`, `apache-2`, `open-source`, `ai`, `knowledge-graph`, `embedded-graph`, `offline-first`, `decentralized`, `africa`, `tinkerpop`
 
 **Features to enable:**
+
 - Issues (for bug reports and feature requests)
 - Discussions (for community Q&A and ideas)
 - Projects (for roadmap tracking)
 - Wiki (optional — may prefer external docs site)
 
 **Branch protection on `main`:**
+
 - Require pull request reviews before merging
 - Require status checks to pass before merging
 - Do not allow force pushes

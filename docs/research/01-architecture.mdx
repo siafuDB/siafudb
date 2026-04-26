@@ -7,7 +7,7 @@ description: "The complete architectural picture — paradigm, fragment model, e
 
 **Status:** WORKING DOCUMENT
 **Decision Owner:** Bryan Fawcett, Founder & CEO, Nyuchi Africa
-**Governance:** Mukoko Foundation (Apache 2.0)
+**Governance:** Bundu Foundation (Apache 2.0)
 
 ---
 
@@ -35,23 +35,23 @@ The graph is the upgrade path, not the entry requirement.
 
 ### Access Patterns (All Graph Underneath)
 
-| Pattern | API | Underneath |
-|---------|-----|-----------|
-| Graph | Cypher / GQL | Native graph operations |
-| Key-Value | `kv_set()` / `kv_get()` | `(:_KV {key, value})` |
-| Document | `doc_insert()` / `doc_find()` | Node with label = collection |
-| Time-Series | `ts_append()` / `ts_range()` | Timestamped nodes + NEXT edges |
-| Vector | Similarity queries | HNSW index on embeddings |
+| Pattern     | API                           | Underneath                     |
+| ----------- | ----------------------------- | ------------------------------ |
+| Graph       | Cypher / GQL                  | Native graph operations        |
+| Key-Value   | `kv_set()` / `kv_get()`       | `(:_KV {key, value})`          |
+| Document    | `doc_insert()` / `doc_find()` | Node with label = collection   |
+| Time-Series | `ts_append()` / `ts_range()`  | Timestamped nodes + NEXT edges |
+| Vector      | Similarity queries            | HNSW index on embeddings       |
 
 ### Deployment Profiles
 
-| Profile | Environment | Memory | Use Case |
-|---------|-------------|--------|----------|
-| Mobile | Phone, tablet | 64 MB | Personal graph, offline AI |
-| Edge | WASM, DOs | 32 MB | Regional cache |
-| Honeycomb Node | Opted-in device | 128 MB | Network fragment hosting |
-| Server | Dev/test | 1 GB | Development |
-| Cloud | Platform | System | Full knowledge graph |
+| Profile        | Environment     | Memory | Use Case                   |
+| -------------- | --------------- | ------ | -------------------------- |
+| Mobile         | Phone, tablet   | 64 MB  | Personal graph, offline AI |
+| Edge           | WASM, DOs       | 32 MB  | Regional cache             |
+| Honeycomb Node | Opted-in device | 128 MB | Network fragment hosting   |
+| Server         | Dev/test        | 1 GB   | Development                |
+| Cloud          | Platform        | System | Full knowledge graph       |
 
 ---
 
@@ -69,11 +69,11 @@ On a user's device, two completely isolated SiafuDB instances:
 
 ### Authority Model
 
-| Authority | Meaning | Sync Behaviour |
-|-----------|---------|---------------|
-| Authoritative | Source of truth here | Push outward |
-| Referenced | Source of truth elsewhere | Pull inward |
-| Local | No sync | Stays local |
+| Authority     | Meaning                   | Sync Behaviour |
+| ------------- | ------------------------- | -------------- |
+| Authoritative | Source of truth here      | Push outward   |
+| Referenced    | Source of truth elsewhere | Pull inward    |
+| Local         | No sync                   | Stays local    |
 
 ---
 
@@ -144,14 +144,15 @@ Every graph change is a `Mutation` with a UUID, source identity, operation type 
 
 A single mutation produces different projections for different destinations:
 
-| Destination | Receives | Transform |
-|-------------|----------|-----------|
-| User's pod | Full data | None |
-| Platform | Public, PII stripped | `StripPII`, `FilterByLabel` |
-| Analytics | Anonymised | `Anonymise` |
-| Content owner | Anonymous signal | `Anonymise`, `Aggregate` |
+| Destination   | Receives             | Transform                   |
+| ------------- | -------------------- | --------------------------- |
+| User's pod    | Full data            | None                        |
+| Platform      | Public, PII stripped | `StripPII`, `FilterByLabel` |
+| Analytics     | Anonymised           | `Anonymise`                 |
+| Content owner | Anonymous signal     | `Anonymise`, `Aggregate`    |
 
 Where transformation happens depends on transport:
+
 - **GSPA (API):** SiafuDB applies transforms before sending
 - **GSPN (NTL):** NTL synapses apply transforms at the network level
 
@@ -197,12 +198,12 @@ SiafuDB does not implement the signal primitive, the neural routing, or the hard
 
 Machine learning is not a feature of one component. It is the operating principle of the entire stack.
 
-| Layer | What Learns | How |
-|-------|-------------|-----|
-| AI (brain) | Reasoning and decision-making | PyTorch/TF trained models |
-| NTL (nervous system) | Signal routing and delivery | Neural network routing model with Hebbian + gradient learning |
-| Graph Sync Protocol | Traffic patterns and sync efficiency | Feedback from delivery success/failure trains NTL's routing model |
-| SiafuDB (memory) | Does not learn independently | Holds what the other layers learn from and about |
+| Layer                | What Learns                          | How                                                               |
+| -------------------- | ------------------------------------ | ----------------------------------------------------------------- |
+| AI (brain)           | Reasoning and decision-making        | PyTorch/TF trained models                                         |
+| NTL (nervous system) | Signal routing and delivery          | Neural network routing model with Hebbian + gradient learning     |
+| Graph Sync Protocol  | Traffic patterns and sync efficiency | Feedback from delivery success/failure trains NTL's routing model |
+| SiafuDB (memory)     | Does not learn independently         | Holds what the other layers learn from and about                  |
 
 The Graph Sync Protocol is the training loop for NTL's neural routing. Every sync cycle produces training data. Every successful delivery is a positive training signal. Every failure is a negative signal. The routing model learns from this feedback and improves over time.
 
@@ -265,15 +266,15 @@ siafudb/
 
 ## What's Next
 
-| Priority | Milestone |
-|----------|-----------|
-| 1 | Engine runs — GrafeoDB integration, Cypher queries end-to-end |
-| 2 | Change log captures mutations automatically |
-| 3 | Internal sync — two instances in same process, channel transport |
-| 4 | GSPA sync — two instances over HTTP with conflict resolution |
-| 5 | GSPN integration — SiafuDB emits signals through NTL |
-| 6 | Hardware acceleration — routing model on neural engine (NTL milestone) |
+| Priority | Milestone                                                              |
+| -------- | ---------------------------------------------------------------------- |
+| 1        | Engine runs — GrafeoDB integration, Cypher queries end-to-end          |
+| 2        | Change log captures mutations automatically                            |
+| 3        | Internal sync — two instances in same process, channel transport       |
+| 4        | GSPA sync — two instances over HTTP with conflict resolution           |
+| 5        | GSPN integration — SiafuDB emits signals through NTL                   |
+| 6        | Hardware acceleration — routing model on neural engine (NTL milestone) |
 
 ---
 
-*April 2026 — Nyuchi Africa / Mukoko Foundation*
+_April 2026 — Nyuchi Africa / Bundu Foundation_

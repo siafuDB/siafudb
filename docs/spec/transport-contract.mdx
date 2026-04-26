@@ -2,6 +2,7 @@
 title: "Transport Contract"
 description: "What GSPA and GSPN transports must guarantee — ordering, delivery, idempotency."
 ---
+
 Both GSPA and GSPN transports must satisfy this contract. Implementations may differ in how — HTTP is very different from an NTL synapse — but the guarantees they surface to the GSP layer above are identical.
 
 ## Delivery
@@ -22,12 +23,12 @@ Transports must surface backpressure to the emitter. A GSPA HTTP transport does 
 
 ## Failure modes
 
-| Failure | Required behaviour |
-|---------|-------------------|
-| Network partition | Buffer locally; resume on reconnect; never drop an Authoritative mutation without an ack |
-| Receiver schema mismatch | Hold on the receiver; emit to dead-letter; notify the author |
-| Signature verification fail | Drop the mutation; log; alert if signed mutations are required by policy |
-| Clock drift | Tolerate; ordering is causal, not timestamp-based |
+| Failure                     | Required behaviour                                                                       |
+| --------------------------- | ---------------------------------------------------------------------------------------- |
+| Network partition           | Buffer locally; resume on reconnect; never drop an Authoritative mutation without an ack |
+| Receiver schema mismatch    | Hold on the receiver; emit to dead-letter; notify the author                             |
+| Signature verification fail | Drop the mutation; log; alert if signed mutations are required by policy                 |
+| Clock drift                 | Tolerate; ordering is causal, not timestamp-based                                        |
 
 ## GSPA-specific
 

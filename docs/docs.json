@@ -16,7 +16,7 @@
     "links": [
       {
         "label": "GitHub",
-        "href": "https://github.com/nyuchitech/siafudb"
+        "href": "https://github.com/nyuchi/siafudb"
       },
       {
         "type": "discord",
@@ -36,11 +36,7 @@
         "groups": [
           {
             "group": "Introduction",
-            "pages": [
-              "introduction",
-              "why-siafudb",
-              "architecture"
-            ]
+            "pages": ["introduction", "why-siafudb", "architecture"]
           },
           {
             "group": "Core Concepts",
@@ -62,11 +58,7 @@
           },
           {
             "group": "Sync",
-            "pages": [
-              "sync/overview",
-              "sync/gspa",
-              "sync/gspn"
-            ]
+            "pages": ["sync/overview", "sync/gspa", "sync/gspn"]
           },
           {
             "group": "Governance",
@@ -126,7 +118,7 @@
   "footer": {
     "socials": {
       "x": "https://x.com/nyuchiafrica",
-      "github": "https://github.com/nyuchitech",
+      "github": "https://github.com/nyuchi",
       "linkedin": "https://linkedin.com/company/nyuchi-africa"
     }
   }

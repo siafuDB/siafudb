@@ -15,7 +15,7 @@ Hi Grafeo team,
 
 I'm Bryan Fawcett, Founder & CEO of Nyuchi Africa — a technology company based in Harare, Zimbabwe, building open-source infrastructure for the next generation of applications across Africa and beyond.
 
-We've just launched **SiafuDB** (github.com/nyuchitech/siafudb), an embedded graph database for device, edge, and Web3 environments. After evaluating every embedded graph database on the market — Neo4j (licensing), KuzuDB (archived/acquired by Apple), LadybugDB (community fork, uncertain roadmap), ArcadeDB (JVM dependency) — we landed on Grafeo as the core engine we want to build on.
+We've just launched **SiafuDB** (github.com/nyuchi/siafudb), an embedded graph database for device, edge, and Web3 environments. After evaluating every embedded graph database on the market — Neo4j (licensing), KuzuDB (archived/acquired by Apple), LadybugDB (community fork, uncertain roadmap), ArcadeDB (JVM dependency) — we landed on Grafeo as the core engine we want to build on.
 
 Grafeo is exactly what the embedded graph space needs: pure Rust, Apache 2.0, multi-model, six query languages, WASM bindings, vector search, and serious performance. The architecture is right, the language choice is right, and the licence commitment is right. We want to build on top of it, not compete with it.
 
@@ -36,7 +36,7 @@ If any of our extension work is general enough to benefit the broader Grafeo com
 
 **About Nyuchi Africa:**
 
-We're building open-source infrastructure for a continent of one billion people. Our flagship product, Mukoko, is an application built on this infrastructure — but the infrastructure itself (SiafuDB, the Nyuchi Honeycomb decentralised network, the Nyuchi API Platform) is independent and available to anyone. SiafuDB is governed by the Mukoko Foundation (Mauritius), a legal entity with no shareholders that structurally guarantees the Apache 2.0 licence can never change.
+We're building open-source infrastructure for a continent of one billion people. Our flagship product, Mukoko, is an application built on this infrastructure — but the infrastructure itself (SiafuDB, the Nyuchi Honeycomb decentralised network, the Nyuchi API Platform) is independent and available to anyone. SiafuDB is governed by the The Bundu Foundation (Zimbabwe), a legal entity with no shareholders that structurally guarantees the Apache 2.0 licence can never change.
 
 We'd love to understand how you see the Grafeo ecosystem developing, whether a distribution model like this aligns with your vision, and how we can be good citizens in the community.
 
@@ -45,7 +45,7 @@ Looking forward to the conversation.
 Bryan Fawcett
 Founder & CEO, Nyuchi Africa
 bryan@nyuchi.com
-github.com/nyuchitech/siafudb
+github.com/nyuchi/siafudb
 
 ---
 
@@ -62,7 +62,7 @@ I'm Bryan Fawcett, Founder & CEO of Nyuchi Africa, based in Harare, Zimbabwe. We
 
 Like many of you, we were using KuzuDB and were caught off guard when it was archived after Apple's acquisition. We evaluated the fork landscape — LadybugDB, Bighorn, Vela Engineering's concurrent-write fork — and have deep respect for the speed at which the community rallied.
 
-We've taken a slightly different path and wanted to introduce ourselves and our project: **SiafuDB** (github.com/nyuchitech/siafudb).
+We've taken a slightly different path and wanted to introduce ourselves and our project: **SiafuDB** (github.com/nyuchi/siafudb).
 
 **Where we diverge:**
 
@@ -88,14 +88,14 @@ We see potential for collaboration:
 - The Graph Sync Protocol we're designing is transport-agnostic and engine-agnostic. If LadybugDB or any other embedded graph database wanted to implement sync compatibility, the protocol spec will be open and Apache 2.0 licensed.
 - Research and benchmarks from the KuzuDB era (particularly the University of Waterloo work on worst-case optimal joins and factorised execution) informed all of our thinking. We want to acknowledge that lineage openly.
 
-SiafuDB is Apache 2.0, governed by the Mukoko Foundation (a legal entity in Mauritius with no shareholders — the licence structurally cannot change). It is named after the African army ant — *siafu* in Swahili — small, embedded, unnoticed, but the ecosystem collapses without it.
+SiafuDB is Apache 2.0, governed by the Bundu Foundation (a legal entity in Mauritius with no shareholders — the licence structurally cannot change). It is named after the African army ant — _siafu_ in Swahili — small, embedded, unnoticed, but the ecosystem collapses without it.
 
 Happy to answer questions, share our architectural thinking, or just connect with fellow travellers in the embedded graph space.
 
 Bryan Fawcett
 Founder & CEO, Nyuchi Africa
 bryan@nyuchi.com
-github.com/nyuchitech/siafudb
+github.com/nyuchi/siafudb
 siafudb.org
 
 ---

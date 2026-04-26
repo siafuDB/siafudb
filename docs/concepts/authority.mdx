@@ -2,13 +2,14 @@
 title: "Authority"
 description: "Who owns this vertex, and which way does the data flow?"
 ---
+
 Every vertex and edge in a fragment has an **authority**. Authority determines who owns the data and which direction it flows through sync.
 
-| Authority | Meaning | Sync behaviour |
-|-----------|---------|---------------|
-| **Authoritative** | Source of truth here | Push outward |
-| **Referenced** | Source of truth elsewhere | Pull inward |
-| **Local** | No sync | Stays local |
+| Authority         | Meaning                   | Sync behaviour |
+| ----------------- | ------------------------- | -------------- |
+| **Authoritative** | Source of truth here      | Push outward   |
+| **Referenced**    | Source of truth elsewhere | Pull inward    |
+| **Local**         | No sync                   | Stays local    |
 
 ## Why authority matters
 

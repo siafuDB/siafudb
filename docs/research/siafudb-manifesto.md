@@ -98,11 +98,11 @@ The era beginning now is defined by:
 
 ## VIII.
 
-SiafuDB is named after the African army ant — *siafu* in Swahili. Small. Embedded. Unnoticed. But the ecosystem collapses without it. Millions of instances, each holding a piece of the graph, each connected through NTL synapses, collectively forming the intelligence infrastructure that makes distributed, context-aware, sovereign computing possible.
+SiafuDB is named after the African army ant — _siafu_ in Swahili. Small. Embedded. Unnoticed. But the ecosystem collapses without it. Millions of instances, each holding a piece of the graph, each connected through NTL synapses, collectively forming the intelligence infrastructure that makes distributed, context-aware, sovereign computing possible.
 
 NTL is named for what it is — the Neural Transfer Layer. Not a messaging protocol. Not an API framework. A neural network at the infrastructure level, where signals propagate, synapses strengthen, and the network learns.
 
-Both are written in Rust. Both are Apache 2.0. Both are maintained by Nyuchi Africa and governed by the Mukoko Foundation. Both are structurally guaranteed to remain open source forever. Both are built in Africa. Both are shared with the world.
+Both are written in Rust. Both are Apache 2.0. Both are maintained by Nyuchi Africa and governed by the Bundu Foundation. Both are structurally guaranteed to remain open source forever. Both are built in Africa. Both are shared with the world.
 
 The relational database was the best tool we had. The API was the best protocol we had. They served humanity well for half a century.
 
@@ -120,7 +120,7 @@ The filing cabinet era is over. The graph era begins here.
 
 <div align="center">
 
-*The army ant carries the graph. The synapse carries the signal.*
+_The army ant carries the graph. The synapse carries the signal._
 
 **[SiafuDB](https://siafudb.org)** — The embedded graph database for device, edge, and Web3.
 

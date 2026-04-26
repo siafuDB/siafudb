@@ -2,6 +2,7 @@
 title: "Mutation Format"
 description: "Wire format for a Mutation and MutationBatch — fields, encoding, signatures."
 ---
+
 The `Mutation` is the atomic unit that travels on the wire. This document defines the normative wire format. See [Mutations](/concepts/mutations) for the conceptual overview.
 
 ## Status
@@ -10,15 +11,15 @@ The `Mutation` is the atomic unit that travels on the wire. This document define
 
 ## Fields
 
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `id` | UUIDv7 | yes | Time-ordered for natural sort |
-| `source` | string | yes | Identity URI of the author |
-| `op` | enum | yes | `vertex-create` \| `vertex-update` \| `vertex-delete` \| `edge-create` \| `edge-update` \| `edge-delete` |
-| `target` | GraphRef | yes | Vertex or edge being changed |
-| `payload` | CBOR | yes | New state or diff |
-| `clock` | VectorClock | yes | Causal metadata |
-| `signature` | bytes | optional | Ed25519 over the canonical CBOR encoding |
+| Field       | Type        | Required | Notes                                                                                                    |
+| ----------- | ----------- | -------- | -------------------------------------------------------------------------------------------------------- |
+| `id`        | UUIDv7      | yes      | Time-ordered for natural sort                                                                            |
+| `source`    | string      | yes      | Identity URI of the author                                                                               |
+| `op`        | enum        | yes      | `vertex-create` \| `vertex-update` \| `vertex-delete` \| `edge-create` \| `edge-update` \| `edge-delete` |
+| `target`    | GraphRef    | yes      | Vertex or edge being changed                                                                             |
+| `payload`   | CBOR        | yes      | New state or diff                                                                                        |
+| `clock`     | VectorClock | yes      | Causal metadata                                                                                          |
+| `signature` | bytes       | optional | Ed25519 over the canonical CBOR encoding                                                                 |
 
 ## Encoding
 

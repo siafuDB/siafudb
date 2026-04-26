@@ -2,6 +2,7 @@
 title: "Integrating with NTL"
 description: "Swap GSPA for GSPN — route mutations as neural signals through the Nyuchi Transfer Layer."
 ---
+
 Once you have a SiafuDB fragment syncing via GSPA, the upgrade path to GSPN is a transport swap. The mutation model, the schema, and the authority rules do not change — only how the signal gets from one fragment to the next.
 
 ## Prerequisites
@@ -29,11 +30,11 @@ The emitter no longer worries about destinations. It hands the mutation to NTL a
 
 Under GSPA, the emitter applies transforms before the wire. Under GSPN, transforms are attached to synapses:
 
-| Synapse | Transform |
-|---------|-----------|
-| `synapse://platform-ingress` | `StripPII` |
-| `synapse://analytics` | `Anonymise`, `Aggregate` |
-| `synapse://owner-feedback` | `Anonymise` |
+| Synapse                      | Transform                |
+| ---------------------------- | ------------------------ |
+| `synapse://platform-ingress` | `StripPII`               |
+| `synapse://analytics`        | `Anonymise`, `Aggregate` |
+| `synapse://owner-feedback`   | `Anonymise`              |
 
 Moving transforms to the network means a single emitted signal can feed multiple destinations with different projections — no duplicate serialisation.
 
