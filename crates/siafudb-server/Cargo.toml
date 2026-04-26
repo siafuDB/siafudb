@@ -1,0 +1,14 @@
+[package]
+name = "siafudb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional standalone SiafuDB server for development and testing."
+
+[dependencies]
+siafudb-core = { path = "../siafudb-core" }
+siafudb-sync = { path = "../siafudb-sync" }
+siafudb-access = { path = "../siafudb-access" }
+tokio = { workspace = true }
+tracing = { workspace = true }

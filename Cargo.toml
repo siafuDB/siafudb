@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+
+# SiafuDB Workspace
+# The army ant carries the graph.
+#
+# Architecture:
+#   siafudb-core    — The engine. Wraps GrafeoDB with SiafuDB-specific extensions
+#                     (fragment model, cryptographic identity, reference semantics).
+#   siafudb-sync    — The Graph Sync Protocol. Lives inside the DB, not separate.
+#                     Handles mutation tracking, conflict resolution, and adapter interface.
+#   siafudb-access  — Convenience access patterns on top of the graph engine.
+#                     Document (JSON), KV (get/set), Time-series. All graph underneath.
+#   siafudb-server  — Optional standalone server mode for development and testing.
+#   siafudb         — The unified crate that re-exports everything. What users depend on.
+
+members = [
+    "crates/siafudb",
+    "crates/siafudb-core",
+    "crates/siafudb-sync",
+    "crates/siafudb-access",
+    "crates/siafudb-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/nyuchitech/siafudb"
+homepage = "https://siafu.nyuchi.com"
+description = "The embedded graph database for device, edge, and Web3. Replaces SQLite with graph-native storage."
+keywords = ["database", "graph", "embedded", "edge", "web3"]
+categories = ["database", "data-structures"]
+
+[workspace.dependencies]
+# === Core Engine ===
+# GrafeoDB is our foundation. We depend on it as a library and build
+# SiafuDB-specific capabilities on top. If the relationship evolves,
+# we can fork or reimplement — but we start with dependency, not divergence.
+grafeo = { version = "0.4", features = ["gql", "ai"] }
+
+# === Serialization & Data ===
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# === Cryptographic Identity ===
+# Every node in SiafuDB carries cryptographic provenance.
+# ed25519 for signing (fast, small signatures, well-understood).
+ed25519-dalek = "2"
+sha2 = "0.10"
+
+# === Concurrency & Async ===
+tokio = { version = "1", features = ["full"] }
+crossbeam = "0.8"
+
+# === Conflict Resolution ===
+# Vector clocks for causal ordering in the sync protocol.
+# CRDTs for conflict-free merge of concurrent mutations.
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# === Error Handling ===
+thiserror = "2"
+anyhow = "1"
+
+# === Logging ===
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# === Testing ===
+criterion = { version = "0.5", features = ["html_reports"] }

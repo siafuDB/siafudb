@@ -1,0 +1,17 @@
+[package]
+name = "siafudb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SiafuDB core engine — wraps GrafeoDB with fragment, identity, and mutation tracking."
+
+[dependencies]
+grafeo = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
