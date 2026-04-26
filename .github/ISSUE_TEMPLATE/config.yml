@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read the documentation
+    url: https://github.com/nyuchi/docs
+    about: Architecture notes, guides, and API references live in the docs repository.
+  - name: Browse the support knowledge base
+    url: https://github.com/nyuchi/support
+    about: FAQs, troubleshooting, and how-to articles before you open an issue.
+  - name: Ask a question or start a discussion
+    url: https://github.com/orgs/nyuchi/discussions
+    about: For usage questions and open-ended discussion, please use GitHub Discussions. Don't open an issue for support.
+  - name: Report a security vulnerability (private)
+    url: https://github.com/nyuchi/.github/blob/main/SECURITY.md
+    about: Do NOT open a public issue for security vulnerabilities. Follow SECURITY.md to report privately via GitHub Security Advisories.

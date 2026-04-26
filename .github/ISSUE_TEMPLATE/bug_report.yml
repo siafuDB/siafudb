@@ -1,0 +1,115 @@
+name: Bug report
+description: Report something that is broken or behaving unexpectedly.
+title: "bug: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Before you continue:**
+        - Please search [open and closed issues](../issues?q=is%3Aissue) to
+          avoid duplicates.
+        - For **security vulnerabilities**, do *not* open a public issue.
+          Follow [`SECURITY.md`](../../blob/main/SECURITY.md) instead.
+        - For **usage questions**, use
+          [Discussions](https://github.com/orgs/nyuchi/discussions), not
+          Issues.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I have read the project's README and relevant docs.
+          required: true
+        - label: This is *not* a security vulnerability (those go via `SECURITY.md`).
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences describing the bug.
+      placeholder: When I do X, Y happens instead of Z.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: |
+        A minimal, self-contained reproduction. If possible, link to a
+        repository, gist, or codesandbox that demonstrates the issue.
+      placeholder: |
+        1. Clone the repo at commit <sha>
+        2. Run `pnpm install && pnpm dev`
+        3. Navigate to /foo
+        4. Click "Bar"
+        5. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead. Include error messages verbatim.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Include anything that might be relevant. Examples:
+        - OS and version (e.g. macOS 15.3, Ubuntu 24.04, Windows 11)
+        - Runtime and version (e.g. Node 24.3, Rust 1.85, Python 3.12, uv 0.5)
+        - Browser and version (for web UIs)
+        - Package version or commit SHA
+        - Deployment target (local, CI, Cloudflare Workers, etc.)
+      render: markdown
+      placeholder: |
+        - OS: macOS 15.3
+        - Node: 24.3.0
+        - pnpm: 9.12.0
+        - Package / repo: nyuchi/<repo-name>@<version-or-sha>
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, or stack traces
+      description: Paste relevant output inside fenced code blocks. Redact secrets.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that might help — related issues, workarounds, hypotheses.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: conduct
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: I agree to follow this project's [Code of Conduct](../../blob/main/CODE_OF_CONDUCT.md).
+          required: true

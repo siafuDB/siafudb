@@ -1,0 +1,52 @@
+# Dependabot — Cargo + GitHub Actions.
+#
+# Org policy:
+#   - Run weekly, every Monday at 06:00 Africa/Harare.
+#   - One PR per ecosystem with all available updates bundled.
+#   - `build:` Conventional Commits prefix so pr-title-lint accepts it.
+#
+# siafudb is a Rust workspace, so cargo + github-actions cover everything
+# it ships. The Mintlify docs site under docs/ has its own package.json
+# but its dependencies are unmanaged (pinned to whatever Mintlify CLI
+# version is current); add an `npm` entry under directory `/docs` if
+# that changes.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Africa/Harare"
+    open-pull-requests-limit: 1
+    reviewers:
+      - "bryanfawcett"
+    labels: ["dependencies", "github-actions"]
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    groups:
+      all:
+        patterns: ["*"]
+        update-types: ["major", "minor", "patch"]
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Africa/Harare"
+    open-pull-requests-limit: 1
+    reviewers:
+      - "bryanfawcett"
+    labels: ["dependencies", "rust"]
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    groups:
+      all:
+        patterns: ["*"]
+        update-types: ["major", "minor", "patch"]

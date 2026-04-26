@@ -1,0 +1,19 @@
+# PR title lint — Conventional Commits via the org's reusable.
+#
+# Uses pull_request_target so it runs against the base ref's workflow
+# definition, which is what GitHub recommends for first-party-trust
+# event handlers that read PR metadata.
+
+name: PR title lint
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+  statuses: write
+
+jobs:
+  lint:
+    uses: nyuchi/.github/.github/workflows/reusable-pr-title-lint.yml@main
