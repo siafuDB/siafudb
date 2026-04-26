@@ -1,8 +1,10 @@
+pub mod changelog;
 pub mod engine;
 pub mod error;
 pub mod fragment;
 pub mod identity;
 
+pub use changelog::{ChangeLog, ChangeLogEntry, SharedChangeLog};
 pub use engine::database::SiafuDB;
 pub use engine::config::{DeploymentProfile, SiafuConfig};
 pub use error::SiafuError;

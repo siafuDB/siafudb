@@ -12,9 +12,11 @@
 // - Cryptographic identity (every node knows where it came from)
 // - Multiple access patterns (graph, document, KV, time-series)
 
+use crate::changelog::{ChangeLog, SharedChangeLog};
 use crate::error::SiafuError;
 use crate::fragment::Fragment;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 /// The main SiafuDB database instance.
@@ -27,9 +29,10 @@ use uuid::Uuid;
 ///
 /// # Quick Start
 ///
-/// ```rust
+/// ```no_run
 /// use siafudb_core::SiafuDB;
 ///
+/// # fn main() -> Result<(), siafudb_core::SiafuError> {
 /// // Open or create a database (just like SQLite)
 /// let db = SiafuDB::open("my_app.siafu")?;
 ///
@@ -52,11 +55,13 @@ use uuid::Uuid;
 /// let token = db.kv_get("session:token")?;
 ///
 /// // Or store a JSON document (becomes a subgraph)
-/// db.doc_insert("messages", json!({
+/// db.doc_insert("messages", serde_json::json!({
 ///     "from": "Amara",
 ///     "text": "Hello!",
 ///     "timestamp": "2026-04-16T10:00:00Z"
 /// }))?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct SiafuDB {
     /// The underlying GrafeoDB engine instance.
@@ -81,6 +86,11 @@ pub struct SiafuDB {
     /// Path to the database file, if persistent.
     /// None for in-memory databases.
     path: Option<std::path::PathBuf>,
+
+    /// The engine-level change log. Every successful execute() appends one
+    /// entry while mutation_tracking is on. The sync protocol layer drains
+    /// this and translates entries into transport-ready Mutations.
+    change_log: SharedChangeLog,
 }
 
 impl SiafuDB {
@@ -103,6 +113,7 @@ impl SiafuDB {
             instance_id,
             mutation_tracking: true,
             path: Some(path.to_path_buf()),
+            change_log: Arc::new(Mutex::new(ChangeLog::new())),
         })
     }
 
@@ -120,6 +131,7 @@ impl SiafuDB {
             instance_id: Uuid::new_v4(),
             mutation_tracking: true,
             path: None,
+            change_log: Arc::new(Mutex::new(ChangeLog::new())),
         })
     }
 
@@ -132,17 +144,20 @@ impl SiafuDB {
     ///
     /// Returns the number of nodes/edges affected.
     pub fn execute(&self, query: &str) -> Result<ExecuteResult, SiafuError> {
-        let result = self.engine.execute(query)
+        let result = self
+            .engine
+            .execute(query)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
 
-        // TODO: Capture mutation in the change log for sync protocol.
-        // This is where siafudb-sync hooks in. The mutation log is the
-        // bridge between the database engine and the sync protocol.
-        // For now, we just execute and return.
+        let rows_affected = result.rows.len();
 
-        Ok(ExecuteResult {
-            rows_affected: result.rows.len(),
-        })
+        if self.mutation_tracking {
+            if let Ok(mut log) = self.change_log.lock() {
+                log.append(query.to_string(), rows_affected);
+            }
+        }
+
+        Ok(ExecuteResult { rows_affected })
     }
 
     /// Execute a graph query that reads data.
@@ -195,6 +210,15 @@ impl SiafuDB {
     /// after the import completes.
     pub fn set_mutation_tracking(&mut self, enabled: bool) {
         self.mutation_tracking = enabled;
+    }
+
+    /// Borrow the engine-level change log.
+    ///
+    /// Returns an `Arc` clone — multiple consumers can read or drain in
+    /// parallel via the inner `Mutex`. The sync protocol layer is the
+    /// expected primary consumer.
+    pub fn change_log(&self) -> SharedChangeLog {
+        Arc::clone(&self.change_log)
     }
 
     // === KV Access Pattern ===
