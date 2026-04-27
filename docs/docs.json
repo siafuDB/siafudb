@@ -129,5 +129,13 @@
   },
   "appearance": {
     "default": "system"
+  },
+  "fonts": {
+    "family": "Noto",
+    "weight": 500,
+    "format": "woff2",
+    "body": {
+      "family": "Plus Jakarta Sans"
+    }
   }
 }
