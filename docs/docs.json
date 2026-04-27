@@ -1,10 +1,11 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "name": "SiafuDB",
-  "theme": "mint",
+  "theme": "aspen",
   "logo": {
     "dark": "/logo/siafudb-dark.svg",
-    "light": "/logo/siafudb-light.svg"
+    "light": "/logo/siafudb-light.svg",
+    "href": "https://siafudb.org"
   },
   "favicon": "/favicon.svg",
   "colors": {
@@ -122,5 +123,11 @@
       "linkedin": "https://linkedin.com/company/nyuchi-africa"
     }
   },
-  "description": "Embedded graph database replacing SQLite for device, edge & Web3. Graph-native storage with built-in sync protocol, privacy transformations & offline-first design. Pure Rust, Apache 2.0. The army ant carries the graph."
+  "description": "Embedded graph database replacing SQLite for device, edge & Web3. Graph-native storage with built-in sync protocol, privacy transformations & offline-first design. Pure Rust, Apache 2.0. The army ant carries the graph.",
+  "background": {
+    "decoration": "grid"
+  },
+  "appearance": {
+    "default": "system"
+  }
 }
