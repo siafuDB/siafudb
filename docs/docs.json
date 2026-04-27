@@ -121,5 +121,6 @@
       "github": "https://github.com/nyuchi",
       "linkedin": "https://linkedin.com/company/nyuchi-africa"
     }
-  }
+  },
+  "description": "Embedded graph database replacing SQLite for device, edge & Web3. Graph-native storage with built-in sync protocol, privacy transformations & offline-first design. Pure Rust, Apache 2.0. The army ant carries the graph."
 }
