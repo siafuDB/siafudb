@@ -134,8 +134,11 @@
     "family": "Noto",
     "weight": 500,
     "format": "woff2",
+    "heading": {
+      "family": "Noto serif"
+    },
     "body": {
-      "family": "Plus Jakarta Sans"
+      "family": "Noto Sans"
     }
   }
 }
