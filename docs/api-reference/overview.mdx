@@ -1,0 +1,42 @@
+---
+title: "API Reference — Overview"
+description: "Rust crate reference for SiafuDB — database, query, sync, access."
+---
+
+Reference documentation for the `siafudb` umbrella crate and its internals. This is not a tutorial — see [Guides](/guides/quickstart) for that. This is the surface.
+
+<CardGroup cols={2}>
+  <Card title="Database" icon="database" href="/api-reference/database">
+    Opening fragments, schema, transactions, lifecycle.
+  </Card>
+  <Card title="Query" icon="code" href="/api-reference/query">
+    Cypher execution, convenience APIs, result types.
+  </Card>
+  <Card title="Sync" icon="arrows-rotate" href="/api-reference/sync">
+    GSPA and GSPN builders, CDC hooks, transforms.
+  </Card>
+</CardGroup>
+
+## Crate layout
+
+| Crate            | Responsibility                                     |
+| ---------------- | -------------------------------------------------- |
+| `siafudb`        | Umbrella — re-exports the public API               |
+| `siafudb-core`   | Engine, fragments, schema, mutations               |
+| `siafudb-sync`   | GSP, transforms, conflict resolution               |
+| `siafudb-access` | Convenience APIs (KV, doc, ts, vector)             |
+| `siafudb-server` | Optional standalone server — GSPA endpoints, admin |
+
+See [01 — SiafuDB Architecture](/research/01-architecture) for the full crate rationale.
+
+## Versioning
+
+SemVer from 0.1.0 onward. Pre-0.1 the surface is fluid; pin to an exact commit during the alpha.
+
+## Generating docs
+
+```bash
+cargo doc --workspace --no-deps --open
+```
+
+The Mintlify site hosts the narrative; `cargo doc` is authoritative for signatures.

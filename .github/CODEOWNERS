@@ -1,0 +1,15 @@
+# CODEOWNERS — who owns what in siafudb.
+#
+# GitHub auto-requests review from owners when a PR touches matching paths.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default — everything goes to Bryan until contributor base grows.
+*               @bryanfawcett
+
+# Workspace, build, and CI files
+/Cargo.toml     @bryanfawcett
+/Cargo.lock     @bryanfawcett
+/.github/       @bryanfawcett
+
+# Docs site
+/docs/          @bryanfawcett

@@ -1,0 +1,101 @@
+name: Feature request
+description: Suggest a new feature, enhancement, or change in behaviour.
+title: "feat: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature.
+
+        **Before you continue:**
+        - Please search [open and closed issues](../issues?q=is%3Aissue) and
+          [discussions](https://github.com/orgs/nyuchi/discussions) to
+          avoid duplicates.
+        - For open-ended ideas that aren't concrete enough to act on, please
+          start a [Discussion](https://github.com/orgs/nyuchi/discussions)
+          instead.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched existing issues and discussions; this is not a duplicate.
+          required: true
+        - label: This is a concrete proposal, not an open-ended idea.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: |
+        What problem are you trying to solve? Focus on the *user need*, not
+        the solution. "I want X" is not a problem statement; "when I do Y,
+        I have no way to Z" is.
+      placeholder: When I do Y, I have no way to Z, which means I have to work around it by...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the change you'd like to see. Be specific about API, UX, or behaviour.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you consider, and why did you reject them?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: How big is this change, roughly?
+      options:
+        - Small (single function, config, or flag)
+        - Medium (new component, module, or endpoint)
+        - Large (new package, major API change, or cross-cutting)
+        - Unknown
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: breaking
+    attributes:
+      label: Breaking change?
+      description: Would this change break existing users? If yes, explain in Additional context.
+      options:
+        - label: This proposal introduces a breaking change.
+          required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Links to related issues, prior art in other projects, screenshots, mocks, etc.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Willing to contribute?
+      options:
+        - label: I'd be willing to open a PR to implement this (see `CONTRIBUTING.md`).
+          required: false
+
+  - type: checkboxes
+    id: conduct
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: I agree to follow this project's [Code of Conduct](../../blob/main/CODE_OF_CONDUCT.md).
+          required: true

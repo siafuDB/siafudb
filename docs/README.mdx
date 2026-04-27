@@ -1,0 +1,60 @@
+# SiafuDB — Documentation
+
+Mintlify documentation site for SiafuDB — the embedded graph database for device, edge, and Web3.
+
+---
+
+## Run locally
+
+This site runs on [Mintlify](https://mintlify.com). The dev server is pinned to port **11300** so it can coexist with the NTL docs site (which is pinned to port **11200**).
+
+```bash
+# from this directory
+npm run install:mintlify   # once — global install
+npm run dev                # http://localhost:11300
+```
+
+`npm run build` and `npm run broken-links` are also wired up in `package.json`.
+
+---
+
+## The System
+
+**AI is the brain. SiafuDB is the memory. NTL is the nervous system.**
+
+| Component           | Role                                         | Repo                             |
+| ------------------- | -------------------------------------------- | -------------------------------- |
+| AI Agents           | The brain — reason, decide, learn            | Application layer                |
+| SiafuDB             | The memory — hold context everywhere         | `nyuchi/siafudb`                 |
+| Graph Sync Protocol | Memory coherence — keep fragments consistent | `nyuchi/siafudb` (coupled to DB) |
+| NTL                 | The nervous system — neural signal transfer  | `nyuchi/ntl` (separate repo)     |
+
+SiafuDB and the Graph Sync Protocol live in this repo. NTL lives in its own repo and Mintlify site (`http://localhost:11200` in dev).
+
+---
+
+## Structure
+
+The Mintlify manifest is `docs.json`. Four tabs:
+
+- **Documentation** — narrative: Introduction, Core Concepts, Guides, Sync, Governance.
+- **Specification** — normative wire-format and transport contracts.
+- **API Reference** — Rust crate surface.
+- **Research** — the four research documents that back the architecture.
+
+Page-level content sits in `introduction.mdx`, `why-siafudb.mdx`, `architecture.mdx`, `concepts/*.mdx`, `guides/*.mdx`, `sync/*.mdx`, `spec/*.mdx`, `api-reference/*.mdx`, `governance/*.mdx`, and `research/*.mdx`.
+
+---
+
+## Research documents
+
+The four research documents that seeded this repo now live under [`research/`](./research/):
+
+1. [01 — Architecture](./research/01-architecture.mdx) — Read this first.
+2. [02 — Graph Sync Protocol](./research/02-graph-sync-protocol.mdx)
+3. [03 — Decision Log](./research/03-decision-log.mdx)
+4. [04 — First Steps](./research/04-first-steps.mdx)
+
+---
+
+_Nyuchi Africa — April 2026_

@@ -1,0 +1,47 @@
+---
+title: "Integrating with NTL"
+description: "Swap GSPA for GSPN — route mutations as neural signals through the Nyuchi Transfer Layer."
+---
+
+Once you have a SiafuDB fragment syncing via GSPA, the upgrade path to GSPN is a transport swap. The mutation model, the schema, and the authority rules do not change — only how the signal gets from one fragment to the next.
+
+## Prerequisites
+
+- **NTL reachable on the network.** See [NTL — First Steps](https://ntl.nyuchi.com/research/06-first-steps).
+- **IPv6** or dual-stack addressing. GSPN assumes neural addresses, which are IPv6-native.
+- **Synapse topology** defined on the NTL side — where signals originate, where they terminate, what transforms attach to each synapse.
+
+## Swap the transport
+
+```rust
+use siafudb::sync::Gspn;
+
+let gspn = Gspn::new()
+    .from(&pod)
+    .to_synapse("synapse://platform-ingress")
+    .build()?;
+
+gspn.start().await?;
+```
+
+The emitter no longer worries about destinations. It hands the mutation to NTL as a signal; NTL decides which synapses fire and which transformations apply.
+
+## Where transforms live now
+
+Under GSPA, the emitter applies transforms before the wire. Under GSPN, transforms are attached to synapses:
+
+| Synapse                      | Transform                |
+| ---------------------------- | ------------------------ |
+| `synapse://platform-ingress` | `StripPII`               |
+| `synapse://analytics`        | `Anonymise`, `Aggregate` |
+| `synapse://owner-feedback`   | `Anonymise`              |
+
+Moving transforms to the network means a single emitted signal can feed multiple destinations with different projections — no duplicate serialisation.
+
+## Learned routing
+
+Synapses retain weights. Frequently-travelled paths strengthen; cold paths decay. Over time, a deployment of SiafuDB fragments connected through NTL learns its own topology. See [NTL — Twelve Principles](https://ntl.nyuchi.com/research/05-twelve-principles).
+
+## Fall-back
+
+If NTL is unreachable, GSPN degrades to GSPA. The graph stays coherent; you lose adaptive routing until the neural layer comes back.

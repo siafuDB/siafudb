@@ -1,0 +1,26 @@
+# Rust CI — fmt, clippy, nextest, build, doc.
+#
+# Calls the org's reusable Rust monorepo workflow. Every job runs with
+# RUSTFLAGS="-D warnings" and RUSTDOCFLAGS="-D warnings"; clippy runs
+# with --all-targets --all-features -- -D warnings.
+
+name: CI / Rust
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: nyuchi/.github/.github/workflows/reusable-ci-rust-monorepo.yml@main
+    with:
+      toolchain: stable

@@ -1,0 +1,16 @@
+# Stale — daily sweep of inactive issues and PRs.
+
+name: Stale
+
+on:
+  schedule:
+    - cron: '23 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    uses: nyuchi/.github/.github/workflows/reusable-stale.yml@main

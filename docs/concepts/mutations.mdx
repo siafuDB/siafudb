@@ -1,0 +1,28 @@
+---
+title: "Mutations"
+description: "The atomic unit of graph change — what gets synced, signed, and logged."
+---
+
+A **Mutation** is the atomic unit of graph change in SiafuDB. Every write produces one or more mutations. Mutations are the currency of the Graph Sync Protocol — they are what gets logged, shipped, transformed, and applied on the receiving end.
+
+## Shape
+
+A mutation carries:
+
+- A **UUID** — unique identifier.
+- A **source identity** — who authored this change.
+- An **operation type** — `vertex-create`, `vertex-update`, `vertex-delete`, `edge-create`, `edge-update`, `edge-delete`.
+- A **target** — the vertex or edge being changed.
+- A **payload** — the new state (or the diff).
+- A **vector clock** — for causal ordering across fragments.
+- An optional **cryptographic signature** — for provenance.
+
+## Batches
+
+Mutations group into atomic `MutationBatch` structures. A batch applies all-or-nothing. Within a batch, causal ordering is preserved. Across batches, vector clocks determine ordering.
+
+## Change Data Capture
+
+The engine emits mutations through Change Data Capture (CDC) — this is what GrafeoDB gives SiafuDB for free. CDC is the hook the sync engine listens on. Every committed mutation becomes a candidate for propagation.
+
+See [02 — Graph Sync Protocol](/research/02-graph-sync-protocol) for the full mutation model and conflict-resolution rules.

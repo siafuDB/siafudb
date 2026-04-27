@@ -1,0 +1,26 @@
+# Lint — calls the org's reusable lint policy.
+#
+# The five jobs (actionlint, JSON validity, prettier, markdownlint,
+# yamllint) are the required status checks declared in the org's
+# main-branch ruleset. All five must pass for any PR to merge into main.
+#
+# CI never auto-fixes; fix locally and push.
+
+name: Lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    uses: nyuchi/.github/.github/workflows/reusable-lint.yml@main

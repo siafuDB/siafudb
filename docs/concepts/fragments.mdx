@@ -1,0 +1,35 @@
+---
+title: "Fragments"
+description: "A SiafuDB instance is a meaningful subset of a larger graph — a fragment."
+---
+
+Every SiafuDB instance is a **fragment**. A fragment is a meaningful subset of a larger graph, with explicit knowledge of which parts it owns, which parts it references, and which parts stay local.
+
+## Why fragments, not partitions
+
+Sharded databases partition a single logical database across physical nodes. SiafuDB is the opposite: each instance is its own database, but it knows it's part of something bigger. Fragments can sync with each other, but they are never forced to.
+
+This is the difference between a tree's leaves and a jigsaw's pieces. Leaves participate in the whole without needing to reconstitute it. Jigsaw pieces are meaningless until every piece is assembled.
+
+## Physical separation: Personal vs Network
+
+On a user's device, two completely isolated fragments live on disk:
+
+| Fragment     | Contains                                         | Encryption    | Sync              |
+| ------------ | ------------------------------------------------ | ------------- | ----------------- |
+| **Personal** | Messages, preferences, history, private AI state | User keys     | Personal pod only |
+| **Network**  | Honeycomb-hosted platform data                   | Platform keys | Opt-in, tokenised |
+
+Compromising the network fragment reveals zero personal data. The two stores do not share a file, a key, or an index.
+
+## Authority
+
+Each vertex in a fragment has an authority:
+
+| Authority     | Meaning                   | Sync behaviour |
+| ------------- | ------------------------- | -------------- |
+| Authoritative | Source of truth here      | Push outward   |
+| Referenced    | Source of truth elsewhere | Pull inward    |
+| Local         | No sync                   | Stays local    |
+
+Authority is set at write time and enforced by the sync engine. See [02 — Graph Sync Protocol](/research/02-graph-sync-protocol) for the full rules.

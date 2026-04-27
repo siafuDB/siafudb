@@ -1,0 +1,42 @@
+---
+title: "Transport Contract"
+description: "What GSPA and GSPN transports must guarantee — ordering, delivery, idempotency."
+---
+
+Both GSPA and GSPN transports must satisfy this contract. Implementations may differ in how — HTTP is very different from an NTL synapse — but the guarantees they surface to the GSP layer above are identical.
+
+## Delivery
+
+**At-least-once.** A mutation may be delivered more than once. Receivers must be idempotent, keyed on `mutation.id`.
+
+## Ordering
+
+**Causal, not total.** Mutations with a happens-before relationship must be applied in causal order. Concurrent mutations may arrive in any order and are reconciled by [Conflict Resolution](/spec/conflict-resolution).
+
+## Idempotency
+
+Applying the same mutation twice must yield the same fragment state as applying it once. Receivers maintain a per-source high-water mark on `mutation.id` and a short-window replay cache.
+
+## Backpressure
+
+Transports must surface backpressure to the emitter. A GSPA HTTP transport does this with 429/503; a GSPN synapse does it with weight decay on the reverse path. GSP treats backpressure as a signal to slow the emitter, not to drop mutations.
+
+## Failure modes
+
+| Failure                     | Required behaviour                                                                       |
+| --------------------------- | ---------------------------------------------------------------------------------------- |
+| Network partition           | Buffer locally; resume on reconnect; never drop an Authoritative mutation without an ack |
+| Receiver schema mismatch    | Hold on the receiver; emit to dead-letter; notify the author                             |
+| Signature verification fail | Drop the mutation; log; alert if signed mutations are required by policy                 |
+| Clock drift                 | Tolerate; ordering is causal, not timestamp-based                                        |
+
+## GSPA-specific
+
+- HTTP: POST `/sync/mutations` with CBOR body; `Idempotency-Key` header set to `mutation.id`.
+- gRPC: bidirectional stream of `MutationBatch`; acks flow back on the same stream.
+- WebSocket: framed `MutationBatch` messages; heartbeat at 30s.
+- Kafka: topic-per-fragment-pair; key by `target`.
+
+## GSPN-specific
+
+See NTL. GSPN binds the GSP mutation model to NTL signals; the ordering and delivery contract above still holds.

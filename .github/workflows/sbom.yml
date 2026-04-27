@@ -1,0 +1,22 @@
+# SBOM — generated on tagged releases.
+#
+# Required by NA-03 §7.2. Produces a CycloneDX JSON SBOM, attaches it
+# to the GitHub release, and uploads it as a build artifact. No effect
+# until siafudb cuts its first v* tag.
+
+name: SBOM
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  sbom:
+    uses: nyuchi/.github/.github/workflows/reusable-sbom.yml@main
+    with:
+      artifact-name: sbom-${{ github.ref_name }}

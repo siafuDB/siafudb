@@ -1,0 +1,59 @@
+---
+title: "Database API"
+description: "Opening fragments, schemas, transactions, lifecycle."
+---
+
+The `Siafu` type is the entry point. Everything else hangs off it.
+
+## Opening a fragment
+
+```rust
+use siafudb::{Siafu, FragmentKind};
+
+let db = Siafu::open("./my.siafu", FragmentKind::Personal)?;
+```
+
+`FragmentKind` values:
+
+| Kind        | Default authority | Typical use                            |
+| ----------- | ----------------- | -------------------------------------- |
+| `Personal`  | Authoritative     | On-device pod, personal sovereign data |
+| `Network`   | Referenced        | Platform-side mirror                   |
+| `Edge`      | Referenced        | Read-through cache at edge locations   |
+| `Transient` | Local             | UI state, sessions — never synced      |
+
+## Schema
+
+```rust
+db.execute(r#"
+    CREATE NODE TABLE Person(name STRING, email STRING, PRIMARY KEY(email));
+    CREATE REL TABLE Knows(FROM Person TO Person, since TIMESTAMP);
+"#)?;
+```
+
+Schemas are enforced at write time. See [Graph Model](/concepts/graph-model).
+
+## Transactions
+
+```rust
+db.transaction(|tx| {
+    tx.execute("CREATE (:Person {name: 'A'})")?;
+    tx.execute("CREATE (:Person {name: 'B'})")?;
+    Ok(())
+})?;
+```
+
+All writes inside the closure commit atomically or roll back as a unit. Mutations emit only on commit.
+
+## Lifecycle
+
+Drop semantics close the fragment cleanly. For explicit control:
+
+```rust
+db.checkpoint()?;  // flush WAL
+db.close()?;       // release file handle
+```
+
+## Reference
+
+Full signatures: `cargo doc --package siafudb-core --open`.

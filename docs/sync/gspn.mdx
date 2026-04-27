@@ -1,0 +1,52 @@
+---
+title: "GSPN — Graph Sync with NTL"
+description: "Neural signal transport for the Graph Sync Protocol. Synapses, signals, learned routing."
+---
+
+GSPN is the neural transport mode for the Graph Sync Protocol. Instead of channels, GSPN emits **signals** through **synapses** — adaptive junctions provided by the [Nyuchi Transfer Layer (NTL)](https://ntl.nyuchi.com).
+
+Where GSPA is a pipe you configure, GSPN is a nervous system that learns. Synapses carry weights. Weights adapt with use. Routes emerge rather than being declared.
+
+## When to use GSPN
+
+Reach for GSPN when:
+
+- Your deployment already has NTL available on the network.
+- You want transformations applied at the synapse level, not in the emitter.
+- Routing needs to adapt — frequently-travelled paths should strengthen; cold paths should decay.
+- You are operating in a dual-stack or IPv6-native environment where neural addresses replace sockets.
+
+If none of that applies, use GSPA.
+
+## Shape
+
+```
+┌──────────────────────┐    signal     ┌─────────┐    signal    ┌──────────────────────┐
+│  SiafuDB (fragment)  │ ────────────▶ │ synapse │ ───────────▶ │  SiafuDB (fragment)  │
+│  Mutation emitter    │               │ (NTL)   │              │  Mutation applier    │
+└──────────────────────┘               └─────────┘              └──────────────────────┘
+                                            │
+                                            ▼
+                                    transform applied here
+                                    (weight × payload)
+```
+
+The emitter does not serialise for a specific destination. It hands the mutation to NTL as a signal; the synapses decide where it goes and how it is shaped along the way.
+
+## Signals vs. channels
+
+| GSPA channel                   | GSPN signal                                   |
+| ------------------------------ | --------------------------------------------- |
+| Point-to-point                 | Propagated through a mesh                     |
+| Configured endpoint            | Learned route                                 |
+| Serialise once per destination | Single signal, multiple transforms downstream |
+| No weight                      | Weighted, adaptive                            |
+| Stateless transport            | Synapses retain state (weights, decay)        |
+
+## Relationship to NTL
+
+GSPN is the SiafuDB-side binding to NTL. The protocol spec for signals, synapses, and the 12 principles that govern neural transport lives in the NTL docs. See [NTL — Neural Network Base Layer](https://ntl.nyuchi.com/research/03-neural-network-base-layer) and [NTL — Twelve Principles](https://ntl.nyuchi.com/research/05-twelve-principles).
+
+## Ships second
+
+GSPN is the second transport to land. It depends on NTL reaching a stable release, on IPv6 availability across the deployment, and ideally on hardware support for neural operations. It is the long-term transport; GSPA is how we get there.

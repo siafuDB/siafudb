@@ -1,0 +1,57 @@
+---
+title: "Graph Model"
+description: "The data model — labeled property graph, vertices and edges, typed schemas, RDF overlay."
+---
+
+SiafuDB stores a **Labeled Property Graph (LPG)**. Every vertex has a label (its type) and a property bag. Every edge has a label (its relationship type), a direction, and an optional property bag. An RDF overlay is available for semantic-web workloads; both models share the same storage.
+
+## Vertex
+
+A vertex is a node in the graph. It carries:
+
+- A **label** — the type (`Person`, `Message`, `Pod`, `Device` ...).
+- A **property bag** — typed key-value pairs declared by the schema.
+- A **fragment-unique identifier** — stable across the life of this instance.
+- An **authority** — Authoritative, Referenced, or Local.
+
+## Edge
+
+An edge is a relationship between two vertices. Edges are directed. They carry:
+
+- A **label** — the relationship type (`KNOWS`, `SENT`, `REACTS_TO` ...).
+- An **optional property bag** — typed properties such as timestamps or weights.
+- A **FROM** and **TO** vertex reference.
+
+Edges are stored as direct pointers where possible, giving O(1) traversal — index-free adjacency. Rust's ownership model lets SiafuDB do this safely.
+
+## Schema
+
+Schemas are declared at creation and enforced at write time. This prevents the schema drift that destroys data quality across millions of devices syncing independently.
+
+```cypher
+CREATE NODE TABLE Person(
+  name STRING,
+  email STRING,
+  created_at TIMESTAMP,
+  PRIMARY KEY (email)
+);
+
+CREATE REL TABLE Knows(
+  FROM Person TO Person,
+  since TIMESTAMP
+);
+```
+
+## Convenience access patterns
+
+The same graph underneath, different APIs on top:
+
+| Pattern     | API                           | Underneath                       |
+| ----------- | ----------------------------- | -------------------------------- |
+| Graph       | Cypher / GQL                  | Native graph operations          |
+| Key-Value   | `kv_set()` / `kv_get()`       | `(:_KV {key, value})`            |
+| Document    | `doc_insert()` / `doc_find()` | Node with label = collection     |
+| Time-Series | `ts_append()` / `ts_range()`  | Timestamped nodes + `NEXT` edges |
+| Vector      | Similarity queries            | HNSW index on embeddings         |
+
+See [01 — SiafuDB Architecture](/research/01-architecture#siafudb-replaces-sqlite) for the full rationale.

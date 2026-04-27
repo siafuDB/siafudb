@@ -1,0 +1,12 @@
+[package]
+name = "siafudb-access"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Convenience access patterns (KV, document, time-series) over the SiafuDB graph."
+
+[dependencies]
+siafudb-core = { path = "../siafudb-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

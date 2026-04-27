@@ -1,0 +1,43 @@
+---
+title: "Your First Query"
+description: "Cypher basics — creating, matching, and traversing in a SiafuDB fragment."
+---
+
+SiafuDB speaks Cypher (via GrafeoDB's parser). If you know Neo4j's Cypher or Kuzu's dialect, you already know most of this.
+
+## Create
+
+```cypher
+CREATE (:Person { name: 'Bryan', email: 'bryan@nyuchi.com' });
+CREATE (:Person { name: 'Sarah', email: 'sarah@example.com' });
+MATCH (a:Person {email: 'bryan@nyuchi.com'}),
+      (b:Person {email: 'sarah@example.com'})
+CREATE (a)-[:KNOWS { since: 2023 }]->(b);
+```
+
+## Match
+
+```cypher
+MATCH (p:Person) RETURN p.name;
+```
+
+## Traverse
+
+```cypher
+MATCH (a:Person)-[:KNOWS]->(b:Person)
+WHERE a.name = 'Bryan'
+RETURN b.name;
+```
+
+Edges are stored as direct pointers, so this traversal is O(1) per hop — no index lookup. See [Graph Model](/concepts/graph-model) for the storage detail.
+
+## Convenience APIs
+
+If Cypher is overkill for a use case, SiafuDB exposes the same graph through key-value, document, time-series, and vector APIs. The graph underneath is identical — only the surface changes.
+
+```rust
+db.kv_set("user:bryan", &user_json)?;
+let value = db.kv_get("user:bryan")?;
+```
+
+See [Graph Model — Convenience Access Patterns](/concepts/graph-model#convenience-access-patterns) for the mapping.

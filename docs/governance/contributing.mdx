@@ -1,0 +1,40 @@
+---
+title: "Contributing"
+description: "How to contribute to SiafuDB — issues, pull requests, and the decision log."
+---
+
+SiafuDB is Apache 2.0 under the Bundu Foundation. Contributions are welcome from anyone — individuals, companies, research groups. The rules below are meant to keep the project coherent, not to gatekeep.
+
+## Where to start
+
+- **Bugs and feature requests:** open an issue on GitHub. Use the template.
+- **Small fixes (typos, doc nits):** open a PR directly. No issue needed.
+- **Architecture changes:** open an issue first. Material changes to the research documents or the crate boundaries need a decision-log entry before code lands. See the [Decision Log](/research/03-decision-log).
+- **New features:** start with an issue describing the use case. If it touches the wire format or sync semantics, expect a specification update to be part of the PR.
+
+## Pull requests
+
+- One logical change per PR. Refactors separate from functional changes.
+- `cargo fmt` and `cargo clippy --all-targets -- -D warnings` must pass.
+- Tests required for new behaviour. Integration tests over mocks where possible.
+- Documentation updates live in the same PR as the code change.
+
+## Commit style
+
+```
+<area>: <short imperative summary>
+
+<body — what changed and why>
+
+Refs: #<issue>
+```
+
+Areas are the crate name or the doc section (`siafudb-sync:`, `docs/research:` …).
+
+## Decision log
+
+Any change that affects the protocol, the wire format, the crate boundaries, or the licensing model must land a [Decision Log](/research/03-decision-log) entry. Small implementation choices do not need one — use judgement.
+
+## Code of conduct
+
+Be kind. Disagree on substance. The project is African-led and globally contributed; diversity of perspective is a feature. See the `CODE_OF_CONDUCT.md` in the repo root for the full text.

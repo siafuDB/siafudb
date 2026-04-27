@@ -1,0 +1,49 @@
+---
+title: "Your First Sync"
+description: "Connect two SiafuDB fragments with GSPA and watch mutations propagate."
+---
+
+This guide stands up two fragments on the same machine and wires them together with GSPA over HTTP. It is the smallest meaningful demonstration of the Graph Sync Protocol.
+
+## Two fragments, one network
+
+```rust
+use siafudb::{Siafu, FragmentKind, sync::Gspa};
+
+let mut pod     = Siafu::open("./pod.siafu",     FragmentKind::Personal)?;
+let mut network = Siafu::open("./network.siafu", FragmentKind::Network)?;
+```
+
+Two fragment files. Two processes in production; one process here for simplicity.
+
+## Wire the sync
+
+```rust
+let gspa = Gspa::http()
+    .from(&pod)
+    .to("http://localhost:11301/sync")
+    .transform("StripPII")
+    .build()?;
+
+gspa.start().await?;
+```
+
+Every committed mutation in `pod` is now:
+
+1. Emitted via CDC.
+2. Transformed by `StripPII`.
+3. Serialised and POSTed to the network fragment's endpoint.
+
+## What you should see
+
+Insert a `Person` into the pod. Query the network fragment — the vertex appears, but with no `email` (that field was stripped by the transform).
+
+## Moving to real sync
+
+On a production deployment, replace HTTP with:
+
+- **gRPC** for large deltas and bidirectional streams.
+- **WebSocket** for push-based sync to devices.
+- **Kafka** for durable platform ingestion.
+
+Or, when NTL is available, switch transport to GSPN and let synapses route. See [GSPN](/sync/gspn).
