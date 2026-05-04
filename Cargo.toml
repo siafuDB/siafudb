@@ -37,7 +37,7 @@ categories = ["database", "data-structures"]
 # GrafeoDB is our foundation. We depend on it as a library and build
 # SiafuDB-specific capabilities on top. If the relationship evolves,
 # we can fork or reimplement — but we start with dependency, not divergence.
-grafeo = { version = "0.4", features = ["gql", "cypher", "wal"] }
+grafeo = { version = "0.5", features = ["gql", "cypher", "wal"] }
 
 # === Serialization & Data ===
 serde = { version = "1", features = ["derive"] }
@@ -47,7 +47,7 @@ serde_json = "1"
 # Every node in SiafuDB carries cryptographic provenance.
 # ed25519 for signing (fast, small signatures, well-understood).
 ed25519-dalek = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # === Async Traits ===
