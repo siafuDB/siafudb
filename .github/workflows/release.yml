@@ -1,0 +1,56 @@
+name: Release
+
+# Releasing is a version bump merged to main; nobody pushes a tag by hand.
+#
+# When CI passes on main, the `tag` job reads [workspace.package] version from
+# Cargo.toml and, if v<version> is not tagged yet, tags it. The `release` job
+# then cuts the GitHub release for that tag in the same run, with the CycloneDX
+# SBOM NA-03 §7.2 requires (it replaces the old tag-only sbom.yml), SHA-256
+# checksums, SLSA provenance and generated notes, through nyuchi/.github's
+# reusable-release.yml. A merge that leaves the version alone does nothing.
+#
+# Both jobs run in one workflow because siafuDB has no RELEASE_BUMP_TOKEN: a
+# tag pushed with GITHUB_TOKEN starts no other workflow. A hand-pushed v* tag
+# still releases through the second trigger. Nothing is published to
+# crates.io yet.
+
+on:
+  workflow_run:
+    workflows: ["CI / Rust"]
+    types: [completed]
+    branches: [main]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    uses: nyuchi/.github/.github/workflows/reusable-auto-tag.yml@main
+    with:
+      version-command: grep -A3 '^\[workspace.package\]' Cargo.toml | grep -m1 '^version' | cut -d'"' -f2
+      ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+    permissions:
+      contents: write
+
+  release:
+    needs: tag
+    # On a tag push `tag` is skipped and this releases the pushed tag.
+    if: >-
+      always() &&
+      (github.event_name == 'push' || needs.tag.outputs.created == 'true')
+    uses: nyuchi/.github/.github/workflows/reusable-release.yml@main
+    with:
+      tag: ${{ needs.tag.outputs.tag || github.ref_name }}
+    permissions:
+      contents: write
+      packages: read
+      id-token: write
+      attestations: write
