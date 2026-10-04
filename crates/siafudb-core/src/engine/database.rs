@@ -149,7 +149,7 @@ impl SiafuDB {
             .execute(query)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
 
-        let rows_affected = result.rows.len();
+        let rows_affected = result.rows().len();
 
         if self.mutation_tracking
             && let Ok(mut log) = self.change_log.lock()
@@ -171,7 +171,7 @@ impl SiafuDB {
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
 
         let rows: Vec<Vec<serde_json::Value>> = result
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 row.iter()
