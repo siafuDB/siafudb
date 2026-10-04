@@ -246,6 +246,24 @@ Major architectural decisions (new extensions, breaking API changes, new support
 
 Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before participating in any community space.
 
+## Versioning
+
+Releases follow the org versioning policy
+([nyuchi/.github#80](https://github.com/nyuchi/.github/issues/80)). The
+branch decides the bump, and there are no version labels:
+
+- **A merge into `staging`** (the live beta) is tagged as the next
+  **patch** automatically, by `staging-version.yml`.
+- **A release to `main`** is the next **minor** above the highest tag. The
+  PR that releases sets `[workspace.package] version` in `Cargo.toml` to it. CI refuses any other version
+  and names the right one.
+- **A major** is only ever made by hand: the owner runs the release
+  workflow from the Actions tab with `bump: major`.
+- Each segment holds 0–999. Patch 999 rolls into the next minor; minor 999
+  stops and asks for a manual major.
+
+Versions released before 2026-10-04 are not renumbered.
+
 ## Licence
 
 By contributing to SiafuDB, you agree that your contributions will be licensed under the [Apache License, Version 2.0](LICENSE). You retain copyright over your contributions.

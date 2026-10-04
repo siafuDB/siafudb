@@ -14,6 +14,12 @@ name: Release
 # still releases through the second trigger. Nothing is published to
 # crates.io yet.
 
+# Versioning policy (nyuchi/.github#80): a release to main is the next
+# MINOR above the highest tag, and the version file must say so (the run
+# fails and names the right version otherwise); merges into staging are
+# tagged as patches by staging-version.yml; a MAJOR only by hand, from the
+# Actions tab with bump: major. Each segment holds 0..999.
+
 on:
   workflow_run:
     workflows: ["CI / Rust"]
@@ -22,6 +28,14 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      bump:
+        description: >-
+          Versioning policy override. main releases the next minor; a major
+          is only ever made by hand, here.
+        type: choice
+        options: [minor, patch, major]
+        default: minor
 
 permissions:
   contents: read
@@ -33,9 +47,10 @@ jobs:
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push')
-    uses: nyuchi/.github/.github/workflows/reusable-auto-tag.yml@b0402fdd3b590fa6c6774ea81c4e8cc21a4cf6cb  # main 2026-10-04
+    uses: nyuchi/.github/.github/workflows/reusable-auto-tag.yml@924e5b4d0983d31379aedbec02b990793f29c792  # main, 2026-10-04
     with:
       version-command: grep -A3 '^\[workspace.package\]' Cargo.toml | grep -m1 '^version' | cut -d'"' -f2
+      bump: ${{ inputs.bump || '' }}
       ref: ${{ github.event.workflow_run.head_sha || github.sha }}
     permissions:
       contents: write
@@ -46,7 +61,7 @@ jobs:
     if: >-
       always() &&
       (github.event_name == 'push' || needs.tag.outputs.created == 'true')
-    uses: nyuchi/.github/.github/workflows/reusable-release.yml@b0402fdd3b590fa6c6774ea81c4e8cc21a4cf6cb  # main 2026-10-04
+    uses: nyuchi/.github/.github/workflows/reusable-release.yml@924e5b4d0983d31379aedbec02b990793f29c792  # main, 2026-10-04
     with:
       tag: ${{ needs.tag.outputs.tag || github.ref_name }}
     permissions:
