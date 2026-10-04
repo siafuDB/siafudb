@@ -33,7 +33,7 @@ jobs:
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push')
-    uses: nyuchi/.github/.github/workflows/reusable-auto-tag.yml@main
+    uses: nyuchi/.github/.github/workflows/reusable-auto-tag.yml@b0402fdd3b590fa6c6774ea81c4e8cc21a4cf6cb  # main 2026-10-04
     with:
       version-command: grep -A3 '^\[workspace.package\]' Cargo.toml | grep -m1 '^version' | cut -d'"' -f2
       ref: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -46,7 +46,7 @@ jobs:
     if: >-
       always() &&
       (github.event_name == 'push' || needs.tag.outputs.created == 'true')
-    uses: nyuchi/.github/.github/workflows/reusable-release.yml@main
+    uses: nyuchi/.github/.github/workflows/reusable-release.yml@b0402fdd3b590fa6c6774ea81c4e8cc21a4cf6cb  # main 2026-10-04
     with:
       tag: ${{ needs.tag.outputs.tag || github.ref_name }}
     permissions:
