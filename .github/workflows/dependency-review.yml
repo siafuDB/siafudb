@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   review:
-    uses: nyuchi/.github/.github/workflows/reusable-dependency-review.yml@b0402fdd3b590fa6c6774ea81c4e8cc21a4cf6cb  # main 2026-10-04
+    uses: nyuchi/.github/.github/workflows/reusable-dependency-review.yml@c2be05a22aeb6a98a80a9301f6b3e33bb88b20b0  # v0.2.0
     with:
       fail-on-severity: moderate
       comment-summary-in-pr: on-failure
