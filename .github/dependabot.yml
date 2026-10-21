@@ -12,6 +12,7 @@
 version: 2
 updates:
   - package-ecosystem: "github-actions"
+    target-branch: "staging"
     directory: "/"
     schedule:
       interval: "weekly"
@@ -31,6 +32,7 @@ updates:
         update-types: ["major", "minor", "patch"]
 
   - package-ecosystem: "cargo"
+    target-branch: "staging"
     directory: "/"
     schedule:
       interval: "weekly"
