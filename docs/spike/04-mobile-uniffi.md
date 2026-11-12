@@ -1,0 +1,62 @@
+# 4. Does it build for iOS/Android and expose cleanly via UniFFI?
+
+**Yes to both, as far as can be checked without Xcode or the Android NDK.** The
+code builds for the mobile targets and UniFFI generates real Swift and Kotlin
+bindings. Nothing was linked into an app or run on a device or simulator.
+
+## Evidence
+
+| Check                                                                                          | Result                                                                                    |
+| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `cargo build -p siafudb-core --target aarch64-apple-ios`                                       | Builds, with no changes                                                                   |
+| `cargo build -p siafudb-core --target aarch64-linux-android`                                   | Builds, with no changes                                                                   |
+| Grafeo `browser` profile on both targets                                                       | Builds                                                                                    |
+| UniFFI 0.29 wrapper crate over `siafudb-core` (`in_memory`, `execute`, `query`), host `cdylib` | Builds                                                                                    |
+| `uniffi-bindgen generate --library ... --language swift`                                       | Generated `siafudb_ffi.swift` (833 lines), header, modulemap                              |
+| `uniffi-bindgen generate --library ... --language kotlin`                                      | Generated `siafudb_ffi.kt` (1,571 lines)                                                  |
+| Generated API                                                                                  | `class Db: DbProtocol` with `execute(q:) throws -> UInt64` and `query(q:) throws -> Rows` |
+
+The tree needs no C toolchain for the current dependencies: Android and iOS
+library builds succeeded with no NDK or Xcode present, which a `cc`-compiled
+dependency would have failed. The one trap is `blake3`'s default build (see 03);
+use its `pure` feature.
+
+## Things the wrapper exposed
+
+1. **`&mut self` on `set_mutation_tracking`.** UniFFI objects are shared
+   `Arc`s, so the FFI wrapper cannot call it. Make the flag an `AtomicBool`
+   inside `SiafuDB`.
+2. **`query()` returns every cell as a Rust `Debug` string**
+   (`serde_json::Value::String(format!("{:?}", val))`). Over FFI that means
+   Swift and Kotlin receive `"Int64(31)"` style text, not typed values. Fix
+   before any real app depends on it: return a typed value enum.
+3. **Parameterised queries are needed at the boundary.** The only way to pass a
+   value today is string interpolation (and see the injection finding in
+   [05](05-relational-and-queries.md#kv-injection)). UniFFI makes that worse
+   because mobile apps will pass user text straight in.
+4. **Errors** map cleanly (`FfiError` with a message). Keep `SiafuError`
+   variants distinct over FFI so apps can tell "locked" from "corrupt".
+5. **Threading.** Grafeo is `Send + Sync`, which UniFFI requires, and the probe
+   compiled. Long queries should be async or run off the UI thread on the Swift
+   or Kotlin side; I did not evaluate UniFFI's async support for this.
+6. **Expo / React Native.** Not tested. Options: a native module wrapping the
+   UniFFI bindings, or `uniffi-bindgen-react-native`. _Unverified which fits
+   Mukoko's Expo setup._ Check this against the app before committing.
+
+## What is left to prove
+
+- Build an XCFramework (`aarch64-apple-ios`, `aarch64-apple-ios-sim`,
+  `aarch64-apple-darwin`) and a Kotlin AAR (`cargo-ndk`, four ABIs), then open a
+  database in the app sandbox on a real low-end Android phone.
+- Measure binary size and cold-start. Grafeo's default `embedded` profile pulls
+  rayon and the full language set; a mobile profile should trim it.
+- Confirm file locking and `fsync` behaviour in the iOS/Android app sandbox
+  (relevant to `FilePageStore` in 02).
+
+## Effort
+
+1-2 weeks per platform to a working demo: toolchain and packaging 3-4 days,
+typed result API 2 days, and on-device verification. Expo wrapper adds about a
+week and depends on the choice in point 6.
+
+Reproduce: [`probes/ffi`](probes/ffi/).

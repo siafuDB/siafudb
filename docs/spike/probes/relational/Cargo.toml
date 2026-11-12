@@ -1,0 +1,8 @@
+[package]
+name="rel"
+version="0.0.0"
+edition="2024"
+[dependencies]
+grafeo = { version="=0.5.43", features=["gql","cypher","sql-pgq","gremlin"] }
+
+[workspace]
