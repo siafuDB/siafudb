@@ -20,7 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+// web-time: std::time::SystemTime panics on wasm32-unknown-unknown.
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// One captured engine-level change.
 #[derive(Debug, Clone, Serialize, Deserialize)]

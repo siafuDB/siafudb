@@ -100,6 +100,7 @@ impl SiafuDB {
     /// it opens the existing database. If it doesn't, it creates a new one.
     /// The file is a single file — the entire graph, indexes, and metadata
     /// in one place. Easy to backup, easy to encrypt, easy to sync.
+    #[cfg(feature = "native")]
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SiafuError> {
         let path = path.as_ref();
         let engine = grafeo::GrafeoDB::open(path.to_str().unwrap_or_default())

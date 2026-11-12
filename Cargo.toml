@@ -37,7 +37,8 @@ categories = ["database", "data-structures"]
 # GrafeoDB is our foundation. We depend on it as a library and build
 # SiafuDB-specific capabilities on top. If the relationship evolves,
 # we can fork or reimplement — but we start with dependency, not divergence.
-grafeo = { version = "0.5", features = ["gql", "cypher", "wal"] }
+# default-features off: each consumer picks a profile (siafudb-core: `native` or `browser`).
+grafeo = { version = "0.6", default-features = false, features = ["gql", "cypher"] }
 
 # === Serialization & Data ===
 serde = { version = "1", features = ["derive"] }
@@ -61,7 +62,9 @@ crossbeam = "0.8"
 # === Conflict Resolution ===
 # Vector clocks for causal ordering in the sync protocol.
 # CRDTs for conflict-free merge of concurrent mutations.
-uuid = { version = "1", features = ["v4", "serde"] }
+# `js` is a no-op off wasm; on wasm32-unknown-unknown it supplies randomness.
+uuid = { version = "1", features = ["v4", "serde", "js"] }
+web-time = "1"
 
 # === Error Handling ===
 thiserror = "2"

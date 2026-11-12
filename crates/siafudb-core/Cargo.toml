@@ -6,6 +6,13 @@ license.workspace = true
 repository.workspace = true
 description = "SiafuDB core engine — wraps GrafeoDB with fragment, identity, and mutation tracking."
 
+[features]
+# `native` (default): file-backed persistence, full Grafeo profile.
+# `browser`: wasm32-unknown-unknown profile; in-memory + snapshot persistence only.
+default = ["native"]
+native = ["grafeo/embedded", "grafeo/wal"]
+browser = ["grafeo/browser"]
+
 [dependencies]
 grafeo = { workspace = true }
 serde = { workspace = true }
@@ -15,3 +22,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+web-time = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
