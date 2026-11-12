@@ -34,6 +34,10 @@ pub struct ChangeLogEntry {
     pub query: String,
     /// How many graph elements the engine reported affected.
     pub rows_affected: usize,
+    /// Bound parameters (`$name`) the query was executed with. Replay must
+    /// bind the same values; never interpolate them into `query`.
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Append-only log of engine-level changes.
@@ -52,7 +56,12 @@ impl ChangeLog {
     }
 
     /// Append a new entry and return its sequence number.
-    pub fn append(&mut self, query: String, rows_affected: usize) -> u64 {
+    pub fn append(
+        &mut self,
+        query: String,
+        rows_affected: usize,
+        params: serde_json::Map<String, serde_json::Value>,
+    ) -> u64 {
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -63,6 +72,7 @@ impl ChangeLog {
             timestamp_ms,
             query,
             rows_affected,
+            params,
         });
         self.next_sequence += 1;
         sequence
