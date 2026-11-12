@@ -26,3 +26,6 @@ target
 
 # probes are standalone; lockfiles are intentionally not committed
 **/docs/spike/probes/*/Cargo.lock
+
+# agent worktrees
+.claude/worktrees/
