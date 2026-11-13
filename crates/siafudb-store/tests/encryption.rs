@@ -4,8 +4,9 @@ mod common;
 
 use common::*;
 use siafudb_store::{
-    AeadSuite, Argon2Params, CallbackKek, EncryptOptions, EncryptedPageStore, KekProvider, KeyHeader,
-    MemPageStore, PageStore, PassphraseKek, RawKek, StoreError, UnwrappedKek, generate_dek,
+    AeadSuite, Argon2Params, CallbackKek, EncryptOptions, EncryptedPageStore, KekProvider,
+    KeyHeader, MemPageStore, PageStore, PassphraseKek, RawKek, StoreError, UnwrappedKek,
+    generate_dek,
 };
 use zeroize::Zeroizing;
 
@@ -58,7 +59,10 @@ fn pages_are_bound_to_slot_and_database() {
         b[3 * PPS..4 * PPS].copy_from_slice(&p0);
     });
     let mut buf = vec![0u8; LPS];
-    assert!(matches!(e.read_page(1, &mut buf), Err(StoreError::Integrity(1))));
+    assert!(matches!(
+        e.read_page(1, &mut buf),
+        Err(StoreError::Integrity(1))
+    ));
 
     // A page from another database with the same key and slot is rejected
     // (db_id in AAD; here the DEKs also differ).
@@ -69,7 +73,10 @@ fn pages_are_bound_to_slot_and_database() {
     e2.write_page(0, &bytes(3, LPS)).unwrap();
     let foreign = other.to_bytes()[2 * PPS..3 * PPS].to_vec();
     inner.with_bytes_mut(|b| b[2 * PPS..3 * PPS].copy_from_slice(&foreign));
-    assert!(matches!(e.read_page(0, &mut buf), Err(StoreError::Integrity(0))));
+    assert!(matches!(
+        e.read_page(0, &mut buf),
+        Err(StoreError::Integrity(0))
+    ));
 }
 
 #[test]
@@ -85,7 +92,10 @@ fn nonces_are_random_and_versions_increase() {
     assert_ne!(a[38..], b[38..], "ciphertext differs");
     let ver = |p: &[u8]| u64::from_le_bytes(p[6..14].try_into().unwrap());
     assert!(ver(&b) > ver(&a));
-    assert_eq!(u16::from_le_bytes([a[0], a[1]]), AeadSuite::XChaCha20Poly1305.id());
+    assert_eq!(
+        u16::from_le_bytes([a[0], a[1]]),
+        AeadSuite::XChaCha20Poly1305.id()
+    );
     // Replaying the older authentic copy decrypts at this layer (only the
     // container's root can tell it is stale; see container tests).
     inner.with_bytes_mut(|x| x[2 * PPS..3 * PPS].copy_from_slice(&a));
@@ -108,9 +118,15 @@ fn passphrase_kek_round_trip_and_wrong_passphrase() {
     e.write_page(0, &bytes(1, LPS)).unwrap();
     drop(e);
     let bad = PassphraseKek::with_params(b"battery staple", Argon2Params::INSECURE_TEST);
-    assert!(matches!(EncryptedPageStore::open(inner.clone(), &bad), Err(StoreError::WrongKey)));
+    assert!(matches!(
+        EncryptedPageStore::open(inner.clone(), &bad),
+        Err(StoreError::WrongKey)
+    ));
     // Raw KEK on a passphrase store: wrong provider -> WrongKey.
-    assert!(matches!(EncryptedPageStore::open(inner.clone(), &kek()), Err(StoreError::WrongKey)));
+    assert!(matches!(
+        EncryptedPageStore::open(inner.clone(), &kek()),
+        Err(StoreError::WrongKey)
+    ));
     let e = EncryptedPageStore::open(inner, &k).unwrap();
     let mut buf = vec![0u8; LPS];
     e.read_page(0, &mut buf).unwrap();
@@ -126,7 +142,10 @@ fn host_kek_returning_garbage_is_caught_by_key_check() {
         |_, _| Err(StoreError::Io("unused".into())),
         |_, _| Ok(Zeroizing::new(vec![0xAA; 32])),
     );
-    assert!(matches!(EncryptedPageStore::open(inner.clone(), &liar), Err(StoreError::WrongKey)));
+    assert!(matches!(
+        EncryptedPageStore::open(inner.clone(), &liar),
+        Err(StoreError::WrongKey)
+    ));
     assert!(matches!(
         EncryptedPageStore::open(inner.clone(), &UnwrappedKek::new(Zeroizing::new([1u8; 32]))),
         Err(StoreError::WrongKey)
@@ -174,7 +193,10 @@ fn header_copy_damage_and_tamper() {
     drop(e);
     // Damage both: clean error, no decrypt attempted.
     inner.with_bytes_mut(|b| b[PPS + 10] ^= 0xFF);
-    assert!(matches!(reopen_encrypted(inner.clone()), Err(StoreError::Corrupt(_))));
+    assert!(matches!(
+        reopen_encrypted(inner.clone()),
+        Err(StoreError::Corrupt(_))
+    ));
 
     // A forged header (db_id changed, checksum recomputed) fails the key
     // check: the KCV binds the header fields to the DEK.
@@ -203,7 +225,10 @@ fn rewrap_changes_kek() {
     let new = PassphraseKek::with_params(b"new pass", Argon2Params::INSECURE_TEST);
     e.rewrap(&new).unwrap();
     drop(e);
-    assert!(matches!(reopen_encrypted(inner.clone()), Err(StoreError::WrongKey)));
+    assert!(matches!(
+        reopen_encrypted(inner.clone()),
+        Err(StoreError::WrongKey)
+    ));
     let e = EncryptedPageStore::open(inner, &new).unwrap();
     let mut buf = vec![0u8; LPS];
     e.read_page(0, &mut buf).unwrap();
@@ -212,8 +237,14 @@ fn rewrap_changes_kek() {
 
 #[test]
 fn unknown_suite_id_is_reported() {
-    assert!(matches!(AeadSuite::from_id(2), Err(StoreError::UnsupportedSuite(2))));
-    assert!(matches!(AeadSuite::from_id(0), Err(StoreError::UnsupportedSuite(0))));
+    assert!(matches!(
+        AeadSuite::from_id(2),
+        Err(StoreError::UnsupportedSuite(2))
+    ));
+    assert!(matches!(
+        AeadSuite::from_id(0),
+        Err(StoreError::UnsupportedSuite(0))
+    ));
 }
 
 #[test]

@@ -2,8 +2,8 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::store::{LockGuard, LockMode, PageNo, PageStore, StoreCaps, StoreError, check_len};
 use crate::Result;
+use crate::store::{LockGuard, LockMode, PageNo, PageStore, StoreCaps, StoreError, check_len};
 
 #[derive(Default)]
 struct LockState {
@@ -43,7 +43,7 @@ impl MemPageStore {
 
     /// Store over existing raw bytes (length must be a multiple of `page_size`).
     pub fn from_bytes(page_size: usize, bytes: Vec<u8>) -> Result<Self> {
-        if page_size == 0 || bytes.len() % page_size != 0 {
+        if page_size == 0 || !bytes.len().is_multiple_of(page_size) {
             return Err(StoreError::InvalidArgument(
                 "length is not a multiple of the page size".into(),
             ));

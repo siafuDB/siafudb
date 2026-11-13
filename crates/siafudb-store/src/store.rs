@@ -162,6 +162,21 @@ pub trait PageStore: MaybeSendSync {
     fn commitment_key(&self) -> Option<Zeroizing<[u8; 32]>> {
         None
     }
+    /// Like [`PageStore::read_page`], and also return the per-write version
+    /// the page was written with, authenticated together with its contents.
+    /// Stores without versions return 0.
+    fn read_page_versioned(&self, no: PageNo, buf: &mut [u8]) -> Result<u64> {
+        self.read_page(no, buf).map(|()| 0)
+    }
+    /// Like [`PageStore::write_page`], and also return the version assigned
+    /// to this write (0 for stores without versions). The container records
+    /// these in its page-version vector.
+    fn write_page_versioned(&self, no: PageNo, buf: &[u8]) -> Result<u64> {
+        self.write_page(no, buf).map(|()| 0)
+    }
+    /// Versions up to `v` are known to exist; later writes must use larger
+    /// ones. The container calls this at open with the committed maximum.
+    fn observe_version(&self, _v: u64) {}
 }
 
 pub(crate) fn check_len(store_page: usize, got: usize) -> Result<()> {
@@ -186,6 +201,9 @@ macro_rules! forward_page_store {
             fn sync(&self) -> Result<()> { (**self).sync() }
             fn lock(&self, mode: LockMode) -> Result<LockGuard> { (**self).lock(mode) }
             fn commitment_key(&self) -> Option<Zeroizing<[u8; 32]>> { (**self).commitment_key() }
+            fn read_page_versioned(&self, no: PageNo, buf: &mut [u8]) -> Result<u64> { (**self).read_page_versioned(no, buf) }
+            fn write_page_versioned(&self, no: PageNo, buf: &[u8]) -> Result<u64> { (**self).write_page_versioned(no, buf) }
+            fn observe_version(&self, v: u64) { (**self).observe_version(v) }
         }
     };
 }

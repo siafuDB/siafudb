@@ -86,7 +86,13 @@ impl Cipher {
 
     /// Decrypt `buf` in place. On failure `buf` is zeroed (never leak
     /// unauthenticated plaintext) and `false` is returned.
-    pub(crate) fn open(&self, nonce: &[u8; 24], aad: &[u8], buf: &mut [u8], tag: &[u8; 16]) -> bool {
+    pub(crate) fn open(
+        &self,
+        nonce: &[u8; 24],
+        aad: &[u8],
+        buf: &mut [u8],
+        tag: &[u8; 16],
+    ) -> bool {
         let ok = self
             .inner
             .decrypt_inout_detached(&XNonce::from(*nonce), aad, buf.into(), &Tag::from(*tag))

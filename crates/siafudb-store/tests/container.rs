@@ -51,7 +51,10 @@ fn round_trip_plain_and_encrypted() {
         c.commit().unwrap();
         assert_eq!(c.log_bounds(), (6, 10));
         let log = c.read_log(0).unwrap();
-        assert_eq!(log.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![6, 7, 8, 9]);
+        assert_eq!(
+            log.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![6, 7, 8, 9]
+        );
         assert_eq!(c.blob_names(), vec!["snapshot".to_string()]);
     }
 }
@@ -65,12 +68,20 @@ fn space_is_reused_and_trimmed() {
         c.commit().unwrap();
     }
     // Two generations of a 10-page blob + directory + superblocks; never 50.
-    assert!(inner.page_count().unwrap() < 30, "{}", inner.page_count().unwrap());
+    assert!(
+        inner.page_count().unwrap() < 30,
+        "{}",
+        inner.page_count().unwrap()
+    );
     c.put_blob("snap", b"x").unwrap();
     c.commit().unwrap();
     c.put_blob("snap", b"y").unwrap();
     c.commit().unwrap();
-    assert!(inner.page_count().unwrap() < 10, "{}", inner.page_count().unwrap());
+    assert!(
+        inner.page_count().unwrap() < 10,
+        "{}",
+        inner.page_count().unwrap()
+    );
 }
 
 #[test]
@@ -83,10 +94,21 @@ fn many_small_log_commits_compact() {
     }
     let log = c.read_log(0).unwrap();
     assert_eq!(log.len(), 200);
-    assert!(log.iter().enumerate().all(|(i, e)| e.seq == i as u64 && e.data == (i as u32).to_le_bytes()));
-    assert!(inner.page_count().unwrap() < 80, "{}", inner.page_count().unwrap());
+    assert!(
+        log.iter()
+            .enumerate()
+            .all(|(i, e)| e.seq == i as u64 && e.data == (i as u32).to_le_bytes())
+    );
+    assert!(
+        inner.page_count().unwrap() < 80,
+        "{}",
+        inner.page_count().unwrap()
+    );
     drop(c);
-    assert_eq!(Container::open(inner).unwrap().read_log(150).unwrap().len(), 50);
+    assert_eq!(
+        Container::open(inner).unwrap().read_log(150).unwrap().len(),
+        50
+    );
 }
 
 #[test]
@@ -99,7 +121,6 @@ fn wrong_key_fails_cleanly() {
     let r = EncryptedPageStore::open(inner, &RawKek::new([0u8; 32]));
     assert!(matches!(r, Err(StoreError::WrongKey)));
 }
-
 
 /// Restore an older authentic copy of any single physical page (from any
 /// earlier commit): open must detect it, or be unaffected (page no longer
@@ -133,7 +154,10 @@ fn replaying_an_older_page_is_detected() {
             match reopen_encrypted(store.clone()).and_then(Container::open) {
                 Err(StoreError::Rollback(_)) => rollback_errors += 1,
                 Err(e) => {
-                    assert!(matches!(e, StoreError::Integrity(_) | StoreError::Corrupt(_)), "page {p}: {e:?}");
+                    assert!(
+                        matches!(e, StoreError::Integrity(_) | StoreError::Corrupt(_)),
+                        "page {p}: {e:?}"
+                    );
                     other_errors += 1;
                 }
                 Ok(c) => {
@@ -143,20 +167,31 @@ fn replaying_an_older_page_is_detected() {
                     }
                     // Physical pages 2 and 3 are the superblock slots.
                     assert!(p == 2 || p == 3, "page {p}: silent mix");
-                    assert!(history.iter().any(|(_, st, _)| *st == s), "page {p}: not a real checkpoint");
+                    assert!(
+                        history.iter().any(|(_, st, _)| *st == s),
+                        "page {p}: not a real checkpoint"
+                    );
                     whole_store += 1;
                     drop(c);
                     let r = Container::open_with(
                         reopen_encrypted(store).unwrap(),
-                        OpenOptions { min_seq: Some(cur_seq), ..OpenOptions::default() },
+                        OpenOptions {
+                            min_seq: Some(cur_seq),
+                            ..OpenOptions::default()
+                        },
                     );
                     assert!(matches!(r, Err(StoreError::Rollback(_))), "{r:?}");
                 }
             }
         }
     }
-    eprintln!("replays: {rollback_errors} rollback errors, {other_errors} other errors, {whole_store} whole-store (min_seq)");
-    assert!(rollback_errors >= 3, "stale data/dir pages detected by the root: {rollback_errors}");
+    eprintln!(
+        "replays: {rollback_errors} rollback errors, {other_errors} other errors, {whole_store} whole-store (min_seq)"
+    );
+    assert!(
+        rollback_errors >= 3,
+        "stale data/dir pages detected by the root: {rollback_errors}"
+    );
 }
 
 fn populated_encrypted() -> (MemPageStore, Vec<u8>, State, State) {
@@ -177,13 +212,20 @@ fn populated_encrypted() -> (MemPageStore, Vec<u8>, State, State) {
 #[test]
 fn whole_store_rollback_needs_min_seq() {
     let (_inner, prev_image, prev, _) = populated_encrypted();
-    let store = reopen_encrypted(MemPageStore::from_bytes(PPS, prev_image.clone()).unwrap()).unwrap();
+    let store =
+        reopen_encrypted(MemPageStore::from_bytes(PPS, prev_image.clone()).unwrap()).unwrap();
     let c = Container::open(store).unwrap();
     assert_eq!(state(&c), prev);
     assert_eq!(c.commit_seq(), 2);
     drop(c);
     let store = reopen_encrypted(MemPageStore::from_bytes(PPS, prev_image).unwrap()).unwrap();
-    let r = Container::open_with(store, OpenOptions { min_seq: Some(3), ..OpenOptions::default() });
+    let r = Container::open_with(
+        store,
+        OpenOptions {
+            min_seq: Some(3),
+            ..OpenOptions::default()
+        },
+    );
     assert!(matches!(r, Err(StoreError::Rollback(_))));
 }
 
@@ -220,7 +262,10 @@ fn bit_flips_anywhere_never_yield_wrong_data() {
             }
         }
     }
-    assert!(errs > 0 && same > 0 && fallback > 0, "errs {errs} same {same} fallback {fallback}");
+    assert!(
+        errs > 0 && same > 0 && fallback > 0,
+        "errs {errs} same {same} fallback {fallback}"
+    );
 }
 
 #[test]
@@ -263,10 +308,16 @@ fn second_open_is_locked_out() {
 
 #[test]
 fn open_errors() {
-    assert!(matches!(Container::open(MemPageStore::new(LPS)), Err(StoreError::NotInitialized)));
+    assert!(matches!(
+        Container::open(MemPageStore::new(LPS)),
+        Err(StoreError::NotInitialized)
+    ));
     let inner = MemPageStore::new(LPS);
     drop(Container::create(inner.clone()).unwrap());
-    assert!(matches!(Container::create(inner.clone()), Err(StoreError::AlreadyInitialized)));
+    assert!(matches!(
+        Container::create(inner.clone()),
+        Err(StoreError::AlreadyInitialized)
+    ));
     // Garbage everywhere: no valid superblock.
     let junk = MemPageStore::from_bytes(LPS, bytes(5, 4 * LPS)).unwrap();
     assert!(matches!(Container::open(junk), Err(StoreError::Corrupt(_))));
@@ -307,7 +358,9 @@ fn check_against(c: &Container<impl PageStore>, m: &Model) -> Result<(), TestCas
     let next = m.log.len() as u64;
     let first = m.first.min(next);
     prop_assert_eq!(c.log_bounds(), (first, next));
-    let want: Vec<(u64, Vec<u8>)> = (first..next).map(|i| (i, m.log[i as usize].clone())).collect();
+    let want: Vec<(u64, Vec<u8>)> = (first..next)
+        .map(|i| (i, m.log[i as usize].clone()))
+        .collect();
     let got: Vec<(u64, Vec<u8>)> = s.log.into_iter().map(|e| (e.seq, e.data)).collect();
     prop_assert_eq!(got, want);
     Ok(())
@@ -374,4 +427,122 @@ proptest! {
     fn prop_container_round_trip_encrypted(ops in prop::collection::vec(arb_op(), 1..40)) {
         run_model(true, ops)?;
     }
+}
+
+/// The content hash cannot tell an older copy of a page apart when the old
+/// and new plaintext are identical; the page-version vector can. Commit the
+/// same blob bytes repeatedly so shadow paging rewrites identical plaintext
+/// into reused slots, then restore an older copy of such a page.
+#[test]
+fn page_version_vector_catches_replay_of_identical_plaintext() {
+    let inner = MemPageStore::new(PPS);
+    let mut c = Container::create(encrypt(inner.clone())).unwrap();
+    let blob = bytes(77, 2 * LPS);
+    let mut images = Vec::new();
+    for _ in 0..4 {
+        c.put_blob("same", &blob).unwrap();
+        c.commit().unwrap();
+        images.push(inner.to_bytes());
+    }
+    drop(c);
+    let cur = images.pop().unwrap();
+    // Physical pages that are live now: holding a blob half, and damaging
+    // them makes open fail (stale copies of the blob are unreferenced).
+    let live: Vec<usize> = {
+        let e = reopen_encrypted(MemPageStore::from_bytes(PPS, cur.clone()).unwrap()).unwrap();
+        let mut buf = vec![0u8; LPS];
+        (0..e.page_count().unwrap())
+            .filter(|&p| {
+                e.read_page(p, &mut buf).is_ok()
+                    && (buf[..] == blob[..LPS] || buf[..] == blob[LPS..])
+            })
+            .map(|p| p as usize + 2)
+            .filter(|&p| {
+                let mut img = cur.clone();
+                img[p * PPS + 40] ^= 1;
+                let s = reopen_encrypted(MemPageStore::from_bytes(PPS, img).unwrap()).unwrap();
+                Container::open(s).is_err()
+            })
+            .collect()
+    };
+    assert_eq!(live.len(), 2, "two live blob pages");
+    let mut tested = 0;
+    for old in &images {
+        for &p in &live {
+            let r = p * PPS..(p + 1) * PPS;
+            if old.len() < r.end || old[r.clone()] == cur[r.clone()] {
+                continue;
+            }
+            // Same logical plaintext in the old copy?
+            let e_old =
+                reopen_encrypted(MemPageStore::from_bytes(PPS, old.clone()).unwrap()).unwrap();
+            let mut a = vec![0u8; LPS];
+            let mut b = vec![0u8; LPS];
+            let e_cur =
+                reopen_encrypted(MemPageStore::from_bytes(PPS, cur.clone()).unwrap()).unwrap();
+            if e_old.read_page(p as u64 - 2, &mut a).is_err() {
+                continue;
+            }
+            e_cur.read_page(p as u64 - 2, &mut b).unwrap();
+            if a != b {
+                continue;
+            }
+            let mut img = cur.clone();
+            img[r.clone()].copy_from_slice(&old[r]);
+            let res = reopen_encrypted(MemPageStore::from_bytes(PPS, img).unwrap()).unwrap();
+            let r = Container::open(res);
+            match r {
+                Err(StoreError::Rollback(m)) => assert!(m.contains("version"), "{m}"),
+                other => panic!("page {p}: identical-plaintext replay not detected: {other:?}"),
+            }
+            tested += 1;
+        }
+    }
+    assert!(
+        tested > 0,
+        "no identical-plaintext replay case was constructed"
+    );
+    eprintln!("identical-plaintext replays detected by the version vector: {tested}");
+}
+
+/// Exhaustive tamper: every bit of every physical page of an encrypted
+/// container (key headers, superblocks, directory, blob and log pages).
+/// Each flip must give an error, the current state, or (newest superblock
+/// hit) exactly the previous checkpoint with the damage reported.
+/// ~63k opens: about 2 minutes in a debug build, so opt-in:
+/// `cargo test -p siafudb-store --test container -- --ignored`.
+#[test]
+#[ignore = "exhaustive, slow in debug builds; run with --ignored"]
+fn every_bit_of_every_physical_page() {
+    let (inner, _, prev, cur) = populated_encrypted();
+    let image = inner.to_bytes();
+    let (mut errs, mut fallback, mut same) = (0u64, 0u64, 0u64);
+    for p in 0..image.len() / PPS {
+        for off in 0..PPS {
+            for bit in 0..8 {
+                let mut img = image.clone();
+                img[p * PPS + off] ^= 1 << bit;
+                let store = MemPageStore::from_bytes(PPS, img).unwrap();
+                match reopen_encrypted(store).and_then(Container::open) {
+                    Err(_) => errs += 1,
+                    Ok(c) => {
+                        let s = state(&c);
+                        if s == cur {
+                            same += 1;
+                        } else {
+                            assert_eq!(s, prev, "page {p} byte {off} bit {bit}: wrong data");
+                            assert!(c.open_report().damaged_superblock);
+                            fallback += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{} pages x {} bits: {errs} errors, {same} unaffected, {fallback} fell back to the previous checkpoint",
+        image.len() / PPS,
+        PPS * 8
+    );
+    assert!(errs > 0 && fallback > 0);
 }

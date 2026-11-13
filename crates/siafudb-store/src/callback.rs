@@ -105,12 +105,18 @@ impl CallbackPageStoreBuilder {
         self
     }
     /// Page count.
-    pub fn page_count(mut self, f: impl Fn() -> Result<u64> + crate::MaybeSendSync + 'static) -> Self {
+    pub fn page_count(
+        mut self,
+        f: impl Fn() -> Result<u64> + crate::MaybeSendSync + 'static,
+    ) -> Self {
         self.count = Some(Box::new(f));
         self
     }
     /// Truncate.
-    pub fn truncate(mut self, f: impl Fn(u64) -> Result<()> + crate::MaybeSendSync + 'static) -> Self {
+    pub fn truncate(
+        mut self,
+        f: impl Fn(u64) -> Result<()> + crate::MaybeSendSync + 'static,
+    ) -> Self {
         self.truncate = Some(Box::new(f));
         self
     }
@@ -129,7 +135,8 @@ impl CallbackPageStoreBuilder {
     }
     /// Finish. Errors if `read`, `write` or `page_count` is missing.
     pub fn build(self) -> Result<CallbackPageStore> {
-        let missing = |n: &str| StoreError::InvalidArgument(format!("callback store: `{n}` not set"));
+        let missing =
+            |n: &str| StoreError::InvalidArgument(format!("callback store: `{n}` not set"));
         if self.page_size == 0 {
             return Err(StoreError::InvalidArgument("page size 0".into()));
         }
@@ -140,7 +147,11 @@ impl CallbackPageStoreBuilder {
             write: self.write.ok_or_else(|| missing("write"))?,
             count: self.count.ok_or_else(|| missing("page_count"))?,
             truncate: self.truncate.unwrap_or_else(|| {
-                Box::new(|_| Err(StoreError::Io("host store does not support truncate".into())))
+                Box::new(|_| {
+                    Err(StoreError::Io(
+                        "host store does not support truncate".into(),
+                    ))
+                })
             }),
             sync: self.sync.unwrap_or_else(|| Box::new(|| Ok(()))),
             lock: self.lock,

@@ -35,10 +35,17 @@ fn apply<S: PageStore>(c: &mut Container<S>, ops: &[Op]) {
 }
 
 fn wrap(fs: Arc<FaultyStore>, encrypted: bool) -> Box<dyn PageStore> {
-    if encrypted { Box::new(encrypt(fs)) } else { Box::new(fs) }
+    if encrypted {
+        Box::new(encrypt(fs))
+    } else {
+        Box::new(fs)
+    }
 }
 
-fn reopen(img: MemPageStore, encrypted: bool) -> siafudb_store::Result<Container<Box<dyn PageStore>>> {
+fn reopen(
+    img: MemPageStore,
+    encrypted: bool,
+) -> siafudb_store::Result<Container<Box<dyn PageStore>>> {
     let s: Box<dyn PageStore> = if encrypted {
         Box::new(reopen_encrypted(img)?)
     } else {
@@ -49,7 +56,10 @@ fn reopen(img: MemPageStore, encrypted: bool) -> siafudb_store::Result<Container
 
 /// Build a container, commit each of `history`, return the store and the
 /// state after the last commit.
-fn setup(encrypted: bool, history: &[Vec<Op>]) -> (Arc<FaultyStore>, Container<Box<dyn PageStore>>, State) {
+fn setup(
+    encrypted: bool,
+    history: &[Vec<Op>],
+) -> (Arc<FaultyStore>, Container<Box<dyn PageStore>>, State) {
     let fs = Arc::new(FaultyStore::new(if encrypted { PPS } else { LPS }));
     let mut c = Container::create(wrap(fs.clone(), encrypted)).unwrap();
     for ops in history {
@@ -103,7 +113,10 @@ fn crash_one(
     };
     let got = state(&c);
     if r.is_ok() {
-        assert_eq!(&got, new, "k={k} {kind:?} seed={seed}: committed Ok but lost");
+        assert_eq!(
+            &got, new,
+            "k={k} {kind:?} seed={seed}: committed Ok but lost"
+        );
     }
     if &got == old {
         out.old += 1;
@@ -125,7 +138,11 @@ fn crash_one(
     drop(c);
     // `img` shares its bytes with the clone the container wrote through.
     let c2 = reopen(img, encrypted).unwrap();
-    assert_eq!(state(&c2), want, "k={k} {kind:?} seed={seed}: recovery commit");
+    assert_eq!(
+        state(&c2),
+        want,
+        "k={k} {kind:?} seed={seed}: recovery commit"
+    );
 }
 
 /// Exhaustive: every op index of the commit, both fault kinds, several
@@ -138,11 +155,18 @@ fn exhaustive(encrypted: bool, history: Vec<Vec<Op>>, next: Vec<Op>) -> (u64, Ou
     for k in 0..=n {
         for kind in [FaultKind::Fail, FaultKind::Tear] {
             for seed in 0..6 {
-                crash_one(encrypted, &history, &next, k, kind, seed, &old, &new, &mut out);
+                crash_one(
+                    encrypted, &history, &next, k, kind, seed, &old, &new, &mut out,
+                );
             }
         }
     }
-    assert!(out.old > 0 && out.new > 0, "both outcomes reachable: old {} new {}", out.old, out.new);
+    assert!(
+        out.old > 0 && out.new > 0,
+        "both outcomes reachable: old {} new {}",
+        out.old,
+        out.new
+    );
     eprintln!(
         "encrypted={encrypted}: {n} ops/commit, {} crash runs: {} old, {} new",
         out.old + out.new,
@@ -154,14 +178,23 @@ fn exhaustive(encrypted: bool, history: Vec<Vec<Op>>, next: Vec<Op>) -> (u64, Ou
 
 fn history() -> Vec<Vec<Op>> {
     vec![
-        vec![Op::Put(0, 3 * LPS + 17, 1), Op::Append(40, 2), Op::Append(700, 3)],
+        vec![
+            Op::Put(0, 3 * LPS + 17, 1),
+            Op::Append(40, 2),
+            Op::Append(700, 3),
+        ],
         vec![Op::Put(1, 10, 4), Op::Append(5, 5)],
     ]
 }
 
 /// Snapshot replacement + log append + log trim in one commit.
 fn checkpoint_commit() -> Vec<Op> {
-    vec![Op::Put(0, 4 * LPS, 6), Op::Trim(2), Op::Append(100, 7), Op::Delete(1)]
+    vec![
+        Op::Put(0, 4 * LPS, 6),
+        Op::Trim(2),
+        Op::Append(100, 7),
+        Op::Delete(1),
+    ]
 }
 
 #[test]
@@ -176,7 +209,11 @@ fn crash_during_checkpoint_encrypted() {
 
 #[test]
 fn crash_during_log_append_encrypted() {
-    exhaustive(true, history(), vec![Op::Append(30, 8), Op::Append(3000, 9)]);
+    exhaustive(
+        true,
+        history(),
+        vec![Op::Append(30, 8), Op::Append(3000, 9)],
+    );
 }
 
 #[test]
@@ -194,7 +231,11 @@ fn crash_during_log_compaction() {
 #[test]
 fn crash_during_shrinking_commit() {
     // Big blob replaced by a tiny one: the commit ends with a truncate.
-    exhaustive(true, vec![vec![Op::Put(0, 12 * LPS, 1)], vec![Op::Put(0, 12 * LPS, 2)]], vec![Op::Put(0, 3, 3)]);
+    exhaustive(
+        true,
+        vec![vec![Op::Put(0, 12 * LPS, 1)], vec![Op::Put(0, 12 * LPS, 2)]],
+        vec![Op::Put(0, 3, 3)],
+    );
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {

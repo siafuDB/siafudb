@@ -15,7 +15,10 @@ fn contract(s: &dyn PageStore) {
     let ps = s.page_size();
     assert_eq!(s.page_count().unwrap(), 0);
     let mut buf = vec![0u8; ps];
-    assert!(matches!(s.read_page(0, &mut buf), Err(StoreError::OutOfRange(0))));
+    assert!(matches!(
+        s.read_page(0, &mut buf),
+        Err(StoreError::OutOfRange(0))
+    ));
     s.write_page(2, &vec![2u8; ps]).unwrap();
     assert_eq!(s.page_count().unwrap(), 3);
     s.read_page(2, &mut buf).unwrap();
@@ -25,10 +28,16 @@ fn contract(s: &dyn PageStore) {
     s.read_page(0, &mut buf).unwrap();
     assert_eq!(buf, vec![1u8; ps]);
     // Wrong buffer size is rejected, not truncated.
-    assert!(matches!(s.write_page(0, &[0u8; 3]), Err(StoreError::InvalidArgument(_))));
+    assert!(matches!(
+        s.write_page(0, &[0u8; 3]),
+        Err(StoreError::InvalidArgument(_))
+    ));
     s.truncate(1).unwrap();
     assert_eq!(s.page_count().unwrap(), 1);
-    assert!(matches!(s.read_page(2, &mut buf), Err(StoreError::OutOfRange(2))));
+    assert!(matches!(
+        s.read_page(2, &mut buf),
+        Err(StoreError::OutOfRange(2))
+    ));
 }
 
 #[test]
@@ -59,7 +68,13 @@ fn encrypted_rejects_mismatched_inner_page_size() {
 fn callback_contract() {
     let pages: Arc<Mutex<BTreeMap<u64, Vec<u8>>>> = Arc::default();
     let synced = Arc::new(Mutex::new(0usize));
-    let (p1, p2, p3, p4, s1) = (pages.clone(), pages.clone(), pages.clone(), pages.clone(), synced.clone());
+    let (p1, p2, p3, p4, s1) = (
+        pages.clone(),
+        pages.clone(),
+        pages.clone(),
+        pages.clone(),
+        synced.clone(),
+    );
     let store = CallbackPageStore::builder(256)
         .caps(StoreCaps {
             durable_sync: true,
@@ -95,11 +110,17 @@ fn callback_contract() {
 fn mem_lock_is_exclusive() {
     let s = MemPageStore::new(256);
     let g = s.lock(LockMode::Exclusive).unwrap();
-    assert!(matches!(s.clone().lock(LockMode::Shared), Err(StoreError::Locked)));
+    assert!(matches!(
+        s.clone().lock(LockMode::Shared),
+        Err(StoreError::Locked)
+    ));
     drop(g);
     let a = s.lock(LockMode::Shared).unwrap();
     let _b = s.lock(LockMode::Shared).unwrap();
-    assert!(matches!(s.lock(LockMode::Exclusive), Err(StoreError::Locked)));
+    assert!(matches!(
+        s.lock(LockMode::Exclusive),
+        Err(StoreError::Locked)
+    ));
     drop(a);
 }
 
@@ -109,7 +130,8 @@ mod file {
     use siafudb_store::{Container, FilePageStore};
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("siafudb-store-test-{}-{name}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("siafudb-store-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_file(&d);
         d
     }
@@ -127,7 +149,10 @@ mod file {
         let a = FilePageStore::open(&p, 256).unwrap();
         let b = FilePageStore::open(&p, 256).unwrap();
         let g = a.lock(LockMode::Exclusive).unwrap();
-        assert!(matches!(b.lock(LockMode::Exclusive), Err(StoreError::Locked)));
+        assert!(matches!(
+            b.lock(LockMode::Exclusive),
+            Err(StoreError::Locked)
+        ));
         assert!(matches!(b.lock(LockMode::Shared), Err(StoreError::Locked)));
         drop(g);
         let _g = b.lock(LockMode::Exclusive).unwrap();
@@ -147,7 +172,8 @@ mod file {
             let other = reopen_encrypted(FilePageStore::open(&p, PPS).unwrap()).unwrap();
             assert!(matches!(Container::open(other), Err(StoreError::Locked)));
         }
-        let c = Container::open(reopen_encrypted(FilePageStore::open(&p, PPS).unwrap()).unwrap()).unwrap();
+        let c = Container::open(reopen_encrypted(FilePageStore::open(&p, PPS).unwrap()).unwrap())
+            .unwrap();
         assert_eq!(c.get_blob("snapshot").unwrap().unwrap(), bytes(1, 5000));
         assert_eq!(c.read_log(0).unwrap()[0].data, b"m1");
         // Plaintext never reaches the file.
@@ -158,7 +184,10 @@ mod file {
 }
 
 fn arb_ops(max_page: u64, ps: usize) -> impl Strategy<Value = Vec<(u64, Vec<u8>)>> {
-    prop::collection::vec((0..max_page, prop::collection::vec(any::<u8>(), ps..=ps)), 1..24)
+    prop::collection::vec(
+        (0..max_page, prop::collection::vec(any::<u8>(), ps..=ps)),
+        1..24,
+    )
 }
 
 fn read_after_write(s: &dyn PageStore, ops: &[(u64, Vec<u8>)]) -> Result<(), TestCaseError> {
@@ -171,7 +200,10 @@ fn read_after_write(s: &dyn PageStore, ops: &[(u64, Vec<u8>)]) -> Result<(), Tes
             s.read_page(*k, &mut buf).unwrap();
             prop_assert_eq!(&buf, v);
         }
-        prop_assert_eq!(s.page_count().unwrap(), model.keys().next_back().unwrap() + 1);
+        prop_assert_eq!(
+            s.page_count().unwrap(),
+            model.keys().next_back().unwrap() + 1
+        );
     }
     Ok(())
 }

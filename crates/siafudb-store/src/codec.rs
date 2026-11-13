@@ -43,7 +43,11 @@ impl<'a> Dec<'a> {
         StoreError::Corrupt(format!("{}: truncated at byte {}", self.what, self.pos))
     }
     pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.buf.len()).ok_or_else(|| self.err())?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&e| e <= self.buf.len())
+            .ok_or_else(|| self.err())?;
         let s = &self.buf[self.pos..end];
         self.pos = end;
         Ok(s)
@@ -63,10 +67,34 @@ impl<'a> Dec<'a> {
     pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.arr()?))
     }
-    pub fn pos(&self) -> usize {
-        self.pos
-    }
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_and_truncation() {
+        let mut e = Enc::default();
+        e.u8(1)
+            .u16(0x0203)
+            .u32(0x0405_0607)
+            .u64(u64::MAX)
+            .raw(b"xy");
+        let mut d = Dec::new(&e.0, "t");
+        assert_eq!(d.u8().unwrap(), 1);
+        assert_eq!(d.u16().unwrap(), 0x0203);
+        assert_eq!(d.u32().unwrap(), 0x0405_0607);
+        assert_eq!(d.u64().unwrap(), u64::MAX);
+        assert_eq!(d.take(2).unwrap(), b"xy");
+        assert_eq!(d.remaining(), 0);
+        assert!(matches!(d.u8(), Err(StoreError::Corrupt(_))));
+        assert!(matches!(
+            Dec::new(b"abc", "t").take(usize::MAX),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 }

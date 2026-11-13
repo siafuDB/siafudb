@@ -36,6 +36,17 @@
 //!
 //! ## Rollback
 //!
+//! Every page write gets a version from the store
+//! ([`PageStore::write_page_versioned`]; for [`crate::EncryptedPageStore`]
+//! the per-write version bound into the page's AAD). The directory lists the
+//! version of every blob and log page, and the superblock carries a keyed
+//! BLAKE3 root over the whole page-version vector (directory pages included)
+//! plus the highest version. At open the vector is recomputed from the
+//! authenticated directory and checked against the root; every later read
+//! checks the page's authenticated version against the vector. This catches
+//! a restored older copy even when its plaintext equals the current one,
+//! which the content hashes alone cannot.
+//!
 //! Mixing pages from different points in time is detected (hash tree). A
 //! rollback of the *whole* store to an earlier consistent state (restore an
 //! old backup, replay both superblock slots) cannot be detected from the
@@ -66,6 +77,7 @@ const D_SB: &[u8] = b"siafudb-store/sb/v1";
 const D_DIR: &[u8] = b"siafudb-store/dir/v1";
 const D_BLOB: &[u8] = b"siafudb-store/blob/v1";
 const D_SEG: &[u8] = b"siafudb-store/seg/v1";
+const D_VER: &[u8] = b"siafudb-store/versions/v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 struct Extent {
@@ -84,6 +96,8 @@ struct BlobRef {
     ext: Extent,
     len: u64,
     hash: [u8; 32],
+    /// Per-page write versions (`ext.pages` entries).
+    versions: Vec<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +107,8 @@ struct Segment {
     ext: Extent,
     len: u64,
     hash: [u8; 32],
+    /// Per-page write versions (`ext.pages` entries).
+    versions: Vec<u64>,
 }
 
 impl Segment {
@@ -116,6 +132,11 @@ struct Superblock {
     dir: Extent,
     dir_len: u64,
     dir_hash: [u8; 32],
+    /// Highest page version referenced by this commit.
+    max_version: u64,
+    /// Keyed BLAKE3 over the page-version vector: `(page_no, version)` for
+    /// every live page (directory, then blobs by name, then log segments).
+    ver_root: [u8; 32],
 }
 
 /// Options for [`Container::open_with`].
@@ -203,7 +224,40 @@ fn content_hash(key: &[u8; 32], domain: &[u8], name: &[u8], len: u64, pages: &[u
 }
 
 fn public_key() -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(blake3::derive_key("siafudb-store v1 public commitment", b""))
+    Zeroizing::new(blake3::derive_key(
+        "siafudb-store v1 public commitment",
+        b"",
+    ))
+}
+
+fn decode_versions(d: &mut Dec<'_>, pages: u64) -> Result<Vec<u64>> {
+    // Bound by the bytes actually present before allocating.
+    if pages
+        .checked_mul(8)
+        .is_none_or(|n| n > d.remaining() as u64)
+    {
+        return Err(StoreError::Corrupt(
+            "directory: version list truncated".into(),
+        ));
+    }
+    (0..pages).map(|_| d.u64()).collect()
+}
+
+/// Keyed BLAKE3 over the page-version vector of a commit.
+fn version_root(key: &[u8; 32], dir_ext: Extent, dir_versions: &[u64], dir: &Dir) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_keyed(key);
+    h.update(D_VER);
+    let mut add = |ext: Extent, vs: &[u64]| {
+        for (i, v) in vs.iter().enumerate() {
+            h.update(&(ext.start + i as u64).to_le_bytes());
+            h.update(&v.to_le_bytes());
+        }
+    };
+    add(dir_ext, dir_versions);
+    for (ext, vs) in dir.versioned() {
+        add(ext, vs);
+    }
+    *h.finalize().as_bytes()
 }
 
 impl Dir {
@@ -218,6 +272,9 @@ impl Dir {
                 .u64(b.ext.pages)
                 .u64(b.len)
                 .raw(&b.hash);
+            for v in &b.versions {
+                e.u64(*v);
+            }
         }
         e.u32(self.segments.len() as u32);
         for s in &self.segments {
@@ -227,6 +284,9 @@ impl Dir {
                 .u64(s.ext.pages)
                 .u64(s.len)
                 .raw(&s.hash);
+            for v in &s.versions {
+                e.u64(*v);
+            }
         }
         e.0
     }
@@ -245,34 +305,55 @@ impl Dir {
             let n = d.u16()? as usize;
             let name = String::from_utf8(d.take(n)?.to_vec())
                 .map_err(|_| StoreError::Corrupt("blob name is not UTF-8".into()))?;
+            let ext = Extent {
+                start: d.u64()?,
+                pages: d.u64()?,
+            };
             let b = BlobRef {
-                ext: Extent {
-                    start: d.u64()?,
-                    pages: d.u64()?,
-                },
+                ext,
                 len: d.u64()?,
                 hash: d.arr()?,
+                versions: decode_versions(&mut d, ext.pages)?,
             };
             if dir.blobs.insert(name, b).is_some() {
                 return Err(StoreError::Corrupt("duplicate blob name".into()));
             }
         }
         for _ in 0..d.u32()? {
+            let first_seq = d.u64()?;
+            let count = d.u32()?;
+            let ext = Extent {
+                start: d.u64()?,
+                pages: d.u64()?,
+            };
             dir.segments.push(Segment {
-                first_seq: d.u64()?,
-                count: d.u32()?,
-                ext: Extent {
-                    start: d.u64()?,
-                    pages: d.u64()?,
-                },
+                first_seq,
+                count,
+                ext,
                 len: d.u64()?,
                 hash: d.arr()?,
+                versions: decode_versions(&mut d, ext.pages)?,
             });
         }
         if d.remaining() != 0 {
             return Err(StoreError::Corrupt("trailing bytes in directory".into()));
         }
         Ok(dir)
+    }
+
+    /// `(extent, versions)` of every blob and segment, in canonical order.
+    fn versioned(&self) -> impl Iterator<Item = (Extent, &[u64])> + '_ {
+        self.blobs
+            .values()
+            .map(|b| (b.ext, b.versions.as_slice()))
+            .chain(self.segments.iter().map(|s| (s.ext, s.versions.as_slice())))
+    }
+
+    fn max_version(&self) -> u64 {
+        self.versioned()
+            .flat_map(|(_, v)| v.iter().copied())
+            .max()
+            .unwrap_or(0)
     }
 
     fn extents(&self) -> impl Iterator<Item = Extent> + '_ {
@@ -291,11 +372,21 @@ impl Dir {
             if e.pages != pages_for(len, ps) {
                 return bad("extent size does not match length");
             }
-            if e.pages > 0 && (e.start < FIRST_DATA_PAGE || e.start.checked_add(e.pages).is_none_or(|end| end > page_count)) {
+            if e.pages > 0
+                && (e.start < FIRST_DATA_PAGE
+                    || e.start
+                        .checked_add(e.pages)
+                        .is_none_or(|end| end > page_count))
+            {
                 return bad("extent out of range");
             }
             Ok(())
         };
+        for (ext, vs) in self.versioned() {
+            if vs.len() as u64 != ext.pages {
+                return bad("version list length");
+            }
+        }
         for b in self.blobs.values() {
             check(b.ext, b.len)?;
         }
@@ -318,7 +409,11 @@ impl Dir {
                 if f.first_seq > self.log_first || l.end_seq() != self.log_next {
                     return bad("log segments do not cover the log");
                 }
-                if self.segments.windows(2).any(|w| w[0].end_seq() != w[1].first_seq) {
+                if self
+                    .segments
+                    .windows(2)
+                    .any(|w| w[0].end_seq() != w[1].first_seq)
+                {
                     return bad("log segments not contiguous");
                 }
             }
@@ -442,14 +537,17 @@ impl<S: PageStore> Container<S> {
             start: FIRST_DATA_PAGE,
             pages: pages_for(bytes.len() as u64, ps),
         };
-        let hash = c.write_extent(ext, D_DIR, b"", &bytes)?;
+        let (hash, versions) = c.write_extent(ext, D_DIR, b"", &bytes)?;
         c.store.sync()?;
+        let ver_root = version_root(&c.key, ext, &versions, &c.dir);
         for seq in 0..2 {
             let sb = Superblock {
                 seq,
                 dir: ext,
                 dir_len: bytes.len() as u64,
                 dir_hash: hash,
+                max_version: versions.iter().copied().max().unwrap_or(0),
+                ver_root,
             };
             c.store.write_page(seq % 2, &c.encode_sb(&sb))?;
         }
@@ -528,9 +626,31 @@ impl<S: PageStore> Container<S> {
         {
             return Err(StoreError::Corrupt("superblock directory extent".into()));
         }
-        let bytes = c.read_extent(sb.dir, sb.dir_len, D_DIR, b"", &sb.dir_hash, "directory")?;
+        let (bytes, dir_versions) = c.read_extent(
+            sb.dir,
+            sb.dir_len,
+            D_DIR,
+            b"",
+            &sb.dir_hash,
+            None,
+            "directory",
+        )?;
         let dir = Dir::decode(&bytes)?;
         dir.validate(sb.dir, ps, count)?;
+        // Rollback check on the page-version vector: the directory's own
+        // page versions (just read, authenticated by the store) plus the
+        // versions it lists must hash to the root in the superblock.
+        if !ct_eq(
+            &version_root(&c.key, sb.dir, &dir_versions, &dir),
+            &sb.ver_root,
+        ) || dir.max_version() > sb.max_version
+            || dir_versions.iter().any(|v| *v > sb.max_version)
+        {
+            return Err(StoreError::Rollback(
+                "page-version vector does not match the superblock (older page restored)".into(),
+            ));
+        }
+        c.store.observe_version(sb.max_version);
         c.dir = dir;
         if opts.verify_all {
             c.verify()?;
@@ -558,7 +678,9 @@ impl<S: PageStore> Container<S> {
             .u64(sb.dir.start)
             .u64(sb.dir.pages)
             .u64(sb.dir_len)
-            .raw(&sb.dir_hash);
+            .raw(&sb.dir_hash)
+            .u64(sb.max_version)
+            .raw(&sb.ver_root);
         let mut page = e.0;
         page.resize(self.ps - MAC_LEN, 0);
         let mac = content_hash(&self.key, D_SB, b"", 0, &page);
@@ -579,7 +701,6 @@ impl<S: PageStore> Container<S> {
         if d.u32()? as usize != ps {
             return Err(StoreError::Corrupt("superblock page size".into()));
         }
-        let _ = d.pos();
         Ok(Superblock {
             seq: d.u64()?,
             dir: Extent {
@@ -588,27 +709,39 @@ impl<S: PageStore> Container<S> {
             },
             dir_len: d.u64()?,
             dir_hash: d.arr()?,
+            max_version: d.u64()?,
+            ver_root: d.arr()?,
         })
     }
 
-    fn write_extent(&self, ext: Extent, domain: &[u8], name: &[u8], bytes: &[u8]) -> Result<[u8; 32]> {
+    /// Write `bytes` into `ext`; returns the content hash and the version of
+    /// every page written.
+    fn write_extent(
+        &self,
+        ext: Extent,
+        domain: &[u8],
+        name: &[u8],
+        bytes: &[u8],
+    ) -> Result<([u8; 32], Vec<u64>)> {
         let mut h = blake3::Hasher::new_keyed(&self.key);
         h.update(domain);
         h.update(&(name.len() as u32).to_le_bytes());
         h.update(name);
         h.update(&(bytes.len() as u64).to_le_bytes());
         let mut page = vec![0u8; self.ps];
+        let mut versions = Vec::with_capacity(ext.pages as usize);
         for i in 0..ext.pages {
             let off = (i as usize) * self.ps;
             let n = self.ps.min(bytes.len() - off);
             page[..n].copy_from_slice(&bytes[off..off + n]);
             page[n..].fill(0);
             h.update(&page);
-            self.store.write_page(ext.start + i, &page)?;
+            versions.push(self.store.write_page_versioned(ext.start + i, &page)?);
         }
-        Ok(*h.finalize().as_bytes())
+        Ok((*h.finalize().as_bytes(), versions))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_extent(
         &self,
         ext: Extent,
@@ -616,13 +749,31 @@ impl<S: PageStore> Container<S> {
         domain: &[u8],
         name: &[u8],
         expected: &[u8; 32],
+        expected_versions: Option<&[u64]>,
         what: &str,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Vec<u64>)> {
         let ps = self.ps;
-        let mut out = vec![0u8; usize::try_from(ext.pages).map_err(|_| StoreError::Corrupt("extent".into()))? * ps];
+        let mut out =
+            vec![
+                0u8;
+                usize::try_from(ext.pages).map_err(|_| StoreError::Corrupt("extent".into()))? * ps
+            ];
+        let mut versions = Vec::with_capacity(ext.pages as usize);
         for i in 0..ext.pages {
             let off = (i as usize) * ps;
-            self.store.read_page(ext.start + i, &mut out[off..off + ps])?;
+            let v = self
+                .store
+                .read_page_versioned(ext.start + i, &mut out[off..off + ps])?;
+            if let Some(want) = expected_versions
+                && want.get(i as usize) != Some(&v)
+            {
+                return Err(StoreError::Rollback(format!(
+                    "{what} page {} has version {v}, the committed page-version vector says {:?}",
+                    ext.start + i,
+                    want.get(i as usize)
+                )));
+            }
+            versions.push(v);
         }
         if !ct_eq(&content_hash(&self.key, domain, name, len, &out), expected) {
             return Err(StoreError::Rollback(format!(
@@ -630,7 +781,7 @@ impl<S: PageStore> Container<S> {
             )));
         }
         out.truncate(len as usize);
-        Ok(out)
+        Ok((out, versions))
     }
 
     fn check(&self) -> Result<()> {
@@ -645,10 +796,26 @@ impl<S: PageStore> Container<S> {
     pub fn verify(&self) -> Result<()> {
         self.check()?;
         for (name, b) in &self.dir.blobs {
-            self.read_extent(b.ext, b.len, D_BLOB, name.as_bytes(), &b.hash, "blob")?;
+            self.read_extent(
+                b.ext,
+                b.len,
+                D_BLOB,
+                name.as_bytes(),
+                &b.hash,
+                Some(&b.versions),
+                "blob",
+            )?;
         }
         for s in &self.dir.segments {
-            let bytes = self.read_extent(s.ext, s.len, D_SEG, b"", &s.hash, "log segment")?;
+            let (bytes, _) = self.read_extent(
+                s.ext,
+                s.len,
+                D_SEG,
+                b"",
+                &s.hash,
+                Some(&s.versions),
+                "log segment",
+            )?;
             decode_entries(&bytes, s.count)?;
         }
         Ok(())
@@ -660,7 +827,8 @@ impl<S: PageStore> Container<S> {
         if name.len() > MAX_NAME {
             return Err(StoreError::InvalidArgument("blob name too long".into()));
         }
-        self.staged_blobs.insert(name.to_owned(), Some(bytes.to_vec()));
+        self.staged_blobs
+            .insert(name.to_owned(), Some(bytes.to_vec()));
         Ok(())
     }
 
@@ -680,8 +848,16 @@ impl<S: PageStore> Container<S> {
         match self.dir.blobs.get(name) {
             None => Ok(None),
             Some(b) => self
-                .read_extent(b.ext, b.len, D_BLOB, name.as_bytes(), &b.hash, "blob")
-                .map(Some),
+                .read_extent(
+                    b.ext,
+                    b.len,
+                    D_BLOB,
+                    name.as_bytes(),
+                    &b.hash,
+                    Some(&b.versions),
+                    "blob",
+                )
+                .map(|(bytes, _)| Some(bytes)),
         }
     }
 
@@ -737,7 +913,15 @@ impl<S: PageStore> Container<S> {
             if s.end_seq() <= start {
                 continue;
             }
-            let bytes = self.read_extent(s.ext, s.len, D_SEG, b"", &s.hash, "log segment")?;
+            let (bytes, _) = self.read_extent(
+                s.ext,
+                s.len,
+                D_SEG,
+                b"",
+                &s.hash,
+                Some(&s.versions),
+                "log segment",
+            )?;
             for (i, data) in decode_entries(&bytes, s.count)?.into_iter().enumerate() {
                 let seq = s.first_seq + i as u64;
                 if seq >= start {
@@ -759,7 +943,9 @@ impl<S: PageStore> Container<S> {
 
     /// Anything staged?
     pub fn is_dirty(&self) -> bool {
-        !self.staged_blobs.is_empty() || !self.staged_log.is_empty() || self.staged_trim > self.dir.log_first
+        !self.staged_blobs.is_empty()
+            || !self.staged_log.is_empty()
+            || self.staged_trim > self.dir.log_first
     }
 
     /// Drop staged changes.
@@ -816,7 +1002,11 @@ impl<S: PageStore> Container<S> {
     fn commit_inner(&mut self) -> Result<()> {
         let ps = self.ps;
         let count = self.store.page_count()?;
-        let used: Vec<Extent> = self.dir.extents().chain(core::iter::once(self.dir_ext)).collect();
+        let used: Vec<Extent> = self
+            .dir
+            .extents()
+            .chain(core::iter::once(self.dir_ext))
+            .collect();
         let mut alloc = Allocator::new(used, count);
         let mut new = self.dir.clone();
 
@@ -828,8 +1018,17 @@ impl<S: PageStore> Container<S> {
                 Some(bytes) => {
                     let len = bytes.len() as u64;
                     let ext = alloc.alloc(pages_for(len, ps));
-                    let hash = self.write_extent(ext, D_BLOB, name.as_bytes(), bytes)?;
-                    new.blobs.insert(name.clone(), BlobRef { ext, len, hash });
+                    let (hash, versions) =
+                        self.write_extent(ext, D_BLOB, name.as_bytes(), bytes)?;
+                    new.blobs.insert(
+                        name.clone(),
+                        BlobRef {
+                            ext,
+                            len,
+                            hash,
+                            versions,
+                        },
+                    );
                 }
             }
         }
@@ -851,7 +1050,15 @@ impl<S: PageStore> Container<S> {
             let mut all = Vec::new();
             let seg_first = new.segments[0].first_seq.max(first);
             for s in &new.segments {
-                let bytes = self.read_extent(s.ext, s.len, D_SEG, b"", &s.hash, "log segment")?;
+                let (bytes, _) = self.read_extent(
+                    s.ext,
+                    s.len,
+                    D_SEG,
+                    b"",
+                    &s.hash,
+                    Some(&s.versions),
+                    "log segment",
+                )?;
                 for (i, d) in decode_entries(&bytes, s.count)?.into_iter().enumerate() {
                     if s.first_seq + i as u64 >= first {
                         all.push(d);
@@ -870,13 +1077,14 @@ impl<S: PageStore> Container<S> {
             let (bytes, n) = encode_entries(entries.iter().map(|e| e.as_slice()));
             let len = bytes.len() as u64;
             let ext = alloc.alloc(pages_for(len, ps));
-            let hash = self.write_extent(ext, D_SEG, b"", &bytes)?;
+            let (hash, versions) = self.write_extent(ext, D_SEG, b"", &bytes)?;
             new.segments.push(Segment {
                 first_seq,
                 count: n,
                 ext,
                 len,
                 hash,
+                versions,
             });
         }
         new.log_first = first;
@@ -884,7 +1092,7 @@ impl<S: PageStore> Container<S> {
 
         let bytes = new.encode();
         let dir_ext = alloc.alloc(pages_for(bytes.len() as u64, ps));
-        let dir_hash = self.write_extent(dir_ext, D_DIR, b"", &bytes)?;
+        let (dir_hash, dir_versions) = self.write_extent(dir_ext, D_DIR, b"", &bytes)?;
         self.store.sync()?;
 
         let seq = self.seq + 1;
@@ -893,6 +1101,10 @@ impl<S: PageStore> Container<S> {
             dir: dir_ext,
             dir_len: bytes.len() as u64,
             dir_hash,
+            max_version: new
+                .max_version()
+                .max(dir_versions.iter().copied().max().unwrap_or(0)),
+            ver_root: version_root(&self.key, dir_ext, &dir_versions, &new),
         };
         self.store.write_page(seq % 2, &self.encode_sb(&sb))?;
         self.store.sync()?;
@@ -921,5 +1133,129 @@ impl<S: PageStore> Container<S> {
             let _ = self.store.truncate(hi);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::MemPageStore;
+
+    fn sample_dir() -> Dir {
+        let mut d = Dir {
+            log_first: 1,
+            log_next: 4,
+            ..Dir::default()
+        };
+        d.blobs.insert(
+            "snap".into(),
+            BlobRef {
+                ext: Extent { start: 3, pages: 2 },
+                len: 300,
+                hash: [1; 32],
+                versions: vec![7, 8],
+            },
+        );
+        d.segments.push(Segment {
+            first_seq: 1,
+            count: 3,
+            ext: Extent { start: 5, pages: 1 },
+            len: 20,
+            hash: [2; 32],
+            versions: vec![9],
+        });
+        d
+    }
+
+    #[test]
+    fn dir_round_trip_and_validation() {
+        let d = sample_dir();
+        let back = Dir::decode(&d.encode()).unwrap();
+        assert_eq!(back.encode(), d.encode());
+        assert_eq!(back.max_version(), 9);
+        back.validate(Extent { start: 2, pages: 1 }, 256, 6)
+            .unwrap();
+        // Overlap with the directory extent.
+        assert!(
+            back.validate(Extent { start: 4, pages: 1 }, 256, 6)
+                .is_err()
+        );
+        // Out of range.
+        assert!(
+            back.validate(Extent { start: 2, pages: 1 }, 256, 5)
+                .is_err()
+        );
+        // Version list length must match the extent.
+        let mut bad = sample_dir();
+        bad.blobs.get_mut("snap").unwrap().versions.pop();
+        assert!(bad.validate(Extent { start: 2, pages: 1 }, 256, 6).is_err());
+        // Truncated encodings are rejected, never panic.
+        let enc = d.encode();
+        for n in 0..enc.len() {
+            assert!(Dir::decode(&enc[..n]).is_err(), "prefix {n}");
+        }
+    }
+
+    #[test]
+    fn huge_version_count_does_not_allocate() {
+        let mut e = Enc::default();
+        e.u32(DIR_FORMAT)
+            .u64(0)
+            .u64(0)
+            .u32(1)
+            .u16(1)
+            .raw(b"x")
+            .u64(2)
+            .u64(u64::MAX / 2)
+            .u64(1)
+            .raw(&[0; 32]);
+        assert!(matches!(Dir::decode(&e.0), Err(StoreError::Corrupt(_))));
+    }
+
+    #[test]
+    fn allocator_reuses_holes_then_extends() {
+        let used = vec![Extent { start: 2, pages: 1 }, Extent { start: 5, pages: 2 }];
+        let mut a = Allocator::new(used, 7);
+        assert_eq!(a.alloc(2), Extent { start: 3, pages: 2 });
+        assert_eq!(a.alloc(1), Extent { start: 7, pages: 1 });
+        assert_eq!(a.alloc(0), Extent::default());
+    }
+
+    #[test]
+    fn version_root_binds_page_numbers_and_versions() {
+        let k = [3u8; 32];
+        let d = sample_dir();
+        let ext = Extent { start: 2, pages: 1 };
+        let r = version_root(&k, ext, &[1], &d);
+        assert_ne!(r, version_root(&k, ext, &[2], &d));
+        assert_ne!(r, version_root(&k, Extent { start: 6, pages: 1 }, &[1], &d));
+        let mut d2 = sample_dir();
+        d2.segments[0].versions[0] = 10;
+        assert_ne!(r, version_root(&k, ext, &[1], &d2));
+        assert_ne!(r, version_root(&[4u8; 32], ext, &[1], &d));
+    }
+
+    #[test]
+    fn superblock_mac_rejects_any_change() {
+        let c = Container::create(MemPageStore::new(256)).unwrap();
+        let sb = Superblock {
+            seq: 5,
+            dir: Extent { start: 2, pages: 1 },
+            dir_len: 10,
+            dir_hash: [1; 32],
+            max_version: 3,
+            ver_root: [2; 32],
+        };
+        let page = c.encode_sb(&sb);
+        let back = Container::<MemPageStore>::decode_sb(&c.key, 256, &page).unwrap();
+        assert_eq!((back.seq, back.max_version, back.ver_root), (5, 3, [2; 32]));
+        for i in 0..page.len() {
+            let mut p = page.clone();
+            p[i] ^= 0x80;
+            assert!(
+                Container::<MemPageStore>::decode_sb(&c.key, 256, &p).is_err(),
+                "byte {i}"
+            );
+        }
     }
 }

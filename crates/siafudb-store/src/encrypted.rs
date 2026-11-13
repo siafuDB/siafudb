@@ -33,7 +33,9 @@ use crate::Result;
 use crate::codec::{Dec, Enc};
 use crate::crypto::{AeadSuite, Cipher, Dek, ct_eq, fill_random, generate_dek};
 use crate::kek::{KekProvider, WrappedDek};
-use crate::store::{LockGuard, LockMode, PAGE_SIZE, PageNo, PageStore, StoreCaps, StoreError, check_len};
+use crate::store::{
+    LockGuard, LockMode, PAGE_SIZE, PageNo, PageStore, StoreCaps, StoreError, check_len,
+};
 
 const HDR_SUITE: usize = 0;
 const HDR_EPOCH: usize = 2;
@@ -125,7 +127,10 @@ impl KeyHeader {
 
     fn encode(&self, phys: usize) -> Result<Vec<u8>> {
         let w = &self.wrapped;
-        if w.kek_id.len() > 255 || w.params.len() > u16::MAX as usize || w.ciphertext.len() > u16::MAX as usize {
+        if w.kek_id.len() > 255
+            || w.params.len() > u16::MAX as usize
+            || w.ciphertext.len() > u16::MAX as usize
+        {
             return Err(StoreError::InvalidArgument("wrapped key too large".into()));
         }
         let mut e = Enc::default();
@@ -144,7 +149,9 @@ impl KeyHeader {
             .raw(&w.ciphertext);
         let mut page = e.0;
         if page.len() + CHECKSUM_LEN > phys {
-            return Err(StoreError::InvalidArgument("key header does not fit in a page".into()));
+            return Err(StoreError::InvalidArgument(
+                "key header does not fit in a page".into(),
+            ));
         }
         page.resize(phys - CHECKSUM_LEN, 0);
         let sum = blake3::hash(&page);
@@ -268,10 +275,15 @@ impl<S: PageStore> EncryptedPageStore<S> {
     /// Initialize with a DEK the host wrapped itself (async WebCrypto flow):
     /// `dek` from [`generate_dek`], `opts.db_id` set, and `wrapped` produced
     /// over [`EncryptedPageStore::wrap_context_for`]`(&opts)`.
-    pub fn create_with_wrapped(inner: S, dek: Dek, wrapped: WrappedDek, opts: EncryptOptions) -> Result<Self> {
-        let db_id = opts
-            .db_id
-            .ok_or_else(|| StoreError::InvalidArgument("create_with_wrapped needs opts.db_id".into()))?;
+    pub fn create_with_wrapped(
+        inner: S,
+        dek: Dek,
+        wrapped: WrappedDek,
+        opts: EncryptOptions,
+    ) -> Result<Self> {
+        let db_id = opts.db_id.ok_or_else(|| {
+            StoreError::InvalidArgument("create_with_wrapped needs opts.db_id".into())
+        })?;
         Self::init(inner, dek, wrapped, opts, db_id)
     }
 
@@ -284,7 +296,13 @@ impl<S: PageStore> EncryptedPageStore<S> {
         Ok(wrap_context(opts.suite.id(), &db_id, 1, opts.page_size))
     }
 
-    fn init(inner: S, dek: Dek, wrapped: WrappedDek, opts: EncryptOptions, db_id: [u8; 16]) -> Result<Self> {
+    fn init(
+        inner: S,
+        dek: Dek,
+        wrapped: WrappedDek,
+        opts: EncryptOptions,
+        db_id: [u8; 16],
+    ) -> Result<Self> {
         if opts.page_size < MIN_PAGE_SIZE || opts.page_size > u32::MAX as usize {
             return Err(StoreError::InvalidArgument(format!(
                 "page size must be at least {MIN_PAGE_SIZE}"
@@ -315,13 +333,16 @@ impl<S: PageStore> EncryptedPageStore<S> {
             inner.write_page(slot, &page)?;
         }
         inner.sync()?;
-        Ok(Self::assemble(inner, header, dek)?)
+        Self::assemble(inner, header, dek)
     }
 
     fn assemble(inner: S, h: KeyHeader, dek: Dek) -> Result<Self> {
         let suite = AeadSuite::from_id(h.suite)?;
         let page_key = Zeroizing::new(blake3::derive_key("siafudb-store v1 page key", &dek[..]));
-        let commit_key = Zeroizing::new(blake3::derive_key("siafudb-store v1 container commitment", &dek[..]));
+        let commit_key = Zeroizing::new(blake3::derive_key(
+            "siafudb-store v1 container commitment",
+            &dek[..],
+        ));
         Ok(Self {
             cipher: Cipher::new(suite, &page_key),
             inner,
@@ -345,7 +366,9 @@ impl<S: PageStore> EncryptedPageStore<S> {
             AeadSuite::from_id(h.suite)?;
             let ctx = h.wrap_context();
             match kek.unwrap(&h.wrapped, &ctx) {
-                Ok(dek) if ct_eq(&kcv_of(&dek, &ctx), &h.kcv) => return Self::assemble(inner, h, dek),
+                Ok(dek) if ct_eq(&kcv_of(&dek, &ctx), &h.kcv) => {
+                    return Self::assemble(inner, h, dek);
+                }
                 Ok(_) => last = StoreError::WrongKey,
                 Err(StoreError::WrongKey) => last = StoreError::WrongKey,
                 Err(e) => last = e,
@@ -404,7 +427,8 @@ impl<S: PageStore> EncryptedPageStore<S> {
     }
 
     fn phys_no(no: PageNo) -> Result<PageNo> {
-        no.checked_add(HEADER_PAGES).ok_or(StoreError::OutOfRange(no))
+        no.checked_add(HEADER_PAGES)
+            .ok_or(StoreError::OutOfRange(no))
     }
 }
 
@@ -419,6 +443,15 @@ impl<S: PageStore> PageStore for EncryptedPageStore<S> {
         Ok(self.inner.page_count()?.saturating_sub(HEADER_PAGES))
     }
     fn read_page(&self, no: PageNo, buf: &mut [u8]) -> Result<()> {
+        self.read_page_versioned(no, buf).map(|_| ())
+    }
+    fn write_page(&self, no: PageNo, buf: &[u8]) -> Result<()> {
+        self.write_page_versioned(no, buf).map(|_| ())
+    }
+    fn observe_version(&self, v: u64) {
+        self.version.fetch_max(v, Ordering::Relaxed);
+    }
+    fn read_page_versioned(&self, no: PageNo, buf: &mut [u8]) -> Result<u64> {
         check_len(self.page_size, buf.len())?;
         let mut phys = vec![0u8; self.page_size + OVERHEAD];
         match self.inner.read_page(Self::phys_no(no)?, &mut phys) {
@@ -444,9 +477,9 @@ impl<S: PageStore> PageStore for EncryptedPageStore<S> {
         buf.copy_from_slice(body);
         zeroize::Zeroize::zeroize(&mut phys);
         self.version.fetch_max(version, Ordering::Relaxed);
-        Ok(())
+        Ok(version)
     }
-    fn write_page(&self, no: PageNo, buf: &[u8]) -> Result<()> {
+    fn write_page_versioned(&self, no: PageNo, buf: &[u8]) -> Result<u64> {
         check_len(self.page_size, buf.len())?;
         let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
         let mut phys = vec![0u8; self.page_size + OVERHEAD];
@@ -461,10 +494,12 @@ impl<S: PageStore> PageStore for EncryptedPageStore<S> {
         body.copy_from_slice(buf);
         let tag = self.cipher.seal(&nonce, &aad, body)?;
         phys[HDR_BODY + self.page_size..].copy_from_slice(&tag);
-        self.inner.write_page(Self::phys_no(no)?, &phys)
+        self.inner.write_page(Self::phys_no(no)?, &phys)?;
+        Ok(version)
     }
     fn truncate(&self, pages: u64) -> Result<()> {
-        self.inner.truncate(pages.checked_add(HEADER_PAGES).ok_or(StoreError::Quota)?)
+        self.inner
+            .truncate(pages.checked_add(HEADER_PAGES).ok_or(StoreError::Quota)?)
     }
     fn sync(&self) -> Result<()> {
         self.inner.sync()

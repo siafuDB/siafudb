@@ -12,9 +12,9 @@
 
 use zeroize::Zeroizing;
 
+use crate::Result;
 use crate::crypto::{Dek, open_blob, seal_blob};
 use crate::store::StoreError;
-use crate::Result;
 
 /// A wrapped DEK as stored in the key header.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,7 +100,11 @@ impl Argon2Params {
         p: 1,
     };
     /// Minimal cost. Tests only.
-    pub const INSECURE_TEST: Self = Self { m_kib: 8, t: 1, p: 1 };
+    pub const INSECURE_TEST: Self = Self {
+        m_kib: 8,
+        t: 1,
+        p: 1,
+    };
     /// Upper bound accepted when reading a header (a tampered header must not
     /// make open allocate unbounded memory).
     pub const MAX_M_KIB: u32 = 4 * 1024 * 1024;
@@ -257,4 +261,3 @@ impl KekProvider for UnwrappedKek {
         Ok(self.dek.clone())
     }
 }
-
