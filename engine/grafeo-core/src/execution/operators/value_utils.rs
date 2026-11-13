@@ -1,0 +1,1194 @@
+//! Shared value comparison and conversion utilities.
+//!
+//! Used by pull-based and push-based aggregate, filter, and sort operators
+//! to avoid duplicating comparison logic across six different files.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+use grafeo_common::types::{TemporalComparison, Value};
+
+use super::sort::{NullOrder, SortDirection};
+
+/// Converts a value to `f64` for numeric aggregations.
+///
+/// Supports RDF values stored as strings by attempting numeric parsing.
+pub fn value_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int64(i) => Some(*i as f64),
+        Value::Float64(f) => Some(*f),
+        Value::Decimal(d) => Some(d.to_f64()),
+        // RDF stores numeric literals as strings - try to parse them
+        Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Compares two values with partial ordering (returns `None` for incomparable types): numbers by
+/// value, a decimal among them (see [`Value::compare_decimal`]).
+pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Decimal(_), _) | (_, Value::Decimal(_)) => a.compare_decimal(b),
+        (Value::Int64(a), Value::Int64(b)) => Some(a.cmp(b)),
+        (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b),
+        (Value::String(a), Value::String(b)) => {
+            // Try numeric comparison first if both look like numbers
+            if let (Ok(a_num), Ok(b_num)) = (a.parse::<f64>(), b.parse::<f64>()) {
+                a_num.partial_cmp(&b_num)
+            } else {
+                Some(a.cmp(b))
+            }
+        }
+        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        (Value::Int64(a), Value::Float64(b)) => partial_cmp_int_float(*a, *b),
+        (Value::Float64(a), Value::Int64(b)) => {
+            partial_cmp_int_float(*b, *a).map(Ordering::reverse)
+        }
+        (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+        (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
+        (Value::Time(a), Value::Time(b)) => Some(a.cmp(b)),
+        // Zoned datetimes, also against a timestamp: by their instant.
+        _ => a.compare_instants(b),
+    }
+}
+
+/// Compares two values for `ORDER BY`: a total order over every value, the
+/// orderability of openCypher.
+///
+/// Values of different types order by type, ascending: maps, lists, paths,
+/// vectors, zoned datetimes, datetimes, dates, zoned times, local times,
+/// durations, bytes, strings, booleans, counters, numbers, then null. A sort
+/// key's own nulls do not get here: they go first or last as its
+/// `NULLS FIRST` / `NULLS LAST` says (see [`compare_sort_values`]); null
+/// inside a list or map is larger than any other value.
+///
+/// Within a type: numbers numerically, integers and floats exactly, decimals
+/// exactly with integers and by a float's shortest text with floats, with NaN
+/// after positive infinity; strings by code point; `false` before `true`;
+/// temporal values in time order; durations by months, then days, then
+/// nanoseconds; lists and paths element by element, a prefix first; maps by
+/// size, then their keys, then their values; vectors and bytes element by
+/// element; counters by their value; RDF terms in SPARQL order (see
+/// [`sparql_order`](grafeo_common::types::sparql_order)).
+#[must_use]
+pub fn compare_values_total(a: &Value, b: &Value) -> Ordering {
+    let by_type = type_rank(a).cmp(&type_rank(b));
+    if by_type.is_ne() {
+        return by_type;
+    }
+    if let Some((a, b)) = sequences(a, b) {
+        return compare_sequences(a, b);
+    }
+    match (a, b) {
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        // A decimal among the numbers; NaN after every decimal.
+        (Value::Decimal(_), Value::Float64(f)) if f.is_nan() => Ordering::Less,
+        (Value::Float64(f), Value::Decimal(_)) if f.is_nan() => Ordering::Greater,
+        (Value::Decimal(_), _) | (_, Value::Decimal(_)) => {
+            a.compare_decimal(b).unwrap_or(Ordering::Equal)
+        }
+        (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+        (Value::Float64(a), Value::Float64(b)) => compare_floats(*a, *b),
+        (Value::Int64(a), Value::Float64(b)) => compare_int_float(*a, *b),
+        (Value::Float64(a), Value::Int64(b)) => compare_int_float(*b, *a).reverse(),
+        (Value::String(a), Value::String(b)) => a.cmp(b),
+        (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Time(a), Value::Time(b)) => a.cmp(b),
+        (Value::ZonedDatetime(a), Value::ZonedDatetime(b)) => a.cmp(b),
+        (Value::Duration(a), Value::Duration(b)) => {
+            (a.months(), a.days(), a.nanos()).cmp(&(b.months(), b.days(), b.nanos()))
+        }
+        (Value::Map(a), Value::Map(b)) => a
+            .len()
+            .cmp(&b.len())
+            .then_with(|| a.keys().cmp(b.keys()))
+            .then_with(|| compare_sequences(a.values(), b.values())),
+        (Value::Vector(a), Value::Vector(b)) => a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| compare_floats(f64::from(*x), f64::from(*y)))
+            .find(|order| order.is_ne())
+            .unwrap_or_else(|| a.len().cmp(&b.len())),
+        (Value::GCounter(_) | Value::OnCounter { .. }, _) => {
+            counter_value(a).cmp(&counter_value(b))
+        }
+        (Value::RdfTerm(a), Value::RdfTerm(b)) => grafeo_common::types::sparql_order(a, b),
+        // Values of the same rank not matched above are equal: nulls, and
+        // values of a type added later.
+        _ => Ordering::Equal,
+    }
+}
+
+/// Whether `a` and `b` are of two kinds, which `=` keeps apart and `<` orders by each
+/// language's rule: numbers are one kind, and a zoned and a local datetime or time are one too,
+/// compared as the statement's temporal mode reads them. A null is of no kind.
+#[must_use]
+pub fn of_two_kinds(a: &Value, b: &Value) -> bool {
+    match (kind_of(a), kind_of(b)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
+/// The kind of `value` that `=` keeps apart from the others (see [`of_two_kinds`]): its type's
+/// place in the order across types, a zoned and a local datetime one kind, and a zoned and a local
+/// time one; `None` for a null.
+fn kind_of(value: &Value) -> Option<u8> {
+    match type_rank(value) {
+        NULL_RANK => None,
+        LOCAL_DATETIME_RANK => Some(ZONED_DATETIME_RANK),
+        LOCAL_TIME_RANK => Some(ZONED_TIME_RANK),
+        rank => Some(rank),
+    }
+}
+
+/// A set of the kinds `=` keeps apart (see [`of_two_kinds`]), small enough to keep in one word: a
+/// structure that answers equalities keeps the kinds it has held, so a statement whose `=` raises
+/// across kinds reads it only when the probe's kind is the only one there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ValueKinds(u32);
+
+impl ValueKinds {
+    /// Numbers: integers, floats and decimals, one kind.
+    pub const NUMBERS: Self = Self(1 << NUMBER_RANK);
+    /// Strings.
+    pub const STRINGS: Self = Self(1 << STRING_RANK);
+
+    /// The kind of `value`; no kind for a null.
+    #[must_use]
+    pub fn of(value: &Value) -> Self {
+        kind_of(value).map_or(Self(0), |kind| Self(1 << kind))
+    }
+
+    /// The kinds of both.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether it holds exactly one kind.
+    #[must_use]
+    pub const fn is_one(self) -> bool {
+        self.0.is_power_of_two()
+    }
+
+    /// Whether it holds no kind but those of `other`.
+    #[must_use]
+    pub const fn within(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+
+    /// Its bits, which [`from_bits`](Self::from_bits) reads back: a set kept in an atomic word.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// The set of [`bits`](Self::bits).
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+}
+
+/// What `=` gives two values of two kinds (see [`of_two_kinds`]): a comparison rule, which each
+/// statement's language picks, as [`AcrossKinds`] is `<`'s.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EqualAcrossKinds {
+    /// False (ISO GQL, openCypher).
+    #[default]
+    False,
+    /// The error values not comparable (22G04): SQL's comparands must be comparable (SQL/PGQ,
+    /// ISO/IEC 9075-2 8.2 Syntax Rule 3). An answer must not depend on the plan, so a structure
+    /// answers such an equality only when it holds no value of another kind than the probe's.
+    Raises,
+}
+
+/// How `<` orders two values of two kinds (see [`of_two_kinds`]): a comparison rule, which each
+/// statement's language picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcrossKinds {
+    /// By the order across kinds that ORDER BY, `min` and `max` use (ISO GQL).
+    Ordered,
+    /// Not at all: the comparison is unknown (openCypher).
+    Apart,
+}
+
+/// The order of two values of two kinds (see [`of_two_kinds`]) by `across`; `None`: unordered,
+/// and for two values of one kind, which their kind's own order compares.
+#[must_use]
+pub fn order_beyond_kind(a: &Value, b: &Value, across: AcrossKinds) -> Option<Ordering> {
+    match across {
+        AcrossKinds::Ordered if of_two_kinds(a, b) => Some(compare_values_total(a, b)),
+        _ => None,
+    }
+}
+
+/// Where a walk of two sequences ends (see [`walk_elements`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walk<R> {
+    /// At a pair of elements that are not the same, with the answer the walk's caller gave it.
+    Decided(R),
+    /// Past the end of one: no pair differed, so the lengths decide, a prefix the lesser.
+    Lengths(Ordering),
+}
+
+/// Walks two sequences element by element to the first pair `decide` answers (`Some`; `None`
+/// passes a pair as the same), or else to the end of the shorter: the one walk by which `<`,
+/// `<=`, `>`, `>=` and ORDER BY compare two lists, and two paths (ISO/IEC 39075 19.3 General Rule
+/// 2 b iv: a path compares as its list of elements), so they cannot disagree.
+pub fn walk_elements<'a, R>(
+    a: impl IntoIterator<Item = &'a Value>,
+    b: impl IntoIterator<Item = &'a Value>,
+    mut decide: impl FnMut(&'a Value, &'a Value) -> Option<R>,
+) -> Walk<R> {
+    let mut b = b.into_iter();
+    for x in a {
+        let Some(y) = b.next() else {
+            return Walk::Lengths(Ordering::Greater);
+        };
+        if let Some(answer) = decide(x, y) {
+            return Walk::Decided(answer);
+        }
+    }
+    Walk::Lengths(if b.next().is_some() {
+        Ordering::Less
+    } else {
+        Ordering::Equal
+    })
+}
+
+/// The elements of two lists, or of two paths (their nodes and edges alternating from the first
+/// node), which [`walk_elements`] walks; `None` for any other pair.
+#[must_use]
+pub fn sequences<'a>(
+    a: &'a Value,
+    b: &'a Value,
+) -> Option<(
+    impl Iterator<Item = &'a Value> + use<'a>,
+    impl Iterator<Item = &'a Value> + use<'a>,
+)> {
+    match (a, b) {
+        (Value::List(a), Value::List(b)) => Some((path_elements(a, &[]), path_elements(b, &[]))),
+        (
+            Value::Path {
+                nodes: a_nodes,
+                edges: a_edges,
+            },
+            Value::Path {
+                nodes: b_nodes,
+                edges: b_edges,
+            },
+        ) => Some((
+            path_elements(a_nodes, a_edges),
+            path_elements(b_nodes, b_edges),
+        )),
+        _ => None,
+    }
+}
+
+/// The places in the order across types that [`kind_of`] names.
+const ZONED_DATETIME_RANK: u8 = 4;
+const LOCAL_DATETIME_RANK: u8 = 5;
+const ZONED_TIME_RANK: u8 = 7;
+const LOCAL_TIME_RANK: u8 = 8;
+const STRING_RANK: u8 = 11;
+const NUMBER_RANK: u8 = 15;
+const NULL_RANK: u8 = 16;
+
+/// The position of a value's type in the order across types.
+fn type_rank(value: &Value) -> u8 {
+    match value {
+        Value::Map(_) => 0,
+        Value::List(_) => 1,
+        Value::Path { .. } => 2,
+        Value::Vector(_) => 3,
+        Value::ZonedDatetime(_) => ZONED_DATETIME_RANK,
+        Value::Timestamp(_) => LOCAL_DATETIME_RANK,
+        Value::Date(_) => 6,
+        Value::Time(time) if time.offset_seconds().is_some() => ZONED_TIME_RANK,
+        Value::Time(_) => LOCAL_TIME_RANK,
+        Value::Duration(_) => 9,
+        Value::Bytes(_) => 10,
+        Value::String(_) => STRING_RANK,
+        Value::Bool(_) => 12,
+        Value::GCounter(_) | Value::OnCounter { .. } => 13,
+        Value::Int64(_) | Value::Float64(_) | Value::Decimal(_) => NUMBER_RANK,
+        Value::Null => NULL_RANK,
+        // RDF terms: SPARQL results order them among themselves; next to other
+        // types they take the place openCypher leaves for types it does not define.
+        Value::RdfTerm(_) => 14,
+        // A type added later goes before the numbers: openCypher keeps types
+        // it does not define out from after them.
+        _ => 14,
+    }
+}
+
+/// Compares two floats numerically, with NaN after every other number and
+/// equal to itself; `-0.0` equals `0.0`. A total order, so floats can be
+/// sorted with it (`partial_cmp` with NaN as equal is not: a sort may panic).
+/// The text of a float in a string: Rust's, except the infinities, which are
+/// `Infinity` and `-Infinity` (the openCypher spelling, as `NaN` is; Rust
+/// writes `inf`).
+#[must_use]
+pub(crate) fn float_text(f: f64) -> String {
+    if f.is_infinite() {
+        if f.is_sign_positive() {
+            "Infinity"
+        } else {
+            "-Infinity"
+        }
+        .to_string()
+    } else {
+        f.to_string()
+    }
+}
+
+pub(crate) fn compare_floats(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        // Without NaN, `partial_cmp` always has an answer.
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// Whether `=` finds an integer equal to a float: exactly, as
+/// `compare_int_float` orders them, so `2^53 + 1` does not equal the float
+/// `2^53`. NaN equals no integer.
+#[must_use]
+pub fn int_equals_float(int: i64, float: f64) -> bool {
+    compare_int_float(int, float).is_eq()
+}
+
+/// The query's `=` of two values, with `temporal` as the statement reads a
+/// zoned against a local datetime or time (ISO/IEC 39075 19.3 General Rule 2):
+/// `Some(true)`, `Some(false)`, or `None` for Unknown. A null operand is
+/// Unknown. Two lists, maps or paths are False when their lengths or field
+/// names differ, else False when a pair of items is, else Unknown when a pair
+/// is, else True: `[null] = [null]` and `[1] = [null]` are Unknown,
+/// `[1, 2] = [null, 3]` is False. Other values compare by [`values_equal`].
+#[must_use]
+pub fn equals(left: &Value, right: &Value, temporal: TemporalComparison) -> Option<bool> {
+    let all = |pairs: &mut dyn Iterator<Item = (&Value, &Value)>| {
+        let mut unknown = false;
+        for (left, right) in pairs {
+            match equals(left, right, temporal) {
+                Some(false) => return Some(false),
+                None => unknown = true,
+                Some(true) => {}
+            }
+        }
+        (!unknown).then_some(true)
+    };
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::List(a), Value::List(b)) => {
+            if a.len() == b.len() {
+                all(&mut a.iter().zip(b.iter()))
+            } else {
+                Some(false)
+            }
+        }
+        (Value::Map(a), Value::Map(b)) => {
+            if a.len() == b.len() && a.keys().zip(b.keys()).all(|(x, y)| x == y) {
+                all(&mut a.values().zip(b.values()))
+            } else {
+                Some(false)
+            }
+        }
+        (
+            Value::Path {
+                nodes: n1,
+                edges: e1,
+            },
+            Value::Path {
+                nodes: n2,
+                edges: e2,
+            },
+        ) => {
+            if n1.len() == n2.len() && e1.len() == e2.len() {
+                all(&mut n1.iter().zip(n2.iter()).chain(e1.iter().zip(e2.iter())))
+            } else {
+                Some(false)
+            }
+        }
+        _ => Some(values_equal(left, right, temporal)),
+    }
+}
+
+/// Whether `value` is a null or holds one at any depth: `=` is never True for
+/// it, so a join, `IN` and an index lookup find nothing for it.
+#[must_use]
+pub fn holds_null(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::List(items) => items.iter().any(holds_null),
+        Value::Map(map) => map.values().any(holds_null),
+        Value::Path { nodes, edges } => nodes.iter().chain(edges.iter()).any(holds_null),
+        _ => false,
+    }
+}
+
+/// Whether `value` is a NaN or holds one at any depth, a vector's item too: `=` finds a NaN
+/// equal to nothing, so an index lookup finds at most the same bits, where the grouping form
+/// (UNIQUE, NODE KEY, `GROUP BY`) takes every NaN, of either sign and any payload, as one.
+#[must_use]
+pub fn holds_nan(value: &Value) -> bool {
+    match value {
+        Value::Float64(float) => float.is_nan(),
+        Value::Vector(items) => items.iter().any(|item| item.is_nan()),
+        Value::List(items) => items.iter().any(holds_nan),
+        Value::Map(map) => map.values().any(holds_nan),
+        Value::Path { nodes, edges } => nodes.iter().chain(edges.iter()).any(holds_nan),
+        _ => false,
+    }
+}
+
+/// Whether two values are equal with nulls not distinct, at the top and
+/// inside a list or map: the leaf of [`equals`], which decides Unknown above
+/// it, with `temporal` as there.
+///
+/// Numbers compare by value (`5 = 5.0`, a decimal too). Two values of
+/// different kinds are never equal (ISO/IEC 39075 19.3, and openCypher): a
+/// string is not the number it spells (`'5' = 5` is false). Two strings, and
+/// the other values, compare as themselves; lists, maps and paths element by
+/// element.
+///
+/// `MaybeEqual`'s probes (`graph/rowgroup/index/property.rs`), the values an
+/// index or a column read may find equal, restate these rules without building
+/// a comparison per value, and must change with them.
+#[must_use]
+pub fn values_equal(left: &Value, right: &Value, temporal: TemporalComparison) -> bool {
+    let equal = |left: &Value, right: &Value| values_equal(left, right, temporal);
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Decimal(_), _) | (_, Value::Decimal(_)) => {
+            left.compare_decimal(right) == Some(Ordering::Equal)
+        }
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Int64(a), Value::Int64(b)) => a == b,
+        // IEEE: NaN equals nothing, -0.0 equals 0.0.
+        (Value::Float64(a), Value::Float64(b)) => a == b,
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Int64(a), Value::Float64(b)) | (Value::Float64(b), Value::Int64(a)) => {
+            int_equals_float(*a, *b)
+        }
+        (Value::List(a), Value::List(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| equal(x, y))
+        }
+        (Value::Map(a), Value::Map(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|((k1, v1), (k2, v2))| k1 == k2 && equal(v1, v2))
+        }
+        (
+            Value::Path {
+                nodes: n1,
+                edges: e1,
+            },
+            Value::Path {
+                nodes: n2,
+                edges: e2,
+            },
+        ) => {
+            n1.len() == n2.len()
+                && e1.len() == e2.len()
+                && n1.iter().zip(n2.iter()).all(|(a, b)| equal(a, b))
+                && e1.iter().zip(e2.iter()).all(|(a, b)| equal(a, b))
+        }
+        // A zoned and a local datetime or time: as the query's language
+        // reads them, as `<` and `>` compare them (see
+        // `TemporalComparison`).
+        _ if TemporalComparison::is_mixed_pair(left, right) => temporal
+            .compare_mixed(left, right)
+            .is_some_and(Ordering::is_eq),
+        // Temporal values, bytes, vectors and the rest: the same variant
+        // with the same value (zoned datetimes compare by instant). This
+        // used to be `false`, so `date('2024-01-01') = date('2024-01-01')`
+        // was false.
+        _ => left == right,
+    }
+}
+
+/// The order of an integer and a float for `<`, `<=`, `>` and `>=`: exact, as
+/// `compare_int_float` orders them (`2^53 + 1` is above the float `2^53`),
+/// and `None` for NaN, which is neither less nor greater.
+#[must_use]
+pub fn partial_cmp_int_float(int: i64, float: f64) -> Option<Ordering> {
+    (!float.is_nan()).then(|| compare_int_float(int, float))
+}
+
+/// Compares an integer with a float exactly. Converting the integer to a
+/// float rounds above 2^53, which would make `2^53 + 1` equal to the float
+/// `2^53` while the integers `2^53` and `2^53 + 1` differ. NaN is after every
+/// integer.
+fn compare_int_float(int: i64, float: f64) -> Ordering {
+    // 2^63, the smallest float above every i64.
+    const BEYOND_I64: f64 = 9_223_372_036_854_775_808.0;
+    if float.is_nan() || float >= BEYOND_I64 {
+        return Ordering::Less;
+    }
+    if float < -BEYOND_I64 {
+        return Ordering::Greater;
+    }
+    let whole = float.trunc();
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "`whole` is an integer in [-2^63, 2^63), checked above, so the cast is exact"
+    )]
+    let whole_int = whole as i64;
+    // On the same whole part, the float's fraction decides.
+    int.cmp(&whole_int)
+        .then_with(|| whole.partial_cmp(&float).unwrap_or(Ordering::Equal))
+}
+
+/// Compares two sequences element by element in the total order; a prefix comes first.
+fn compare_sequences<'a>(
+    a: impl IntoIterator<Item = &'a Value>,
+    b: impl IntoIterator<Item = &'a Value>,
+) -> Ordering {
+    match walk_elements(a, b, |x, y| {
+        let order = compare_values_total(x, y);
+        order.is_ne().then_some(order)
+    }) {
+        Walk::Decided(order) | Walk::Lengths(order) => order,
+    }
+}
+
+/// The nodes and edges of a path, alternating from its first node; a list's items with no edges.
+fn path_elements<'a>(nodes: &'a [Value], edges: &'a [Value]) -> impl Iterator<Item = &'a Value> {
+    nodes
+        .iter()
+        .enumerate()
+        .flat_map(move |(index, node)| std::iter::once(node).chain(edges.get(index)))
+}
+
+/// The value of a counter.
+fn counter_value(value: &Value) -> i128 {
+    let total = |counts: &HashMap<String, u64>| {
+        i128::try_from(
+            counts
+                .values()
+                .map(|&count| u128::from(count))
+                .sum::<u128>(),
+        )
+        .unwrap_or(i128::MAX)
+    };
+    match value {
+        Value::GCounter(counts) => total(counts),
+        Value::OnCounter { pos, neg } => total(pos).saturating_sub(total(neg)),
+        _ => 0,
+    }
+}
+
+/// Orders the values of one sort key: nulls (and missing values) first or
+/// last as `null_order` says, in either direction, and the other values by
+/// [`compare_values_total`] in `direction`.
+///
+/// Used by the sort and top-K operators for `ORDER BY ... [ASC | DESC]
+/// [NULLS FIRST | NULLS LAST]`.
+#[must_use]
+pub fn compare_sort_values(
+    a: Option<&Value>,
+    b: Option<&Value>,
+    direction: SortDirection,
+    null_order: NullOrder,
+) -> Ordering {
+    order_by(
+        a,
+        b,
+        direction == SortDirection::Descending,
+        null_order == NullOrder::NullsFirst,
+    )
+}
+
+/// [`compare_sort_values`] with the direction and the null order as flags, for
+/// the sorts that have sort keys of their own.
+pub(crate) fn order_by(
+    a: Option<&Value>,
+    b: Option<&Value>,
+    descending: bool,
+    nulls_first: bool,
+) -> Ordering {
+    let nulls = if nulls_first {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    };
+    match (
+        a.filter(|value| !value.is_null()),
+        b.filter(|value| !value.is_null()),
+    ) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => nulls,
+        (Some(_), None) => nulls.reverse(),
+        (Some(a), Some(b)) => {
+            let order = compare_values_total(a, b);
+            if descending { order.reverse() } else { order }
+        }
+    }
+}
+
+/// [`compare_sort_values`] with both values read as `temporal` reads them
+/// (see [`order_by_under`]).
+pub(crate) fn compare_sort_values_under(
+    a: Option<&Value>,
+    b: Option<&Value>,
+    direction: SortDirection,
+    null_order: NullOrder,
+    temporal: TemporalComparison,
+) -> Ordering {
+    order_by_under(
+        a,
+        b,
+        direction == SortDirection::Descending,
+        null_order == NullOrder::NullsFirst,
+        temporal,
+    )
+}
+
+/// [`order_by`] with both values read as `temporal` reads them (see
+/// [`TemporalComparison::normalize`]): under the reading of GQL and SQL/PGQ a
+/// local datetime sorts among zoned datetimes by its instant at the session
+/// offset, as `<` orders them. The sorted values themselves do not change.
+pub(crate) fn order_by_under(
+    a: Option<&Value>,
+    b: Option<&Value>,
+    descending: bool,
+    nulls_first: bool,
+    temporal: TemporalComparison,
+) -> Ordering {
+    let a = a.map(|value| temporal.normalize(value));
+    let b = b.map(|value| temporal.normalize(value));
+    order_by(a.as_deref(), b.as_deref(), descending, nulls_first)
+}
+
+/// `value` as `temporal` reads it (see [`TemporalComparison::normalize`]),
+/// without a copy when the reading leaves it as it is.
+pub(crate) fn normalized(value: Value, temporal: TemporalComparison) -> Value {
+    let changed = match temporal.normalize(&value) {
+        std::borrow::Cow::Owned(changed) => Some(changed),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    changed.unwrap_or(value)
+}
+
+/// Returns `true` if `new` is less than `current` in the order of ORDER BY
+/// ([`compare_values_total`]), as MIN compares values of every type.
+///
+/// Returns `true` when `current` is `None` (first value always wins).
+pub fn is_less_than(current: &Option<Value>, new: &Value) -> bool {
+    current
+        .as_ref()
+        .is_none_or(|current| compare_values_total(new, current).is_lt())
+}
+
+/// Returns `true` if `new` is greater than `current` in the order of ORDER
+/// BY ([`compare_values_total`]), as MAX compares values of every type.
+///
+/// Returns `true` when `current` is `None` (first value always wins).
+pub fn is_greater_than(current: &Option<Value>, new: &Value) -> bool {
+    current
+        .as_ref()
+        .is_none_or(|current| compare_values_total(new, current).is_gt())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use grafeo_common::types::{Date, Duration, PropertyKey, Time, Timestamp, ZonedDatetime};
+
+    use super::*;
+
+    #[test]
+    fn value_to_f64_int() {
+        assert_eq!(value_to_f64(&Value::Int64(42)), Some(42.0));
+    }
+
+    #[test]
+    fn value_to_f64_float() {
+        assert_eq!(value_to_f64(&Value::Float64(2.72)), Some(2.72));
+    }
+
+    #[test]
+    fn value_to_f64_numeric_string() {
+        assert_eq!(value_to_f64(&Value::String("2.5".into())), Some(2.5));
+    }
+
+    #[test]
+    fn value_to_f64_non_numeric_string() {
+        assert_eq!(value_to_f64(&Value::String("abc".into())), None);
+    }
+
+    #[test]
+    fn value_to_f64_null() {
+        assert_eq!(value_to_f64(&Value::Null), None);
+    }
+
+    #[test]
+    fn compare_same_type_int() {
+        assert_eq!(
+            compare_values(&Value::Int64(1), &Value::Int64(2)),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn compare_cross_type_int_float() {
+        assert_eq!(
+            compare_values(&Value::Int64(2), &Value::Float64(2.0)),
+            Some(Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn compare_rdf_numeric_strings() {
+        assert_eq!(
+            compare_values(&Value::String("10".into()), &Value::String("9".into())),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn compare_incomparable() {
+        assert_eq!(compare_values(&Value::Bool(true), &Value::Int64(1)), None);
+    }
+
+    #[test]
+    fn is_less_than_none_always_true() {
+        assert!(is_less_than(&None, &Value::Int64(5)));
+    }
+
+    #[test]
+    fn is_less_than_smaller() {
+        assert!(is_less_than(&Some(Value::Int64(10)), &Value::Int64(5)));
+    }
+
+    #[test]
+    fn is_less_than_larger() {
+        assert!(!is_less_than(&Some(Value::Int64(3)), &Value::Int64(5)));
+    }
+
+    #[test]
+    fn is_greater_than_none_always_true() {
+        assert!(is_greater_than(&None, &Value::Int64(5)));
+    }
+
+    #[test]
+    fn is_greater_than_larger() {
+        assert!(is_greater_than(&Some(Value::Int64(3)), &Value::Int64(5)));
+    }
+
+    #[test]
+    fn is_greater_than_smaller() {
+        assert!(!is_greater_than(&Some(Value::Int64(10)), &Value::Int64(5)));
+    }
+
+    fn list(values: Vec<Value>) -> Value {
+        Value::List(values.into())
+    }
+
+    fn map(entries: &[(&str, Value)]) -> Value {
+        let map: BTreeMap<PropertyKey, Value> = entries
+            .iter()
+            .map(|(key, value)| (PropertyKey::new(*key), value.clone()))
+            .collect();
+        Value::Map(Arc::new(map))
+    }
+
+    fn time(hour: u32) -> Time {
+        Time::from_hms(hour, 0, 0).unwrap()
+    }
+
+    /// One value of each type, in ascending order.
+    fn one_of_each_type() -> Vec<Value> {
+        vec![
+            map(&[("k", Value::Int64(1))]),
+            list(vec![Value::Int64(1)]),
+            Value::Path {
+                nodes: vec![Value::Int64(0), Value::Int64(1)].into(),
+                edges: vec![Value::Int64(0)].into(),
+            },
+            Value::Vector(vec![1.0_f32, 2.0].into()),
+            Value::ZonedDatetime(ZonedDatetime::from_timestamp_offset(
+                Timestamp::from_secs(0),
+                3600,
+            )),
+            Value::Timestamp(Timestamp::from_secs(0)),
+            Value::Date(Date::from_ymd(2024, 1, 15).unwrap()),
+            Value::Time(time(12).with_offset(3600)),
+            Value::Time(time(12)),
+            Value::Duration(Duration::new(1, 0, 0)),
+            Value::Bytes(vec![1_u8, 2].into()),
+            Value::String("a".into()),
+            Value::Bool(false),
+            Value::GCounter(Arc::new(HashMap::from([("r".to_string(), 3_u64)]))),
+            Value::Int64(1),
+            Value::Null,
+        ]
+    }
+
+    /// Sorts `values` with `compare_values_total`; also checks that the
+    /// result is in order, pair by pair.
+    fn sorted(mut values: Vec<Value>) -> Vec<Value> {
+        values.sort_by(compare_values_total);
+        for pair in values.windows(2) {
+            assert_ne!(
+                compare_values_total(&pair[0], &pair[1]),
+                Ordering::Greater,
+                "{:?} before {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        values
+    }
+
+    #[test]
+    fn values_of_different_types_follow_the_opencypher_order() {
+        let ascending = one_of_each_type();
+        for rotation in 0..ascending.len() {
+            let mut shuffled = ascending.clone();
+            shuffled.rotate_left(rotation);
+            shuffled.reverse();
+            assert_eq!(sorted(shuffled), ascending, "rotation {rotation}");
+        }
+    }
+
+    #[test]
+    fn integers_and_floats_compare_exactly() {
+        let two_53 = 9_007_199_254_740_992_i64;
+        let cases = [
+            (
+                Value::Int64(two_53),
+                Value::Float64(2f64.powi(53)),
+                Ordering::Equal,
+            ),
+            (
+                Value::Int64(two_53 + 1),
+                Value::Float64(2f64.powi(53)),
+                Ordering::Greater,
+            ),
+            (Value::Int64(2), Value::Float64(2.5), Ordering::Less),
+            (Value::Int64(3), Value::Float64(2.5), Ordering::Greater),
+            (Value::Int64(-2), Value::Float64(-2.5), Ordering::Greater),
+            (Value::Int64(-3), Value::Float64(-2.5), Ordering::Less),
+            (Value::Int64(0), Value::Float64(-0.0), Ordering::Equal),
+            (Value::Float64(-0.0), Value::Float64(0.0), Ordering::Equal),
+            (
+                Value::Int64(i64::MAX),
+                Value::Float64(2f64.powi(63)),
+                Ordering::Less,
+            ),
+            (
+                Value::Int64(i64::MIN),
+                Value::Float64(-(2f64.powi(63))),
+                Ordering::Equal,
+            ),
+            (
+                Value::Int64(i64::MAX),
+                Value::Float64(f64::INFINITY),
+                Ordering::Less,
+            ),
+            (
+                Value::Int64(i64::MIN),
+                Value::Float64(f64::NEG_INFINITY),
+                Ordering::Greater,
+            ),
+        ];
+        for (a, b, expected) in cases {
+            assert_eq!(compare_values_total(&a, &b), expected, "{a:?} vs {b:?}");
+            assert_eq!(
+                compare_values_total(&b, &a),
+                expected.reverse(),
+                "{b:?} vs {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nan_is_the_largest_number_and_equals_itself() {
+        let nan = Value::Float64(f64::NAN);
+        assert_eq!(
+            compare_values_total(&nan, &Value::Float64(f64::INFINITY)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_values_total(&nan, &Value::Int64(i64::MAX)),
+            Ordering::Greater
+        );
+        assert_eq!(compare_values_total(&nan, &nan), Ordering::Equal);
+        assert_eq!(
+            sorted(vec![
+                Value::Int64(1),
+                nan.clone(),
+                Value::Int64(-1),
+                Value::Float64(f64::INFINITY),
+                Value::Float64(f64::NEG_INFINITY),
+            ])
+            .iter()
+            .map(|value| format!("{value:?}"))
+            .collect::<Vec<_>>(),
+            [
+                "Float64(-inf)",
+                "Int64(-1)",
+                "Int64(1)",
+                "Float64(inf)",
+                "Float64(NaN)"
+            ]
+        );
+    }
+
+    /// The openCypher examples: element by element, a missing element
+    /// before any value (null too), null after any value.
+    #[test]
+    fn lists_compare_element_by_element() {
+        let cases = [
+            (
+                vec![Value::Int64(1)],
+                vec![Value::Int64(1), Value::Int64(0)],
+            ),
+            (vec![Value::Int64(1)], vec![Value::Int64(1), Value::Null]),
+            (
+                vec![
+                    Value::Int64(1),
+                    Value::String("foo".into()),
+                    Value::Int64(3),
+                ],
+                vec![
+                    Value::Int64(1),
+                    Value::Int64(2),
+                    Value::String("bar".into()),
+                ],
+            ),
+            (
+                vec![Value::Int64(1), Value::Int64(2)],
+                vec![Value::Null, Value::Int64(1)],
+            ),
+            (
+                vec![Value::Null, Value::Int64(1)],
+                vec![Value::Null, Value::Int64(2)],
+            ),
+            (vec![], vec![Value::Null]),
+        ];
+        for (smaller, larger) in cases {
+            let (smaller, larger) = (list(smaller), list(larger));
+            assert_eq!(
+                compare_values_total(&smaller, &larger),
+                Ordering::Less,
+                "{smaller:?} < {larger:?}"
+            );
+            assert_eq!(compare_values_total(&larger, &smaller), Ordering::Greater);
+        }
+    }
+
+    #[test]
+    fn maps_compare_by_size_then_keys_then_values() {
+        let cases = [
+            (
+                map(&[("z", Value::Int64(9))]),
+                map(&[("a", Value::Int64(1)), ("b", Value::Int64(1))]),
+            ),
+            (
+                map(&[("a", Value::Int64(2))]),
+                map(&[("b", Value::Int64(1))]),
+            ),
+            (
+                map(&[("a", Value::Int64(1))]),
+                map(&[("a", Value::Int64(2))]),
+            ),
+            (map(&[("a", Value::Int64(1))]), map(&[("a", Value::Null)])),
+        ];
+        for (smaller, larger) in cases {
+            assert_eq!(
+                compare_values_total(&smaller, &larger),
+                Ordering::Less,
+                "{smaller:?} < {larger:?}"
+            );
+            assert_eq!(compare_values_total(&larger, &smaller), Ordering::Greater);
+        }
+    }
+
+    #[test]
+    fn paths_compare_node_edge_node() {
+        let path = |ids: &[i64]| Value::Path {
+            nodes: ids.iter().step_by(2).map(|&id| Value::Int64(id)).collect(),
+            edges: ids
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .map(|&id| Value::Int64(id))
+                .collect(),
+        };
+        // The openCypher example: n1 r1 n3 before n1 r2 n2, decided by the edge.
+        assert_eq!(
+            compare_values_total(&path(&[1, 1, 3]), &path(&[1, 2, 2])),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values_total(&path(&[1]), &path(&[1, 1, 3])),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn temporal_values_order_in_time_within_their_type() {
+        assert_eq!(
+            compare_values_total(
+                &Value::Duration(Duration::new(1, 0, 0)),
+                &Value::Duration(Duration::new(0, 40, 0))
+            ),
+            Ordering::Greater,
+            "months before days"
+        );
+        assert_eq!(
+            compare_values_total(
+                &Value::Duration(Duration::new(0, 1, 5)),
+                &Value::Duration(Duration::new(0, 1, 7))
+            ),
+            Ordering::Less
+        );
+        // A zoned time before every local time, whatever the clock says.
+        assert_eq!(
+            compare_values_total(&Value::Time(time(23).with_offset(0)), &Value::Time(time(1))),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values_total(
+                &Value::Time(time(9).with_offset(3600)),
+                &Value::Time(time(9).with_offset(0))
+            ),
+            Ordering::Less,
+            "09:00+01:00 is 08:00 UTC"
+        );
+    }
+
+    /// The order is total on a mix of every type and the edge cases of each:
+    /// antisymmetric, transitive, and `sort_by` gives a sorted result.
+    /// Comparing values of different types as equal broke transitivity, and
+    /// `slice::sort_by` may panic on such a comparator.
+    #[test]
+    fn the_order_is_total_on_mixed_values() {
+        let mut pool = one_of_each_type();
+        pool.extend([
+            Value::Int64(-3),
+            Value::Int64(9_007_199_254_740_993),
+            Value::Float64(9_007_199_254_740_992.0),
+            Value::Float64(2.5),
+            Value::Float64(-0.0),
+            Value::Float64(f64::NAN),
+            Value::Float64(f64::INFINITY),
+            Value::String(String::new().into()),
+            Value::String("b".into()),
+            Value::Bool(true),
+            list(vec![]),
+            list(vec![Value::Null]),
+            list(vec![Value::Int64(1), Value::Null]),
+            list(vec![Value::String("x".into())]),
+            map(&[]),
+            map(&[("a", Value::Null)]),
+            Value::Vector(vec![f32::NAN].into()),
+            Value::Bytes(vec![].into()),
+            Value::OnCounter {
+                pos: Arc::new(HashMap::from([("r".to_string(), 1_u64)])),
+                neg: Arc::new(HashMap::from([("r".to_string(), 5_u64)])),
+            },
+        ]);
+        for a in &pool {
+            for b in &pool {
+                let order = compare_values_total(a, b);
+                assert_eq!(
+                    compare_values_total(b, a),
+                    order.reverse(),
+                    "{a:?} vs {b:?}"
+                );
+                for c in &pool {
+                    if order.is_le() && compare_values_total(b, c).is_le() {
+                        assert!(
+                            compare_values_total(a, c).is_le(),
+                            "{a:?} <= {b:?} <= {c:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // A long mix in a scrambled order sorts without panicking.
+        let mut long: Vec<Value> = (0..2000_u64)
+            .map(|i| pool[usize::try_from(i * 7919 % 41).unwrap() % pool.len()].clone())
+            .collect();
+        long.rotate_left(17);
+        sorted(long);
+    }
+
+    #[test]
+    fn sort_values_put_nulls_where_the_key_says_in_both_directions() {
+        let (one, two) = (Value::Int64(1), Value::Int64(2));
+        let null = Value::Null;
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            assert_eq!(
+                compare_sort_values(Some(&null), Some(&one), direction, NullOrder::NullsFirst),
+                Ordering::Less,
+                "{direction:?} NULLS FIRST"
+            );
+            assert_eq!(
+                compare_sort_values(Some(&null), Some(&one), direction, NullOrder::NullsLast),
+                Ordering::Greater,
+                "{direction:?} NULLS LAST"
+            );
+            assert_eq!(
+                compare_sort_values(None, Some(&null), direction, NullOrder::NullsLast),
+                Ordering::Equal,
+                "a missing value is null"
+            );
+        }
+        assert_eq!(
+            compare_sort_values(
+                Some(&one),
+                Some(&two),
+                SortDirection::Descending,
+                NullOrder::NullsLast
+            ),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_sort_values(
+                Some(&one),
+                Some(&two),
+                SortDirection::Ascending,
+                NullOrder::NullsLast
+            ),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn rdf_terms_sort_in_sparql_order() {
+        use grafeo_common::types::rdf::{Literal, Term};
+        let rdf = |term: Term| Value::RdfTerm(Arc::new(term));
+        let mut values = vec![
+            rdf(Term::typed_literal("10", Literal::XSD_INTEGER)),
+            rdf(Term::literal("Apple")),
+            rdf(Term::iri("http://example.org/a")),
+            rdf(Term::typed_literal("9", Literal::XSD_INTEGER)),
+            rdf(Term::blank("b0")),
+        ];
+        values.sort_by(compare_values_total);
+        assert_eq!(
+            values,
+            vec![
+                rdf(Term::blank("b0")),
+                rdf(Term::iri("http://example.org/a")),
+                rdf(Term::typed_literal("9", Literal::XSD_INTEGER)),
+                rdf(Term::typed_literal("10", Literal::XSD_INTEGER)),
+                rdf(Term::literal("Apple")),
+            ]
+        );
+    }
+}

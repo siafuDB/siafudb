@@ -1,0 +1,16 @@
+[package]
+name="siafudb-ffi-probe"
+version="0.0.0"
+edition="2024"
+[lib]
+crate-type=["cdylib","staticlib","lib"]
+name="siafudb_ffi"
+[[bin]]
+name="uniffi-bindgen"
+path="src/bin.rs"
+[dependencies]
+siafudb-core = { path = "../../../../crates/siafudb-core" }
+uniffi = { version = "0.29", features = ["cli"] }
+thiserror = "2"
+
+[workspace]

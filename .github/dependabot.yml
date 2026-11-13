@@ -5,14 +5,26 @@
 #   - One PR per ecosystem with all available updates bundled.
 #   - `build:` Conventional Commits prefix so pr-title-lint accepts it.
 #
-# siafudb is a Rust workspace, so cargo + github-actions cover everything
-# it ships. The docs site (nyuchi/docs) lives in its own repo and is not
-# covered here.
+# Ecosystems: cargo, github-actions and npm (packages/ and apps/).
+#
+# Engine fork (ADR-0001): engine/ holds GrafeoDB 0.6.2 vendored and frozen.
+# Dependabot must never propose changes to the grafeo-* crates:
+#   - [patch.crates-io] in the root Cargo.toml already pins every grafeo-*
+#     reference to the vendored path, so there is no registry version to bump;
+#   - the cargo `ignore` entries below stop any PR that names them anyway;
+#   - engine/ is not a cargo update directory (only "/" is scanned), so its
+#     manifests are never rewritten.
+# Upstream fixes are adopted only as reviewed cherry-picks (engine/UPSTREAM.md).
+#
+# The docs site lives in Mintlify (siafudb-docs) and is not covered here.
 
 version: 2
 updates:
   - package-ecosystem: "github-actions"
+    target-branch: "staging"
     directory: "/"
+    cooldown:
+      default-days: 7
     schedule:
       interval: "weekly"
       day: "monday"
@@ -31,7 +43,10 @@ updates:
         update-types: ["major", "minor", "patch"]
 
   - package-ecosystem: "cargo"
+    target-branch: "staging"
     directory: "/"
+    cooldown:
+      default-days: 7
     schedule:
       interval: "weekly"
       day: "monday"
@@ -41,6 +56,33 @@ updates:
     reviewers:
       - "bryanfawcett"
     labels: ["dependencies", "rust"]
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    ignore:
+      - dependency-name: "grafeo"
+      - dependency-name: "grafeo-*"
+    groups:
+      all:
+        patterns: ["*"]
+        update-types: ["major", "minor", "patch"]
+
+  # JavaScript/TypeScript workspaces (packages/*, apps/*). Node >= 24 only.
+  # The root package.json owns the workspace lockfile, so "/" covers both.
+  - package-ecosystem: "npm"
+    target-branch: "staging"
+    directory: "/"
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Africa/Harare"
+    open-pull-requests-limit: 1
+    reviewers:
+      - "bryanfawcett"
+    labels: ["dependencies", "javascript"]
     commit-message:
       prefix: "build"
       include: "scope"

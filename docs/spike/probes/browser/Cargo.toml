@@ -1,0 +1,18 @@
+[package]
+name = "browserprobe"
+version = "0.0.0"
+edition = "2024"
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+wasm-bindgen = "=0.2.130"
+siafudb-core = { path = "../../../../crates/siafudb-core", default-features = false, features = ["browser"] }
+serde_json = "1"
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+[workspace]

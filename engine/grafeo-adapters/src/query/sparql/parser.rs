@@ -1,0 +1,3258 @@
+//! SPARQL Parser.
+//!
+//! Implements a recursive descent parser for SPARQL 1.1 Query Language.
+
+#[allow(clippy::wildcard_imports)]
+use super::ast::*;
+use super::lexer::{Lexer, Token, TokenKind};
+use crate::query::limits::{Chain, Nesting, nesting_error_message};
+use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
+
+/// SPARQL Parser.
+pub struct Parser<'a> {
+    lexer: Lexer<'a>,
+    current: Token,
+    /// Source string for error reporting.
+    source: &'a str,
+    /// Counter for generating unique blank node labels (used by RDF collections).
+    collection_counter: u32,
+    /// Counter for generating unique anonymous blank node labels.
+    anon_blank_counter: u32,
+    /// How deep the query parsed so far nests (see
+    /// [`MAX_NESTING_DEPTH`](crate::query::limits::MAX_NESTING_DEPTH)).
+    nesting: Nesting,
+    /// The prefixes in scope: the predefined ones ([`PREDEFINED_PREFIXES`])
+    /// and those the query declared so far.
+    prefixes: std::collections::HashSet<String>,
+    /// Whether the parser is reading a `PREFIX` declaration, whose name is
+    /// not a use of the prefix.
+    declaring_prefix: bool,
+    /// The first prefixed name whose prefix is not in scope, with its token:
+    /// the query is refused with it once parsed.
+    undeclared: Option<Token>,
+}
+
+/// The error for a quoted triple (`<< s p o >>`, RDF-star), wherever a
+/// term or a pattern may stand: it is SPARQL 1.2.
+const QUOTED_TRIPLES_UNSUPPORTED: &str =
+    "quoted triples (<< ... >>) are SPARQL 1.2, which this version does not support";
+
+/// The prefixes a query can use without declaring them, as Jena and GraphDB
+/// predefine them; a query's own `PREFIX` redefines one.
+pub const PREDEFINED_PREFIXES: [(&str, &str); 5] = [
+    ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+    ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
+    ("xsd", "http://www.w3.org/2001/XMLSchema#"),
+    ("owl", "http://www.w3.org/2002/07/owl#"),
+    ("fn", "http://www.w3.org/2005/xpath-functions#"),
+];
+
+impl<'a> Parser<'a> {
+    /// Creates a new parser for the given query string.
+    pub fn new(source: &'a str) -> Self {
+        let mut lexer = Lexer::new(source);
+        let current = lexer.next_token();
+        Self {
+            lexer,
+            current,
+            source,
+            collection_counter: 0,
+            anon_blank_counter: 0,
+            nesting: Nesting::default(),
+            prefixes: PREDEFINED_PREFIXES
+                .iter()
+                .map(|(prefix, _)| (*prefix).to_string())
+                .collect(),
+            declaring_prefix: false,
+            undeclared: None,
+        }
+    }
+
+    /// Generates a unique blank node label for anonymous blank nodes (`[]`).
+    fn next_anon_blank(&mut self) -> String {
+        let id = self.anon_blank_counter;
+        self.anon_blank_counter += 1;
+        format!("_anon{id}")
+    }
+
+    /// Generates a unique blank node label for RDF collection desugaring.
+    fn next_collection_blank(&mut self) -> String {
+        let id = self.collection_counter;
+        self.collection_counter += 1;
+        format!("_coll{id}")
+    }
+
+    /// Parses the entire query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input contains invalid or unexpected SPARQL syntax.
+    pub fn parse(&mut self) -> Result<Query> {
+        let base = self.parse_base()?;
+        let prefixes = self.parse_prefixes()?;
+        let query_form = self.parse_query_form()?;
+
+        if self.current.kind != TokenKind::Eof {
+            return Err(self.error(&format!(
+                "unexpected token '{}' after query",
+                self.current.text
+            )));
+        }
+        // A prefix must be declared (SPARQL 1.1, 4.1.1), or be one of the
+        // predefined ones.
+        if let Some(token) = self.undeclared.take() {
+            let prefix = token.text.split(':').next().unwrap_or_default().to_string();
+            self.current = token;
+            return Err(self.error(&format!(
+                "the prefix '{prefix}:' is not declared (add PREFIX {prefix}: <...>)"
+            )));
+        }
+
+        Ok(Query {
+            base,
+            prefixes,
+            query_form,
+        })
+    }
+
+    // ==================== Prologue ====================
+
+    fn parse_base(&mut self) -> Result<Option<Iri>> {
+        if self.current.kind == TokenKind::Base {
+            self.advance();
+            let iri = self.expect_iri()?;
+            Ok(Some(iri))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parse_prefixes(&mut self) -> Result<Vec<PrefixDeclaration>> {
+        let mut prefixes = Vec::new();
+        while self.current.kind == TokenKind::Prefix {
+            self.declaring_prefix = true;
+            self.advance();
+            self.declaring_prefix = false;
+
+            // Parse prefix name (can be empty for default prefix)
+            let prefix = if self.current.kind == TokenKind::PrefixedName {
+                let text = self.current.text.clone();
+                self.advance();
+                // Remove trailing colon if present
+                let prefix = text.trim_end_matches(':').to_string();
+                self.prefixes.insert(prefix.clone());
+                prefix
+            } else if self.current.kind == TokenKind::Colon {
+                self.advance();
+                self.prefixes.insert(String::new());
+                String::new() // Default prefix
+            } else {
+                return Err(self.error("expected prefix name or ':'"));
+            };
+
+            let namespace = self.expect_iri()?;
+            prefixes.push(PrefixDeclaration { prefix, namespace });
+        }
+        Ok(prefixes)
+    }
+
+    // ==================== Query Forms ====================
+
+    fn parse_query_form(&mut self) -> Result<QueryForm> {
+        match self.current.kind {
+            TokenKind::Select => Ok(QueryForm::Select(self.parse_select_query()?)),
+            TokenKind::Construct => Ok(QueryForm::Construct(self.parse_construct_query()?)),
+            TokenKind::Ask => Ok(QueryForm::Ask(self.parse_ask_query()?)),
+            TokenKind::Describe => Ok(QueryForm::Describe(self.parse_describe_query()?)),
+            TokenKind::Insert
+            | TokenKind::Delete
+            | TokenKind::Load
+            | TokenKind::Clear
+            | TokenKind::Drop
+            | TokenKind::Create
+            | TokenKind::Copy
+            | TokenKind::Move
+            | TokenKind::Add
+            | TokenKind::With => Ok(QueryForm::Update(self.parse_update_operation()?)),
+            _ => Err(self.error("expected SELECT, CONSTRUCT, ASK, DESCRIBE, or update operation")),
+        }
+    }
+
+    fn parse_select_query(&mut self) -> Result<SelectQuery> {
+        self.expect(TokenKind::Select)?;
+
+        let modifier = self.parse_select_modifier();
+        let projection = self.parse_projection()?;
+        let dataset = self.parse_dataset_clause()?;
+        let where_clause = self.parse_where_clause()?;
+        let solution_modifiers = self.parse_solution_modifiers()?;
+
+        // The target of `(expr AS ?v)` must not be in scope already (SPARQL 1.1
+        // sec 18.2.1): `SELECT (STR(?o) AS ?o) WHERE { ?s ?p ?o }` is an error,
+        // not a silent overwrite of the bound ?o.
+        if let Projection::Variables(variables) = &projection {
+            let mut in_scope = std::collections::HashSet::new();
+            collect_in_scope_variables(&where_clause, &mut in_scope);
+            if let Some(name) = variables
+                .iter()
+                .filter_map(|var| var.alias.as_deref())
+                .find(|alias| in_scope.contains(*alias))
+            {
+                return Err(self.error(&format!(
+                    "the target of AS must be a fresh variable, but '?{name}' is already bound \
+                     in the WHERE clause (SPARQL 1.1 sec 18.2.1)"
+                )));
+            }
+        }
+
+        Ok(SelectQuery {
+            modifier,
+            projection,
+            dataset,
+            where_clause,
+            solution_modifiers,
+        })
+    }
+
+    fn parse_construct_query(&mut self) -> Result<ConstructQuery> {
+        self.expect(TokenKind::Construct)?;
+
+        let template = self.parse_construct_template()?;
+        let dataset = self.parse_dataset_clause()?;
+        let where_clause = self.parse_where_clause()?;
+        let mut solution_modifiers = self.parse_solution_modifiers()?;
+        let where_clause = Self::with_values(where_clause, solution_modifiers.values.take());
+
+        Ok(ConstructQuery {
+            template,
+            dataset,
+            where_clause,
+            solution_modifiers,
+        })
+    }
+
+    fn parse_ask_query(&mut self) -> Result<AskQuery> {
+        self.expect(TokenKind::Ask)?;
+
+        let dataset = self.parse_dataset_clause()?;
+        let where_clause = self.parse_where_clause()?;
+        let values = self.parse_trailing_values()?;
+        let where_clause = Self::with_values(where_clause, values);
+
+        Ok(AskQuery {
+            dataset,
+            where_clause,
+        })
+    }
+
+    fn parse_describe_query(&mut self) -> Result<DescribeQuery> {
+        self.expect(TokenKind::Describe)?;
+
+        let resources = self.parse_describe_resources()?;
+        let dataset = self.parse_dataset_clause()?;
+
+        let where_clause =
+            if self.current.kind == TokenKind::Where || self.current.kind == TokenKind::LeftBrace {
+                Some(self.parse_where_clause()?)
+            } else {
+                None
+            };
+        let where_clause = match (where_clause, self.parse_trailing_values()?) {
+            (Some(pattern), values) => Some(Self::with_values(pattern, values)),
+            (None, values) => values.map(GraphPattern::InlineData),
+        };
+
+        Ok(DescribeQuery {
+            resources,
+            dataset,
+            where_clause,
+        })
+    }
+
+    fn parse_describe_resources(&mut self) -> Result<Vec<VariableOrIri>> {
+        let mut resources = Vec::new();
+
+        if self.current.kind == TokenKind::Star {
+            // DESCRIBE * - will be handled specially
+            self.advance();
+            return Ok(resources);
+        }
+
+        while matches!(
+            self.current.kind,
+            TokenKind::Variable | TokenKind::Iri | TokenKind::PrefixedName
+        ) {
+            resources.push(self.parse_variable_or_iri()?);
+        }
+
+        if resources.is_empty() {
+            return Err(self.error("expected variable or IRI to describe"));
+        }
+
+        Ok(resources)
+    }
+
+    // ==================== Update Operations ====================
+
+    fn parse_update_operation(&mut self) -> Result<UpdateOperation> {
+        match self.current.kind {
+            TokenKind::Insert => self.parse_insert_operation(),
+            TokenKind::Delete => self.parse_delete_operation(),
+            TokenKind::Load => self.parse_load(),
+            TokenKind::Clear => self.parse_clear(),
+            TokenKind::Drop => self.parse_drop(),
+            TokenKind::Create => self.parse_create(),
+            TokenKind::Copy => self.parse_copy(),
+            TokenKind::Move => self.parse_move(),
+            TokenKind::Add => self.parse_add(),
+            TokenKind::With => self.parse_modify_with_graph(),
+            _ => Err(self.error("expected update operation")),
+        }
+    }
+
+    fn parse_insert_operation(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::Insert)?;
+
+        if self.current.kind == TokenKind::Data {
+            // INSERT DATA { ... }
+            self.advance();
+            let data = self.parse_quad_data()?;
+            Ok(UpdateOperation::InsertData { data })
+        } else {
+            // INSERT { ... } WHERE { ... } (part of Modify)
+            let insert_template = self.parse_quad_pattern()?;
+            let using_clauses = self.parse_using_clauses()?;
+            let where_clause = self.parse_where_clause()?;
+            Ok(UpdateOperation::Modify {
+                with_graph: None,
+                delete_template: None,
+                insert_template: Some(insert_template),
+                using_clauses,
+                where_clause,
+            })
+        }
+    }
+
+    fn parse_delete_operation(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::Delete)?;
+
+        if self.current.kind == TokenKind::Data {
+            // DELETE DATA { ... }
+            self.advance();
+            let data = self.parse_quad_data()?;
+            Ok(UpdateOperation::DeleteData { data })
+        } else if self.current.kind == TokenKind::Where {
+            // DELETE WHERE { ... }
+            self.advance();
+            let pattern = self.parse_group_graph_pattern()?;
+            Ok(UpdateOperation::DeleteWhere { pattern })
+        } else {
+            // DELETE { ... } INSERT { ... } WHERE { ... } or DELETE { ... } WHERE { ... }
+            let delete_template = self.parse_quad_pattern()?;
+
+            let insert_template = if self.current.kind == TokenKind::Insert {
+                self.advance();
+                Some(self.parse_quad_pattern()?)
+            } else {
+                None
+            };
+
+            let using_clauses = self.parse_using_clauses()?;
+            let where_clause = self.parse_where_clause()?;
+            Ok(UpdateOperation::Modify {
+                with_graph: None,
+                delete_template: Some(delete_template),
+                insert_template,
+                using_clauses,
+                where_clause,
+            })
+        }
+    }
+
+    fn parse_modify_with_graph(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::With)?;
+        let graph = self.expect_iri()?;
+
+        // Now expect DELETE and/or INSERT
+        let delete_template = if self.current.kind == TokenKind::Delete {
+            self.advance();
+            Some(self.parse_quad_pattern()?)
+        } else {
+            None
+        };
+
+        let insert_template = if self.current.kind == TokenKind::Insert {
+            self.advance();
+            Some(self.parse_quad_pattern()?)
+        } else {
+            None
+        };
+
+        if delete_template.is_none() && insert_template.is_none() {
+            return Err(self.error("expected DELETE or INSERT after WITH"));
+        }
+
+        let using_clauses = self.parse_using_clauses()?;
+        let where_clause = self.parse_where_clause()?;
+
+        Ok(UpdateOperation::Modify {
+            with_graph: Some(graph),
+            delete_template,
+            insert_template,
+            using_clauses,
+            where_clause,
+        })
+    }
+
+    /// The quads of `INSERT DATA` or `DELETE DATA`, which hold no variables
+    /// (SPARQL 1.1 Update, QuadData): a variable is a syntax error naming it.
+    fn parse_quad_data(&mut self) -> Result<Vec<QuadPattern>> {
+        self.expect(TokenKind::LeftBrace)?;
+        let quads = self.parse_quads()?;
+        let variable = quads.iter().find_map(|quad| {
+            let term = |term: &TripleTerm| match term {
+                TripleTerm::Variable(name) => Some(name.clone()),
+                _ => None,
+            };
+            let graph = match &quad.graph {
+                Some(VariableOrIri::Variable(name)) => Some(name.clone()),
+                _ => None,
+            };
+            let predicate = match &quad.triple.predicate {
+                PropertyPath::Variable(name) => Some(name.clone()),
+                _ => None,
+            };
+            graph
+                .or_else(|| term(&quad.triple.subject))
+                .or(predicate)
+                .or_else(|| term(&quad.triple.object))
+        });
+        if let Some(name) = variable {
+            return Err(self.error(&format!(
+                "INSERT DATA and DELETE DATA hold no variables, but '?{name}' is one: use INSERT                  or DELETE with a WHERE clause"
+            )));
+        }
+        self.expect(TokenKind::RightBrace)?;
+        Ok(quads)
+    }
+
+    fn parse_quad_pattern(&mut self) -> Result<Vec<QuadPattern>> {
+        self.expect(TokenKind::LeftBrace)?;
+        let quads = self.parse_quads()?;
+        self.expect(TokenKind::RightBrace)?;
+        Ok(quads)
+    }
+
+    fn parse_quads(&mut self) -> Result<Vec<QuadPattern>> {
+        let mut quads = Vec::new();
+
+        while self.current.kind != TokenKind::RightBrace {
+            if self.current.kind == TokenKind::Eof {
+                return Err(self.error("unexpected end of input in quad block"));
+            }
+
+            if self.current.kind == TokenKind::Graph {
+                // GRAPH <iri> { triples }
+                self.advance();
+                let graph = self.parse_variable_or_iri()?;
+
+                self.expect(TokenKind::LeftBrace)?;
+                while self.current.kind != TokenKind::RightBrace {
+                    let mut triples = Vec::new();
+                    self.parse_triples_same_subject(&mut triples)?;
+                    for triple in triples {
+                        quads.push(QuadPattern {
+                            graph: Some(graph.clone()),
+                            triple,
+                        });
+                    }
+                    if self.current.kind == TokenKind::Dot {
+                        self.advance();
+                    }
+                }
+                self.expect(TokenKind::RightBrace)?;
+            } else if self.is_triple_start() {
+                // Default graph triples
+                let mut triples = Vec::new();
+                self.parse_triples_same_subject(&mut triples)?;
+                for triple in triples {
+                    quads.push(QuadPattern {
+                        graph: None,
+                        triple,
+                    });
+                }
+                if self.current.kind == TokenKind::Dot {
+                    self.advance();
+                }
+            } else if self.current.kind == TokenKind::LessThan {
+                return Err(self.error(QUOTED_TRIPLES_UNSUPPORTED));
+            } else {
+                break;
+            }
+        }
+
+        Ok(quads)
+    }
+
+    fn parse_using_clauses(&mut self) -> Result<Vec<UsingClause>> {
+        let mut clauses = Vec::new();
+
+        while self.current.kind == TokenKind::Using {
+            self.advance();
+            if self.current.kind == TokenKind::Named {
+                self.advance();
+                clauses.push(UsingClause::Named(self.expect_iri()?));
+            } else {
+                clauses.push(UsingClause::Default(self.expect_iri()?));
+            }
+        }
+
+        Ok(clauses)
+    }
+
+    fn parse_load(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::Load)?;
+        let silent = self.parse_silent()?;
+        let source = self.expect_iri()?;
+
+        let destination = if self.current.kind == TokenKind::Into {
+            self.advance();
+            self.expect(TokenKind::Graph)?;
+            Some(self.expect_iri()?)
+        } else {
+            None
+        };
+
+        Ok(UpdateOperation::Load {
+            silent,
+            source,
+            destination,
+        })
+    }
+
+    fn parse_clear(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::Clear)?;
+        let silent = self.parse_silent()?;
+        let target = self.parse_graph_ref_all()?;
+        Ok(UpdateOperation::Clear { silent, target })
+    }
+
+    fn parse_drop(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::Drop)?;
+        let silent = self.parse_silent()?;
+        let target = self.parse_graph_ref_all()?;
+        Ok(UpdateOperation::Drop { silent, target })
+    }
+
+    fn parse_create(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::Create)?;
+        let silent = self.parse_silent()?;
+        self.expect(TokenKind::Graph)?;
+        let graph = self.expect_iri()?;
+        Ok(UpdateOperation::Create { silent, graph })
+    }
+
+    fn parse_copy(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::Copy)?;
+        let silent = self.parse_silent()?;
+        let source = self.parse_graph_or_default()?;
+        self.expect(TokenKind::To)?;
+        let destination = self.parse_graph_or_default()?;
+        Ok(UpdateOperation::Copy {
+            silent,
+            source,
+            destination,
+        })
+    }
+
+    fn parse_move(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::Move)?;
+        let silent = self.parse_silent()?;
+        let source = self.parse_graph_or_default()?;
+        self.expect(TokenKind::To)?;
+        let destination = self.parse_graph_or_default()?;
+        Ok(UpdateOperation::Move {
+            silent,
+            source,
+            destination,
+        })
+    }
+
+    fn parse_add(&mut self) -> Result<UpdateOperation> {
+        self.expect(TokenKind::Add)?;
+        let silent = self.parse_silent()?;
+        let source = self.parse_graph_or_default()?;
+        self.expect(TokenKind::To)?;
+        let destination = self.parse_graph_or_default()?;
+        Ok(UpdateOperation::Add {
+            silent,
+            source,
+            destination,
+        })
+    }
+
+    fn parse_silent(&mut self) -> Result<bool> {
+        if self.current.kind == TokenKind::Silent {
+            self.advance();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn parse_graph_ref_all(&mut self) -> Result<GraphTarget> {
+        match self.current.kind {
+            TokenKind::Graph => {
+                self.advance();
+                let iri = self.expect_iri()?;
+                Ok(GraphTarget::Named(iri))
+            }
+            TokenKind::Default => {
+                self.advance();
+                Ok(GraphTarget::Default)
+            }
+            TokenKind::Named => {
+                self.advance();
+                Ok(GraphTarget::AllNamed)
+            }
+            TokenKind::All => {
+                self.advance();
+                Ok(GraphTarget::All)
+            }
+            _ => Err(self.error("expected GRAPH, DEFAULT, NAMED, or ALL")),
+        }
+    }
+
+    fn parse_graph_or_default(&mut self) -> Result<GraphTarget> {
+        if self.current.kind == TokenKind::Default {
+            self.advance();
+            Ok(GraphTarget::Default)
+        } else if self.current.kind == TokenKind::Graph {
+            self.advance();
+            let iri = self.expect_iri()?;
+            Ok(GraphTarget::Named(iri))
+        } else {
+            // Just an IRI without GRAPH keyword
+            let iri = self.expect_iri()?;
+            Ok(GraphTarget::Named(iri))
+        }
+    }
+
+    // ==================== Select Clause ====================
+
+    fn parse_select_modifier(&mut self) -> SelectModifier {
+        match self.current.kind {
+            TokenKind::Distinct => {
+                self.advance();
+                SelectModifier::Distinct
+            }
+            TokenKind::Reduced => {
+                self.advance();
+                SelectModifier::Reduced
+            }
+            _ => SelectModifier::None,
+        }
+    }
+
+    fn parse_projection(&mut self) -> Result<Projection> {
+        if self.current.kind == TokenKind::Star {
+            self.advance();
+            return Ok(Projection::Wildcard);
+        }
+
+        let mut variables = Vec::new();
+        while self.current.kind == TokenKind::Variable || self.current.kind == TokenKind::LeftParen
+        {
+            variables.push(self.parse_projection_variable()?);
+        }
+
+        if variables.is_empty() {
+            return Err(self.error("expected '*' or variable list in SELECT"));
+        }
+
+        // The target of `(expr AS ?v)` must be a new variable (SPARQL 1.1
+        // sec 18.2.4.4): reject an alias that repeats another projected name.
+        // `SELECT ?s ?s` is left to the engine's duplicate-column check.
+        {
+            let mut seen: Vec<(&str, bool)> = Vec::with_capacity(variables.len());
+            for var in &variables {
+                let (name, is_alias): (&str, bool) = match (&var.alias, &var.expression) {
+                    (Some(alias), _) => (alias.as_str(), true),
+                    (None, Expression::Variable(name)) => (name.as_str(), false),
+                    (None, _) => continue,
+                };
+                let collides = seen.iter().any(|&(prev_name, prev_is_alias)| {
+                    prev_name == name && (prev_is_alias || is_alias)
+                });
+                if collides {
+                    return Err(self.error(&format!(
+                        "duplicate projection variable '?{name}' in SELECT: the target of AS \
+                         must be a fresh variable (SPARQL 1.1 sec 18.2.4.4)"
+                    )));
+                }
+                seen.push((name, is_alias));
+            }
+        }
+
+        Ok(Projection::Variables(variables))
+    }
+
+    fn parse_projection_variable(&mut self) -> Result<ProjectionVariable> {
+        if self.current.kind == TokenKind::LeftParen {
+            // Expression with alias: (expr AS ?var)
+            self.advance();
+            let expression = self.parse_expression()?;
+            self.expect(TokenKind::As)?;
+            let alias = self.expect_variable_name()?;
+            self.expect(TokenKind::RightParen)?;
+
+            Ok(ProjectionVariable {
+                expression,
+                alias: Some(alias),
+            })
+        } else {
+            // Simple variable
+            let var_name = self.expect_variable_name()?;
+            Ok(ProjectionVariable {
+                expression: Expression::Variable(var_name),
+                alias: None,
+            })
+        }
+    }
+
+    // ==================== Dataset Clause ====================
+
+    fn parse_dataset_clause(&mut self) -> Result<Option<DatasetClause>> {
+        let mut default_graphs = Vec::new();
+        let mut named_graphs = Vec::new();
+
+        while self.current.kind == TokenKind::From {
+            self.advance();
+
+            if self.current.kind == TokenKind::Named {
+                self.advance();
+                named_graphs.push(self.expect_iri()?);
+            } else {
+                default_graphs.push(self.expect_iri()?);
+            }
+        }
+
+        if default_graphs.is_empty() && named_graphs.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(DatasetClause {
+                default_graphs,
+                named_graphs,
+            }))
+        }
+    }
+
+    // ==================== WHERE Clause ====================
+
+    fn parse_where_clause(&mut self) -> Result<GraphPattern> {
+        // WHERE is optional
+        if self.current.kind == TokenKind::Where {
+            self.advance();
+        }
+
+        self.parse_group_graph_pattern()
+    }
+
+    fn parse_group_graph_pattern(&mut self) -> Result<GraphPattern> {
+        self.expect(TokenKind::LeftBrace)?;
+
+        self.enter_group()?;
+        let patterns = self.parse_group_elements()?;
+        self.exit_group();
+
+        self.expect(TokenKind::RightBrace)?;
+        Ok(group_of(patterns))
+    }
+
+    /// Parses the elements of a group up to its closing brace. The target of
+    /// a `BIND` must not be in scope from the elements before it in the group
+    /// (SPARQL 1.1 sec 10.1 and 18.2.1): `{ ?s :p ?o BIND(1 AS ?o) }` is an
+    /// error, not a rebinding of ?o.
+    fn parse_group_elements(&mut self) -> Result<Vec<GraphPattern>> {
+        let mut patterns = Vec::new();
+        let mut in_scope = std::collections::HashSet::new();
+        while self.current.kind != TokenKind::RightBrace {
+            if self.current.kind == TokenKind::Eof {
+                return Err(self.error("unexpected end of input in graph pattern"));
+            }
+            // A nested `{ BIND(...) }` of one element comes back as a bare
+            // BIND too, but its group starts with nothing in scope.
+            let written_here = self.current.kind == TokenKind::Bind;
+            // Grammar rule 54: one `.` may follow a pattern that is not a triples block, which
+            // takes its own. A sub-SELECT is not one of them: a group that is one holds only it
+            // (rule 53), so `{ SELECT ... } .` is an error, and `{ { SELECT ... } . }` is not.
+            let not_triples = matches!(
+                self.current.kind,
+                TokenKind::Optional
+                    | TokenKind::Minus
+                    | TokenKind::Graph
+                    | TokenKind::Service
+                    | TokenKind::Filter
+                    | TokenKind::Bind
+                    | TokenKind::Values
+                    | TokenKind::LeftBrace
+            );
+            let element = self.parse_graph_pattern_element()?;
+            if not_triples && self.current.kind == TokenKind::Dot {
+                self.advance();
+            }
+            if written_here
+                && let GraphPattern::Bind { variable, .. } = &element
+                && in_scope.contains(variable)
+            {
+                return Err(self.error(&format!(
+                    "the target of BIND must be a fresh variable, but '?{variable}' is already \
+                     in scope in its group (SPARQL 1.1 sec 18.2.1)"
+                )));
+            }
+            collect_in_scope_variables(&element, &mut in_scope);
+            patterns.push(element);
+        }
+        Ok(patterns)
+    }
+
+    fn parse_graph_pattern_element(&mut self) -> Result<GraphPattern> {
+        match self.current.kind {
+            TokenKind::Optional => {
+                self.advance();
+                let pattern = self.parse_group_graph_pattern()?;
+                Ok(GraphPattern::Optional(Box::new(pattern)))
+            }
+            TokenKind::Minus => {
+                self.advance();
+                let pattern = self.parse_group_graph_pattern()?;
+                Ok(GraphPattern::Minus(Box::new(pattern)))
+            }
+            TokenKind::Graph => {
+                self.advance();
+                let graph = self.parse_variable_or_iri()?;
+                let pattern = self.parse_group_graph_pattern()?;
+                Ok(GraphPattern::NamedGraph {
+                    graph,
+                    pattern: Box::new(pattern),
+                })
+            }
+            TokenKind::Service => {
+                self.advance();
+                let silent = if self.current.kind == TokenKind::Silent {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let endpoint = self.parse_variable_or_iri()?;
+                let pattern = self.parse_group_graph_pattern()?;
+                Ok(GraphPattern::Service {
+                    silent,
+                    endpoint,
+                    pattern: Box::new(pattern),
+                })
+            }
+            TokenKind::Filter => {
+                self.advance();
+                let expression = self.parse_constraint()?;
+                Ok(GraphPattern::Filter(expression))
+            }
+            TokenKind::Bind => {
+                self.advance();
+                self.expect(TokenKind::LeftParen)?;
+                let expression = self.parse_expression()?;
+                self.expect(TokenKind::As)?;
+                let variable = self.expect_variable_name()?;
+                self.expect(TokenKind::RightParen)?;
+                Ok(GraphPattern::Bind {
+                    expression,
+                    variable,
+                })
+            }
+            TokenKind::Values => self.parse_inline_data(),
+            TokenKind::LeftBrace => {
+                // Nested group or subquery, which nests as a group does
+                self.enter_group()?;
+                let pattern = self.parse_group_or_subquery()?;
+                self.exit_group();
+                // Check for UNION
+                self.parse_union_continuation(pattern)
+            }
+            TokenKind::Select => {
+                // Subquery
+                let subquery = self.parse_select_query()?;
+                Ok(GraphPattern::SubSelect(Box::new(subquery)))
+            }
+            // A quoted triple (`<< s p o >>`) is SPARQL 1.2 (RDF-star).
+            TokenKind::LessThan => Err(self.error(QUOTED_TRIPLES_UNSUPPORTED)),
+            _ => {
+                // Triple patterns. A token that starts none is an error: an
+                // element that consumed nothing would be parsed again and
+                // again by its group.
+                let triples = self.parse_triples_block()?;
+                if triples.is_empty() {
+                    return Err(self.error(&format!(
+                        "unexpected '{}' in a graph pattern",
+                        self.current.text
+                    )));
+                }
+                Ok(GraphPattern::Basic(triples))
+            }
+        }
+    }
+
+    fn parse_group_or_subquery(&mut self) -> Result<GraphPattern> {
+        // Save position to potentially backtrack
+        let saved_kind = self.current.kind.clone();
+
+        if saved_kind == TokenKind::LeftBrace {
+            self.advance();
+
+            if self.current.kind == TokenKind::Select {
+                // It's a subquery
+                let subquery = self.parse_select_query()?;
+                self.expect(TokenKind::RightBrace)?;
+                return Ok(GraphPattern::SubSelect(Box::new(subquery)));
+            }
+
+            // Regular group pattern - parse contents
+            let patterns = self.parse_group_elements()?;
+            self.expect(TokenKind::RightBrace)?;
+            Ok(group_of(patterns))
+        } else {
+            Err(self.error("expected '{'"))
+        }
+    }
+
+    fn parse_union_continuation(&mut self, first: GraphPattern) -> Result<GraphPattern> {
+        if self.current.kind == TokenKind::Union {
+            let mut alternatives = vec![first];
+            while self.current.kind == TokenKind::Union {
+                self.advance();
+                let pattern = self.parse_group_graph_pattern()?;
+                alternatives.push(pattern);
+            }
+            Ok(GraphPattern::Union(alternatives))
+        } else {
+            Ok(first)
+        }
+    }
+
+    fn parse_constraint(&mut self) -> Result<Expression> {
+        if self.current.kind == TokenKind::LeftParen {
+            self.advance();
+            let expr = self.parse_expression()?;
+            self.expect(TokenKind::RightParen)?;
+            Ok(expr)
+        } else {
+            self.parse_built_in_call()
+        }
+    }
+
+    fn parse_inline_data(&mut self) -> Result<GraphPattern> {
+        self.expect(TokenKind::Values)?;
+
+        let mut variables = Vec::new();
+
+        // Parse variable list: `?x` takes its values bare, `(?x ...)` in
+        // parenthesized rows, also for one variable (SPARQL 1.1 rule [62]).
+        let rows_in_parens = self.current.kind == TokenKind::LeftParen;
+        if rows_in_parens {
+            self.advance();
+            while self.current.kind == TokenKind::Variable {
+                variables.push(self.expect_variable_name()?);
+            }
+            self.expect(TokenKind::RightParen)?;
+        } else if self.current.kind == TokenKind::Variable {
+            variables.push(self.expect_variable_name()?);
+        }
+
+        // Parse data block
+        self.expect(TokenKind::LeftBrace)?;
+        let mut values = Vec::new();
+
+        while self.current.kind != TokenKind::RightBrace {
+            if !rows_in_parens {
+                // Single variable - values listed directly
+                let value = self.parse_data_value()?;
+                values.push(vec![value]);
+            } else {
+                // Multiple variables - parenthesized rows
+                self.expect(TokenKind::LeftParen)?;
+                let mut row = Vec::new();
+                for _ in 0..variables.len() {
+                    row.push(self.parse_data_value()?);
+                }
+                self.expect(TokenKind::RightParen)?;
+                values.push(row);
+            }
+        }
+
+        self.expect(TokenKind::RightBrace)?;
+
+        Ok(GraphPattern::InlineData(InlineDataClause {
+            variables,
+            values,
+        }))
+    }
+
+    fn parse_data_value(&mut self) -> Result<Option<DataValue>> {
+        match self.current.kind {
+            TokenKind::Undef => {
+                self.advance();
+                Ok(None)
+            }
+            TokenKind::Iri => {
+                let iri = self.parse_iri()?;
+                Ok(Some(DataValue::Iri(iri)))
+            }
+            TokenKind::PrefixedName => {
+                let iri = self.parse_prefixed_iri()?;
+                Ok(Some(DataValue::Iri(iri)))
+            }
+            TokenKind::String | TokenKind::LongString => {
+                let literal = self.parse_literal()?;
+                Ok(Some(DataValue::Literal(literal)))
+            }
+            TokenKind::Integer
+            | TokenKind::Decimal
+            | TokenKind::Double
+            | TokenKind::MinusOp
+            | TokenKind::Plus => {
+                let literal = self.parse_signed_numeric_literal()?;
+                Ok(Some(DataValue::Literal(literal)))
+            }
+            TokenKind::True | TokenKind::False => {
+                let literal = self.parse_boolean_literal()?;
+                Ok(Some(DataValue::Literal(literal)))
+            }
+            _ => Err(self.error("expected data value or UNDEF")),
+        }
+    }
+
+    // ==================== Triple Patterns ====================
+
+    fn parse_triples_block(&mut self) -> Result<Vec<TriplePattern>> {
+        let mut triples = Vec::new();
+
+        loop {
+            if !self.is_triple_start() {
+                break;
+            }
+
+            self.parse_triples_same_subject(&mut triples)?;
+
+            // Optional trailing dot
+            if self.current.kind == TokenKind::Dot {
+                self.advance();
+            }
+        }
+
+        Ok(triples)
+    }
+
+    fn is_triple_start(&self) -> bool {
+        matches!(
+            self.current.kind,
+            TokenKind::Variable
+                | TokenKind::Iri
+                | TokenKind::PrefixedName
+                | TokenKind::BlankNodeLabel
+                | TokenKind::AnonymousBlank
+                | TokenKind::LeftBracket
+                | TokenKind::LeftParen
+                | TokenKind::String
+                | TokenKind::LongString
+                | TokenKind::Integer
+                | TokenKind::Decimal
+                | TokenKind::Double
+                | TokenKind::True
+                | TokenKind::False
+        )
+    }
+
+    fn parse_triples_same_subject(&mut self, triples: &mut Vec<TriplePattern>) -> Result<()> {
+        if self.current.kind == TokenKind::LeftParen {
+            // RDF collection in subject position: (item1 item2) pred obj .
+            let subject = self.parse_collection(triples)?;
+            self.parse_property_list_not_empty(&subject, triples)?;
+        } else if self.current.kind == TokenKind::LeftBracket {
+            // Anonymous blank node in subject position: [ pred obj ; ... ] pred obj .
+            let subject = self.parse_blank_node_subject(triples)?;
+            if self.is_verb() {
+                self.parse_property_list_not_empty(&subject, triples)?;
+            }
+        } else {
+            let subject = self.parse_var_or_term()?;
+            self.parse_property_list_not_empty(&subject, triples)?;
+        }
+        Ok(())
+    }
+
+    /// Parses `[ predicate-object-list ]` in subject position.
+    fn parse_blank_node_subject(&mut self, triples: &mut Vec<TriplePattern>) -> Result<TripleTerm> {
+        self.expect(TokenKind::LeftBracket)?;
+
+        let label = self.next_anon_blank();
+        let subject = TripleTerm::BlankNode(BlankNode::Labeled(label));
+
+        if self.current.kind == TokenKind::RightBracket {
+            // Empty anonymous blank node: []
+            self.advance();
+            return Ok(subject);
+        }
+
+        // Parse internal property-object pairs
+        self.parse_property_list_not_empty(&subject, triples)?;
+        self.expect(TokenKind::RightBracket)?;
+
+        Ok(subject)
+    }
+
+    fn parse_property_list_not_empty(
+        &mut self,
+        subject: &TripleTerm,
+        triples: &mut Vec<TriplePattern>,
+    ) -> Result<()> {
+        loop {
+            let predicate = self.parse_verb()?;
+            self.parse_object_list(subject, &predicate, triples)?;
+
+            if self.current.kind == TokenKind::Semicolon {
+                self.advance();
+                // Check if there's another predicate-object list
+                if !self.is_verb() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_verb(&self) -> bool {
+        matches!(
+            self.current.kind,
+            TokenKind::Variable
+                | TokenKind::Iri
+                | TokenKind::PrefixedName
+                | TokenKind::A
+                | TokenKind::Caret
+                | TokenKind::Bang
+                | TokenKind::LeftParen
+        )
+    }
+
+    fn parse_verb(&mut self) -> Result<PropertyPath> {
+        if self.current.kind == TokenKind::A {
+            self.advance();
+            Ok(PropertyPath::RdfType)
+        } else if self.current.kind == TokenKind::Variable {
+            let name = self.expect_variable_name()?;
+            Ok(PropertyPath::Variable(name))
+        } else {
+            self.parse_property_path()
+        }
+    }
+
+    fn parse_object_list(
+        &mut self,
+        subject: &TripleTerm,
+        predicate: &PropertyPath,
+        triples: &mut Vec<TriplePattern>,
+    ) -> Result<()> {
+        loop {
+            let object = self.parse_object(triples)?;
+            triples.push(TriplePattern {
+                subject: subject.clone(),
+                predicate: predicate.clone(),
+                object,
+            });
+
+            if self.current.kind == TokenKind::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_object(&mut self, triples: &mut Vec<TriplePattern>) -> Result<TripleTerm> {
+        if self.current.kind == TokenKind::LeftBracket {
+            // Blank node with property list
+            self.advance();
+
+            if self.current.kind == TokenKind::RightBracket {
+                self.advance();
+                return Ok(TripleTerm::BlankNode(BlankNode::Anonymous(vec![])));
+            }
+
+            // Create an anonymous blank node as subject
+            let blank_subject =
+                TripleTerm::BlankNode(BlankNode::Labeled(format!("_:b{}", triples.len())));
+            self.parse_property_list_not_empty(&blank_subject, triples)?;
+            self.expect(TokenKind::RightBracket)?;
+
+            Ok(blank_subject)
+        } else if self.current.kind == TokenKind::LeftParen {
+            // RDF collection in object position: subj pred (item1 item2) .
+            self.parse_collection(triples)
+        } else {
+            self.parse_var_or_term()
+        }
+    }
+
+    /// Parses an RDF collection `(item1 item2 ...)` and desugars it into
+    /// `rdf:first`/`rdf:rest` blank node chains per SPARQL 1.1 sec 19.3.
+    ///
+    /// Returns the head blank node (or `rdf:nil` for empty collections).
+    /// Generated triples are appended to `triples`.
+    fn parse_collection(&mut self, triples: &mut Vec<TriplePattern>) -> Result<TripleTerm> {
+        self.expect(TokenKind::LeftParen)?;
+
+        // Empty collection: () => rdf:nil
+        if self.current.kind == TokenKind::RightParen {
+            self.advance();
+            return Ok(TripleTerm::Iri(Iri::new(
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
+            )));
+        }
+
+        let rdf_first =
+            PropertyPath::Predicate(Iri::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#first"));
+        let rdf_rest =
+            PropertyPath::Predicate(Iri::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#rest"));
+        let rdf_nil = TripleTerm::Iri(Iri::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"));
+
+        let head_label = self.next_collection_blank();
+        let head = TripleTerm::BlankNode(BlankNode::Labeled(head_label.clone()));
+        let mut current_node = head_label;
+
+        loop {
+            // Parse the item (which may itself be a collection or blank node)
+            let item = if self.current.kind == TokenKind::LeftParen {
+                self.parse_collection(triples)?
+            } else if self.current.kind == TokenKind::LeftBracket {
+                self.parse_object(triples)?
+            } else {
+                self.parse_var_or_term()?
+            };
+
+            // _:bN rdf:first item
+            triples.push(TriplePattern {
+                subject: TripleTerm::BlankNode(BlankNode::Labeled(current_node.clone())),
+                predicate: rdf_first.clone(),
+                object: item,
+            });
+
+            // Check if there are more items
+            if self.current.kind == TokenKind::RightParen {
+                // Last item: _:bN rdf:rest rdf:nil
+                triples.push(TriplePattern {
+                    subject: TripleTerm::BlankNode(BlankNode::Labeled(current_node)),
+                    predicate: rdf_rest.clone(),
+                    object: rdf_nil,
+                });
+                break;
+            }
+
+            // More items: _:bN rdf:rest _:bN+1
+            let next_label = self.next_collection_blank();
+            triples.push(TriplePattern {
+                subject: TripleTerm::BlankNode(BlankNode::Labeled(current_node)),
+                predicate: rdf_rest.clone(),
+                object: TripleTerm::BlankNode(BlankNode::Labeled(next_label.clone())),
+            });
+            current_node = next_label;
+        }
+
+        self.expect(TokenKind::RightParen)?;
+        Ok(head)
+    }
+
+    fn parse_var_or_term(&mut self) -> Result<TripleTerm> {
+        match self.current.kind {
+            TokenKind::Variable => {
+                let name = self.expect_variable_name()?;
+                Ok(TripleTerm::Variable(name))
+            }
+            TokenKind::Iri => {
+                let iri = self.parse_iri()?;
+                Ok(TripleTerm::Iri(iri))
+            }
+            TokenKind::PrefixedName => {
+                let iri = self.parse_prefixed_iri()?;
+                Ok(TripleTerm::Iri(iri))
+            }
+            TokenKind::BlankNodeLabel => {
+                let label = self.current.text[2..].to_string(); // Remove _: prefix
+                self.advance();
+                Ok(TripleTerm::BlankNode(BlankNode::Labeled(label)))
+            }
+            // `[]` with no space inside is one token (ANON).
+            TokenKind::AnonymousBlank => {
+                self.advance();
+                Ok(TripleTerm::BlankNode(BlankNode::Anonymous(vec![])))
+            }
+            TokenKind::LeftBracket => {
+                self.advance();
+                if self.current.kind == TokenKind::RightBracket {
+                    self.advance();
+                    Ok(TripleTerm::BlankNode(BlankNode::Anonymous(vec![])))
+                } else {
+                    // Property list - simplified handling
+                    let mut props = Vec::new();
+                    while self.current.kind != TokenKind::RightBracket {
+                        let pred = self.parse_verb()?;
+                        let obj = self.parse_var_or_term()?;
+                        props.push((pred, obj));
+                        if self.current.kind == TokenKind::Semicolon {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::RightBracket)?;
+                    Ok(TripleTerm::BlankNode(BlankNode::Anonymous(props)))
+                }
+            }
+            TokenKind::String | TokenKind::LongString => {
+                let literal = self.parse_literal()?;
+                Ok(TripleTerm::Literal(literal))
+            }
+            TokenKind::Integer
+            | TokenKind::Decimal
+            | TokenKind::Double
+            | TokenKind::MinusOp
+            | TokenKind::Plus => {
+                let literal = self.parse_signed_numeric_literal()?;
+                Ok(TripleTerm::Literal(literal))
+            }
+            TokenKind::True | TokenKind::False => {
+                let literal = self.parse_boolean_literal()?;
+                Ok(TripleTerm::Literal(literal))
+            }
+            TokenKind::LessThan => Err(self.error(QUOTED_TRIPLES_UNSUPPORTED)),
+            _ => Err(self.error("expected variable, IRI, blank node, or literal")),
+        }
+    }
+
+    // ==================== Property Paths ====================
+
+    fn parse_property_path(&mut self) -> Result<PropertyPath> {
+        self.parse_path_alternative()
+    }
+
+    fn parse_path_alternative(&mut self) -> Result<PropertyPath> {
+        let mut path = self.parse_path_sequence()?;
+
+        if self.current.kind == TokenKind::Pipe {
+            let mut alternatives = vec![path];
+            while self.current.kind == TokenKind::Pipe {
+                self.advance();
+                alternatives.push(self.parse_path_sequence()?);
+            }
+            path = PropertyPath::Alternative(alternatives);
+        }
+
+        Ok(path)
+    }
+
+    fn parse_path_sequence(&mut self) -> Result<PropertyPath> {
+        let mut path = self.parse_path_elt_or_inverse()?;
+
+        if self.current.kind == TokenKind::Slash {
+            let mut sequence = vec![path];
+            while self.current.kind == TokenKind::Slash {
+                self.advance();
+                sequence.push(self.parse_path_elt_or_inverse()?);
+            }
+            path = PropertyPath::Sequence(sequence);
+        }
+
+        Ok(path)
+    }
+
+    fn parse_path_elt_or_inverse(&mut self) -> Result<PropertyPath> {
+        if self.current.kind == TokenKind::Caret {
+            self.advance();
+            let path = self.parse_path_elt()?;
+            Ok(PropertyPath::Inverse(Box::new(path)))
+        } else {
+            self.parse_path_elt()
+        }
+    }
+
+    fn parse_path_elt(&mut self) -> Result<PropertyPath> {
+        let mut path = self.parse_path_primary()?;
+
+        // Path modifiers: * + ?
+        match self.current.kind {
+            TokenKind::Star => {
+                self.advance();
+                path = PropertyPath::ZeroOrMore(Box::new(path));
+            }
+            TokenKind::Plus => {
+                self.advance();
+                path = PropertyPath::OneOrMore(Box::new(path));
+            }
+            TokenKind::QuestionMark => {
+                self.advance();
+                path = PropertyPath::ZeroOrOne(Box::new(path));
+            }
+            _ => {}
+        }
+
+        Ok(path)
+    }
+
+    fn parse_path_primary(&mut self) -> Result<PropertyPath> {
+        match self.current.kind {
+            TokenKind::Iri => {
+                let iri = self.parse_iri()?;
+                Ok(PropertyPath::Predicate(iri))
+            }
+            TokenKind::PrefixedName => {
+                let iri = self.parse_prefixed_iri()?;
+                Ok(PropertyPath::Predicate(iri))
+            }
+            TokenKind::A => {
+                self.advance();
+                Ok(PropertyPath::RdfType)
+            }
+            TokenKind::Bang => {
+                self.advance();
+                self.parse_path_negation()
+            }
+            TokenKind::LeftParen => {
+                self.advance();
+                self.enter_nesting()?;
+                let path = self.parse_property_path()?;
+                self.exit_nesting();
+                self.expect(TokenKind::RightParen)?;
+                Ok(path)
+            }
+            _ => Err(self.error("expected property path")),
+        }
+    }
+
+    fn parse_path_negation(&mut self) -> Result<PropertyPath> {
+        if self.current.kind == TokenKind::LeftParen {
+            self.advance();
+            let mut iris = Vec::new();
+
+            if self.current.kind != TokenKind::RightParen {
+                iris.push(self.parse_negated_iri()?);
+                while self.current.kind == TokenKind::Pipe {
+                    self.advance();
+                    iris.push(self.parse_negated_iri()?);
+                }
+            }
+
+            self.expect(TokenKind::RightParen)?;
+            Ok(PropertyPath::Negation(iris))
+        } else {
+            let iri = self.parse_negated_iri()?;
+            Ok(PropertyPath::Negation(vec![iri]))
+        }
+    }
+
+    /// Parses an IRI in a negated property set, optionally preceded by `^` for inverse.
+    fn parse_negated_iri(&mut self) -> Result<NegatedIri> {
+        let inverse = if self.current.kind == TokenKind::Caret {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let iri = self.expect_iri_or_prefixed()?;
+        Ok(NegatedIri { iri, inverse })
+    }
+
+    // ==================== CONSTRUCT Template ====================
+
+    fn parse_construct_template(&mut self) -> Result<Vec<TriplePattern>> {
+        self.expect(TokenKind::LeftBrace)?;
+        let mut triples = Vec::new();
+
+        while self.current.kind != TokenKind::RightBrace {
+            if self.current.kind == TokenKind::Eof {
+                return Err(self.error("unexpected end of input in CONSTRUCT template"));
+            }
+            self.parse_triples_same_subject(&mut triples)?;
+            if self.current.kind == TokenKind::Dot {
+                self.advance();
+            }
+        }
+
+        self.expect(TokenKind::RightBrace)?;
+        Ok(triples)
+    }
+
+    // ==================== Solution Modifiers ====================
+
+    fn parse_solution_modifiers(&mut self) -> Result<SolutionModifiers> {
+        let group_by = self.parse_group_by()?;
+        let having = self.parse_having()?;
+        let order_by = self.parse_order_by()?;
+        let (limit, offset) = self.parse_limit_offset()?;
+        let values = self.parse_trailing_values()?;
+
+        Ok(SolutionModifiers {
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            values,
+        })
+    }
+
+    /// The VALUES clause after a query's pattern and modifiers (SPARQL 1.1
+    /// sec 10.2.2), if there is one.
+    fn parse_trailing_values(&mut self) -> Result<Option<InlineDataClause>> {
+        if self.current.kind != TokenKind::Values {
+            return Ok(None);
+        }
+        match self.parse_inline_data()? {
+            GraphPattern::InlineData(data) => Ok(Some(data)),
+            _ => Err(self.error("expected a VALUES data block")),
+        }
+    }
+
+    /// `pattern` joined with a trailing VALUES clause: for a query form
+    /// without grouping (ASK, CONSTRUCT, DESCRIBE), the same as a VALUES at
+    /// the end of its WHERE clause.
+    fn with_values(pattern: GraphPattern, values: Option<InlineDataClause>) -> GraphPattern {
+        match values {
+            Some(data) => GraphPattern::Group(vec![pattern, GraphPattern::InlineData(data)]),
+            None => pattern,
+        }
+    }
+
+    fn parse_group_by(&mut self) -> Result<Option<Vec<GroupCondition>>> {
+        if self.current.kind != TokenKind::Group {
+            return Ok(None);
+        }
+        self.advance();
+        self.expect(TokenKind::By)?;
+
+        let mut conditions = Vec::new();
+        while self.current.kind == TokenKind::Variable || self.current.kind == TokenKind::LeftParen
+        {
+            conditions.push(self.parse_group_condition()?);
+        }
+
+        if conditions.is_empty() {
+            return Err(self.error("expected GROUP BY condition"));
+        }
+
+        Ok(Some(conditions))
+    }
+
+    fn parse_group_condition(&mut self) -> Result<GroupCondition> {
+        if self.current.kind == TokenKind::LeftParen {
+            self.advance();
+            let expression = self.parse_expression()?;
+
+            let alias = if self.current.kind == TokenKind::As {
+                self.advance();
+                Some(self.expect_variable_name()?)
+            } else {
+                None
+            };
+
+            self.expect(TokenKind::RightParen)?;
+            Ok(GroupCondition::Expression { expression, alias })
+        } else if self.current.kind == TokenKind::Variable {
+            let name = self.expect_variable_name()?;
+            Ok(GroupCondition::Variable(name))
+        } else {
+            let expr = self.parse_built_in_call()?;
+            Ok(GroupCondition::BuiltInCall(expr))
+        }
+    }
+
+    fn parse_having(&mut self) -> Result<Option<Expression>> {
+        if self.current.kind != TokenKind::Having {
+            return Ok(None);
+        }
+        self.advance();
+        Ok(Some(self.parse_constraint()?))
+    }
+
+    fn parse_order_by(&mut self) -> Result<Option<Vec<OrderCondition>>> {
+        if self.current.kind != TokenKind::Order {
+            return Ok(None);
+        }
+        self.advance();
+        self.expect(TokenKind::By)?;
+
+        let mut conditions = Vec::new();
+        loop {
+            let (expression, direction) = if self.current.kind == TokenKind::Asc {
+                self.advance();
+                self.expect(TokenKind::LeftParen)?;
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::RightParen)?;
+                (expr, SortDirection::Ascending)
+            } else if self.current.kind == TokenKind::Desc {
+                self.advance();
+                self.expect(TokenKind::LeftParen)?;
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::RightParen)?;
+                (expr, SortDirection::Descending)
+            } else if self.current.kind == TokenKind::Variable {
+                let name = self.expect_variable_name()?;
+                (Expression::Variable(name), SortDirection::Ascending)
+            } else if self.current.kind == TokenKind::LeftParen {
+                self.advance();
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::RightParen)?;
+                (expr, SortDirection::Ascending)
+            } else if self.starts_call() {
+                // A Constraint (SPARQL 1.1 rule [24]): a built-in call
+                // (`STR(?x)`) or a function call (`xsd:double(?price)`).
+                match self.parse_primary_expression()? {
+                    Expression::Iri(_) => {
+                        return Err(self.error(
+                            "an ORDER BY condition is a variable, a bracketed expression or a \
+                             function call, not an IRI",
+                        ));
+                    }
+                    call => (call, SortDirection::Ascending),
+                }
+            } else {
+                break;
+            };
+
+            conditions.push(OrderCondition {
+                expression,
+                direction,
+            });
+        }
+
+        if conditions.is_empty() {
+            return Err(self.error("expected ORDER BY condition"));
+        }
+
+        Ok(Some(conditions))
+    }
+
+    fn parse_limit_offset(&mut self) -> Result<(Option<u64>, Option<u64>)> {
+        let mut limit = None;
+        let mut offset = None;
+
+        // Can appear in either order
+        for _ in 0..2 {
+            if self.current.kind == TokenKind::Limit {
+                self.advance();
+                limit = Some(self.expect_integer()?);
+            } else if self.current.kind == TokenKind::Offset {
+                self.advance();
+                offset = Some(self.expect_integer()?);
+            }
+        }
+
+        Ok((limit, offset))
+    }
+
+    // ==================== Expressions ====================
+
+    fn parse_expression(&mut self) -> Result<Expression> {
+        self.enter_nesting()?;
+        let result = self.parse_conditional_or_expression();
+        self.exit_nesting();
+        result
+    }
+
+    fn parse_conditional_or_expression(&mut self) -> Result<Expression> {
+        self.parse_balanced_chain(
+            TokenKind::OrOp,
+            BinaryOperator::Or,
+            Self::parse_conditional_and_expression,
+        )
+    }
+
+    fn parse_conditional_and_expression(&mut self) -> Result<Expression> {
+        self.parse_balanced_chain(
+            TokenKind::AndOp,
+            BinaryOperator::And,
+            Self::parse_value_logical,
+        )
+    }
+
+    /// Parses `operand` joined by `token`, an associative operator, into a
+    /// balanced tree of `operator` (see [`Nesting::join_balanced`]): a chain
+    /// of any length stays shallow.
+    fn parse_balanced_chain(
+        &mut self,
+        token: TokenKind,
+        operator: BinaryOperator,
+        operand: fn(&mut Self) -> Result<Expression>,
+    ) -> Result<Expression> {
+        let chain = self.begin_chain();
+        let first = operand(self)?;
+        if self.current.kind != token {
+            self.end_chain(chain);
+            return Ok(first);
+        }
+        let mut operands = vec![(first, self.nesting.take_operand())];
+        while self.current.kind == token {
+            self.advance();
+            let next = operand(self)?;
+            operands.push((next, self.nesting.take_operand()));
+        }
+        let tree = self
+            .nesting
+            .join_balanced(operands, |left, right| Expression::Binary {
+                left: Box::new(left),
+                operator,
+                right: Box::new(right),
+            })
+            .ok_or_else(|| self.error(&nesting_error_message()));
+        self.end_chain(chain);
+        tree
+    }
+
+    fn parse_value_logical(&mut self) -> Result<Expression> {
+        let chain = self.begin_chain();
+        let expression = self.parse_relational_expression()?;
+        self.end_chain(chain);
+        Ok(expression)
+    }
+
+    /// A comparison nests one level above its operands (see
+    /// [`Self::parse_value_logical`]).
+    fn parse_relational_expression(&mut self) -> Result<Expression> {
+        let mut expr = self.parse_numeric_expression()?;
+
+        let operator = match self.current.kind {
+            TokenKind::Equals => Some(BinaryOperator::Equal),
+            TokenKind::NotEquals => Some(BinaryOperator::NotEqual),
+            TokenKind::LessThan => Some(BinaryOperator::LessThan),
+            TokenKind::LessOrEqual => Some(BinaryOperator::LessOrEqual),
+            TokenKind::GreaterThan => Some(BinaryOperator::GreaterThan),
+            TokenKind::GreaterOrEqual => Some(BinaryOperator::GreaterOrEqual),
+            TokenKind::In => {
+                self.advance();
+                let list = self.parse_expression_list()?;
+                self.link_chain()?;
+                return Ok(Expression::In {
+                    expression: Box::new(expr),
+                    list,
+                });
+            }
+            TokenKind::Not => {
+                self.advance();
+                self.expect(TokenKind::In)?;
+                let list = self.parse_expression_list()?;
+                self.link_chain()?;
+                return Ok(Expression::NotIn {
+                    expression: Box::new(expr),
+                    list,
+                });
+            }
+            _ => None,
+        };
+
+        if let Some(op) = operator {
+            self.advance();
+            let right = self.parse_numeric_expression()?;
+            self.link_chain()?;
+            expr = Expression::Binary {
+                left: Box::new(expr),
+                operator: op,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(expr)
+    }
+
+    fn parse_numeric_expression(&mut self) -> Result<Expression> {
+        self.parse_additive_expression()
+    }
+
+    fn parse_additive_expression(&mut self) -> Result<Expression> {
+        let chain = self.begin_chain();
+        let mut expr = self.parse_multiplicative_expression()?;
+
+        loop {
+            let operator = match self.current.kind {
+                TokenKind::Plus => BinaryOperator::Add,
+                TokenKind::MinusOp => BinaryOperator::Subtract,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_multiplicative_expression()?;
+            self.link_chain()?;
+            expr = Expression::Binary {
+                left: Box::new(expr),
+                operator,
+                right: Box::new(right),
+            };
+        }
+        self.end_chain(chain);
+
+        Ok(expr)
+    }
+
+    fn parse_multiplicative_expression(&mut self) -> Result<Expression> {
+        let chain = self.begin_chain();
+        let mut expr = self.parse_unary_expression()?;
+
+        loop {
+            let operator = match self.current.kind {
+                TokenKind::Star => BinaryOperator::Multiply,
+                TokenKind::Slash => BinaryOperator::Divide,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_unary_expression()?;
+            self.link_chain()?;
+            expr = Expression::Binary {
+                left: Box::new(expr),
+                operator,
+                right: Box::new(right),
+            };
+        }
+        self.end_chain(chain);
+
+        Ok(expr)
+    }
+
+    /// A unary operator nests one level above its operand.
+    fn parse_unary_expression(&mut self) -> Result<Expression> {
+        let operator = match self.current.kind {
+            TokenKind::Bang => UnaryOperator::Not,
+            TokenKind::Plus => UnaryOperator::Plus,
+            TokenKind::MinusOp => UnaryOperator::Minus,
+            _ => return self.parse_primary_expression(),
+        };
+        self.advance();
+        let chain = self.begin_chain();
+        let operand = self.parse_primary_expression()?;
+        self.link_chain()?;
+        self.end_chain(chain);
+        Ok(Expression::Unary {
+            operator,
+            operand: Box::new(operand),
+        })
+    }
+
+    fn parse_primary_expression(&mut self) -> Result<Expression> {
+        match self.current.kind {
+            TokenKind::LeftParen => {
+                self.advance();
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::RightParen)?;
+                Ok(Expression::Bracketed(Box::new(expr)))
+            }
+            TokenKind::Variable => {
+                let name = self.expect_variable_name()?;
+                Ok(Expression::Variable(name))
+            }
+            TokenKind::Iri => {
+                let iri = self.parse_iri()?;
+                // Could be IRI or function call
+                if self.current.kind == TokenKind::LeftParen {
+                    self.parse_function_call_with_iri(iri)
+                } else {
+                    Ok(Expression::Iri(iri))
+                }
+            }
+            TokenKind::PrefixedName => {
+                let iri = self.parse_prefixed_iri()?;
+                if self.current.kind == TokenKind::LeftParen {
+                    self.parse_function_call_with_iri(iri)
+                } else {
+                    Ok(Expression::Iri(iri))
+                }
+            }
+            TokenKind::String | TokenKind::LongString => {
+                let literal = self.parse_literal()?;
+                Ok(Expression::Literal(literal))
+            }
+            TokenKind::Integer | TokenKind::Decimal | TokenKind::Double => {
+                let literal = self.parse_numeric_literal()?;
+                Ok(Expression::Literal(literal))
+            }
+            TokenKind::True | TokenKind::False => {
+                let literal = self.parse_boolean_literal()?;
+                Ok(Expression::Literal(literal))
+            }
+            TokenKind::Not => {
+                self.advance();
+                self.expect(TokenKind::Exists)?;
+                let pattern = self.parse_group_graph_pattern()?;
+                Ok(Expression::NotExists(Box::new(pattern)))
+            }
+            TokenKind::Exists => {
+                self.advance();
+                let pattern = self.parse_group_graph_pattern()?;
+                Ok(Expression::Exists(Box::new(pattern)))
+            }
+            // Aggregates and built-in functions
+            _ => self.parse_built_in_call(),
+        }
+    }
+
+    fn parse_built_in_call(&mut self) -> Result<Expression> {
+        match self.current.kind {
+            // Aggregates
+            TokenKind::Count => self.parse_count_aggregate(),
+            TokenKind::Sum => self.parse_aggregate(|e| AggregateExpression::Sum {
+                distinct: false,
+                expression: Box::new(e),
+            }),
+            TokenKind::Avg => self.parse_aggregate(|e| AggregateExpression::Average {
+                distinct: false,
+                expression: Box::new(e),
+            }),
+            TokenKind::Min => self.parse_aggregate(|e| AggregateExpression::Minimum {
+                expression: Box::new(e),
+            }),
+            TokenKind::Max => self.parse_aggregate(|e| AggregateExpression::Maximum {
+                expression: Box::new(e),
+            }),
+            TokenKind::Sample => self.parse_aggregate(|e| AggregateExpression::Sample {
+                expression: Box::new(e),
+            }),
+            TokenKind::GroupConcat => self.parse_group_concat(),
+
+            // EXISTS / NOT EXISTS
+            TokenKind::Exists => {
+                self.advance();
+                let pattern = self.parse_group_graph_pattern()?;
+                Ok(Expression::Exists(Box::new(pattern)))
+            }
+            TokenKind::Not => {
+                self.advance();
+                self.expect(TokenKind::Exists)?;
+                let pattern = self.parse_group_graph_pattern()?;
+                Ok(Expression::NotExists(Box::new(pattern)))
+            }
+
+            // String functions
+            _ if self.is_built_in_function() => self.parse_built_in_function(),
+
+            _ => Err(self.error("expected expression")),
+        }
+    }
+
+    /// Whether the current token starts a built-in call (an aggregate,
+    /// EXISTS, NOT EXISTS or a function name) or an IRI function call.
+    fn starts_call(&self) -> bool {
+        matches!(
+            self.current.kind,
+            TokenKind::Iri
+                | TokenKind::PrefixedName
+                | TokenKind::Count
+                | TokenKind::Sum
+                | TokenKind::Avg
+                | TokenKind::Min
+                | TokenKind::Max
+                | TokenKind::Sample
+                | TokenKind::GroupConcat
+                | TokenKind::Exists
+                | TokenKind::Not
+        ) || self.is_built_in_function()
+    }
+
+    fn is_built_in_function(&self) -> bool {
+        // Check for keywords that can be function names
+        matches!(
+            self.current.text.to_uppercase().as_str(),
+            "STR"
+                | "LANG"
+                | "LANGMATCHES"
+                | "DATATYPE"
+                | "BOUND"
+                | "IRI"
+                | "URI"
+                | "BNODE"
+                | "RAND"
+                | "ABS"
+                | "CEIL"
+                | "FLOOR"
+                | "ROUND"
+                | "CONCAT"
+                | "STRLEN"
+                | "UCASE"
+                | "LCASE"
+                | "ENCODE_FOR_URI"
+                | "CONTAINS"
+                | "STRSTARTS"
+                | "STRENDS"
+                | "STRBEFORE"
+                | "STRAFTER"
+                | "YEAR"
+                | "MONTH"
+                | "DAY"
+                | "HOURS"
+                | "MINUTES"
+                | "SECONDS"
+                | "TIMEZONE"
+                | "TZ"
+                | "NOW"
+                | "UUID"
+                | "STRUUID"
+                | "MD5"
+                | "SHA1"
+                | "SHA256"
+                | "SHA384"
+                | "SHA512"
+                | "COALESCE"
+                | "IF"
+                | "STRLANG"
+                | "STRDT"
+                | "SAMETERM"
+                | "ISIRI"
+                | "ISURI"
+                | "ISBLANK"
+                | "ISLITERAL"
+                | "ISNUMERIC"
+                | "REGEX"
+                | "SUBSTR"
+                | "REPLACE"
+                // Vector functions (extension for AI/ML workloads)
+                | "VECTOR"
+                | "COSINE_SIMILARITY"
+                | "EUCLIDEAN_DISTANCE"
+                | "DOT_PRODUCT"
+                | "MANHATTAN_DISTANCE"
+        ) || matches!(
+            self.current.kind,
+            TokenKind::Vector
+                | TokenKind::CosineSimilarity
+                | TokenKind::EuclideanDistance
+                | TokenKind::DotProduct
+                | TokenKind::ManhattanDistance
+        )
+    }
+
+    fn parse_built_in_function(&mut self) -> Result<Expression> {
+        let func_name = self.current.text.to_uppercase();
+        self.advance();
+
+        // Special cases
+        match func_name.as_str() {
+            "BOUND" => {
+                self.expect(TokenKind::LeftParen)?;
+                let var = self.expect_variable_name()?;
+                self.expect(TokenKind::RightParen)?;
+                return Ok(Expression::Bound(var));
+            }
+            "IF" => {
+                self.expect(TokenKind::LeftParen)?;
+                let condition = self.parse_expression()?;
+                self.expect(TokenKind::Comma)?;
+                let then_expr = self.parse_expression()?;
+                self.expect(TokenKind::Comma)?;
+                let else_expr = self.parse_expression()?;
+                self.expect(TokenKind::RightParen)?;
+                return Ok(Expression::Conditional {
+                    condition: Box::new(condition),
+                    then_expression: Box::new(then_expr),
+                    else_expression: Box::new(else_expr),
+                });
+            }
+            "COALESCE" => {
+                let args = self.parse_expression_list()?;
+                return Ok(Expression::Coalesce(args));
+            }
+            _ => {}
+        }
+
+        // Regular function call
+        let builtin = match func_name.as_str() {
+            "STR" => BuiltInFunction::Str,
+            "LANG" => BuiltInFunction::Lang,
+            "LANGMATCHES" => BuiltInFunction::LangMatches,
+            "DATATYPE" => BuiltInFunction::Datatype,
+            "IRI" | "URI" => BuiltInFunction::Iri,
+            "BNODE" => BuiltInFunction::Bnode,
+            "RAND" => BuiltInFunction::Rand,
+            "ABS" => BuiltInFunction::Abs,
+            "CEIL" => BuiltInFunction::Ceil,
+            "FLOOR" => BuiltInFunction::Floor,
+            "ROUND" => BuiltInFunction::Round,
+            "CONCAT" => BuiltInFunction::Concat,
+            "STRLEN" => BuiltInFunction::StrLen,
+            "UCASE" => BuiltInFunction::Ucase,
+            "LCASE" => BuiltInFunction::Lcase,
+            "ENCODE_FOR_URI" => BuiltInFunction::EncodeForUri,
+            "CONTAINS" => BuiltInFunction::Contains,
+            "STRSTARTS" => BuiltInFunction::StrStarts,
+            "STRENDS" => BuiltInFunction::StrEnds,
+            "STRBEFORE" => BuiltInFunction::StrBefore,
+            "STRAFTER" => BuiltInFunction::StrAfter,
+            "YEAR" => BuiltInFunction::Year,
+            "MONTH" => BuiltInFunction::Month,
+            "DAY" => BuiltInFunction::Day,
+            "HOURS" => BuiltInFunction::Hours,
+            "MINUTES" => BuiltInFunction::Minutes,
+            "SECONDS" => BuiltInFunction::Seconds,
+            "TIMEZONE" => BuiltInFunction::Timezone,
+            "TZ" => BuiltInFunction::Tz,
+            "NOW" => BuiltInFunction::Now,
+            "UUID" => BuiltInFunction::Uuid,
+            "STRUUID" => BuiltInFunction::StrUuid,
+            "MD5" => BuiltInFunction::Md5,
+            "SHA1" => BuiltInFunction::Sha1,
+            "SHA256" => BuiltInFunction::Sha256,
+            "SHA384" => BuiltInFunction::Sha384,
+            "SHA512" => BuiltInFunction::Sha512,
+            "STRLANG" => BuiltInFunction::StrLang,
+            "STRDT" => BuiltInFunction::StrDt,
+            "SAMETERM" => BuiltInFunction::SameTerm,
+            "ISIRI" | "ISURI" => BuiltInFunction::IsIri,
+            "ISBLANK" => BuiltInFunction::IsBlank,
+            "ISLITERAL" => BuiltInFunction::IsLiteral,
+            "ISNUMERIC" => BuiltInFunction::IsNumeric,
+            "REGEX" => BuiltInFunction::Regex,
+            "SUBSTR" => BuiltInFunction::Substr,
+            "REPLACE" => BuiltInFunction::Replace,
+            // Vector functions (extension for AI/ML workloads)
+            "VECTOR" => BuiltInFunction::Vector,
+            "COSINE_SIMILARITY" => BuiltInFunction::CosineSimilarity,
+            "EUCLIDEAN_DISTANCE" => BuiltInFunction::EuclideanDistance,
+            "DOT_PRODUCT" => BuiltInFunction::DotProduct,
+            "MANHATTAN_DISTANCE" => BuiltInFunction::ManhattanDistance,
+            _ => return Err(self.error(&format!("unknown function: {}", func_name))),
+        };
+
+        let arguments = self.parse_argument_list()?;
+        Ok(Expression::FunctionCall {
+            function: FunctionName::BuiltIn(builtin),
+            arguments,
+        })
+    }
+
+    fn parse_count_aggregate(&mut self) -> Result<Expression> {
+        self.expect(TokenKind::Count)?;
+        self.expect(TokenKind::LeftParen)?;
+
+        let distinct = if self.current.kind == TokenKind::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let expression = if self.current.kind == TokenKind::Star {
+            self.advance();
+            None
+        } else {
+            Some(Box::new(self.parse_expression()?))
+        };
+
+        self.expect(TokenKind::RightParen)?;
+
+        Ok(Expression::Aggregate(AggregateExpression::Count {
+            distinct,
+            expression,
+        }))
+    }
+
+    fn parse_aggregate<F>(&mut self, constructor: F) -> Result<Expression>
+    where
+        F: FnOnce(Expression) -> AggregateExpression,
+    {
+        self.advance(); // Skip the aggregate keyword
+        self.expect(TokenKind::LeftParen)?;
+
+        let distinct = if self.current.kind == TokenKind::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let expression = self.parse_expression()?;
+        self.expect(TokenKind::RightParen)?;
+
+        let mut agg = constructor(expression);
+
+        // Apply distinct if needed
+        match &mut agg {
+            AggregateExpression::Sum { distinct: d, .. }
+            | AggregateExpression::Average { distinct: d, .. } => {
+                *d = distinct;
+            }
+            _ => {}
+        }
+
+        Ok(Expression::Aggregate(agg))
+    }
+
+    fn parse_group_concat(&mut self) -> Result<Expression> {
+        self.expect(TokenKind::GroupConcat)?;
+        self.expect(TokenKind::LeftParen)?;
+
+        let distinct = if self.current.kind == TokenKind::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let expression = self.parse_expression()?;
+
+        let separator = if self.current.kind == TokenKind::Semicolon {
+            self.advance();
+            self.expect(TokenKind::Separator)?;
+            self.expect(TokenKind::Equals)?;
+            let sep = self.parse_literal()?;
+            Some(sep.value)
+        } else {
+            None
+        };
+
+        self.expect(TokenKind::RightParen)?;
+
+        Ok(Expression::Aggregate(AggregateExpression::GroupConcat {
+            distinct,
+            expression: Box::new(expression),
+            separator,
+        }))
+    }
+
+    fn parse_function_call_with_iri(&mut self, iri: Iri) -> Result<Expression> {
+        let arguments = self.parse_argument_list()?;
+        Ok(Expression::FunctionCall {
+            function: FunctionName::Custom(iri),
+            arguments,
+        })
+    }
+
+    fn parse_argument_list(&mut self) -> Result<Vec<Expression>> {
+        self.expect(TokenKind::LeftParen)?;
+
+        if self.current.kind == TokenKind::RightParen {
+            self.advance();
+            return Ok(Vec::new());
+        }
+
+        let mut args = vec![self.parse_expression()?];
+        while self.current.kind == TokenKind::Comma {
+            self.advance();
+            args.push(self.parse_expression()?);
+        }
+
+        self.expect(TokenKind::RightParen)?;
+        Ok(args)
+    }
+
+    fn parse_expression_list(&mut self) -> Result<Vec<Expression>> {
+        self.expect(TokenKind::LeftParen)?;
+
+        let mut exprs = Vec::new();
+        if self.current.kind != TokenKind::RightParen {
+            exprs.push(self.parse_expression()?);
+            while self.current.kind == TokenKind::Comma {
+                self.advance();
+                exprs.push(self.parse_expression()?);
+            }
+        }
+
+        self.expect(TokenKind::RightParen)?;
+        Ok(exprs)
+    }
+
+    // ==================== Literals ====================
+
+    fn parse_literal(&mut self) -> Result<Literal> {
+        let value = self.parse_string_value()?;
+
+        // Check for language tag or datatype
+        if self.current.kind == TokenKind::At {
+            self.advance();
+            let lang = if self.current.kind == TokenKind::PrefixedName {
+                let text = self.current.text.clone();
+                self.advance();
+                text
+            } else {
+                return Err(self.error("expected language tag"));
+            };
+            Ok(Literal::with_language(value, lang))
+        } else if self.current.kind == TokenKind::DoubleCaret {
+            self.advance();
+            let datatype = self.expect_iri_or_prefixed()?;
+            Ok(Literal::typed(value, datatype))
+        } else {
+            Ok(Literal::string(value))
+        }
+    }
+
+    fn parse_string_value(&mut self) -> Result<String> {
+        let text = self.current.text.clone();
+
+        let value = if self.current.kind == TokenKind::LongString {
+            self.advance();
+            // Remove triple quotes
+            let quote = text
+                .chars()
+                .next()
+                .ok_or_else(|| self.error("empty string literal token"))?;
+            let inner = &text[3..text.len() - 3];
+            self.unescape_string(inner, quote)
+        } else if self.current.kind == TokenKind::String {
+            self.advance();
+            // Remove single quotes
+            let quote = text
+                .chars()
+                .next()
+                .ok_or_else(|| self.error("empty string literal token"))?;
+            let inner = &text[1..text.len() - 1];
+            self.unescape_string(inner, quote)
+        } else {
+            return Err(self.error("expected string literal"));
+        };
+
+        Ok(value)
+    }
+
+    fn unescape_string(&self, s: &str, _quote: char) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    chars.next();
+                    match next {
+                        'n' => result.push('\n'),
+                        'r' => result.push('\r'),
+                        't' => result.push('\t'),
+                        '\\' => result.push('\\'),
+                        '"' => result.push('"'),
+                        '\'' => result.push('\''),
+                        'u' => {
+                            // Unicode escape \uXXXX
+                            let hex: String = chars.by_ref().take(4).collect();
+                            if let Ok(code) = u32::from_str_radix(&hex, 16)
+                                && let Some(ch) = char::from_u32(code)
+                            {
+                                result.push(ch);
+                            }
+                        }
+                        'U' => {
+                            // Unicode escape \UXXXXXXXX
+                            let hex: String = chars.by_ref().take(8).collect();
+                            if let Ok(code) = u32::from_str_radix(&hex, 16)
+                                && let Some(ch) = char::from_u32(code)
+                            {
+                                result.push(ch);
+                            }
+                        }
+                        _ => {
+                            result.push('\\');
+                            result.push(next);
+                        }
+                    }
+                }
+            } else {
+                result.push(c);
+            }
+        }
+
+        result
+    }
+
+    /// A numeric literal with an optional sign (`-1`, `+2.5`), as a VALUES
+    /// entry and a triple term may write one (SPARQL 1.1 grammar:
+    /// `NumericLiteralNegative`, `NumericLiteralPositive`). The lexer gives the
+    /// sign as its own token; there it can only start a number.
+    fn parse_signed_numeric_literal(&mut self) -> Result<Literal> {
+        let negative = match self.current.kind {
+            TokenKind::MinusOp => {
+                self.advance();
+                true
+            }
+            TokenKind::Plus => {
+                self.advance();
+                false
+            }
+            _ => false,
+        };
+        let mut literal = self.parse_numeric_literal()?;
+        if negative {
+            literal.value.insert(0, '-');
+        }
+        Ok(literal)
+    }
+
+    fn parse_numeric_literal(&mut self) -> Result<Literal> {
+        let text = self.current.text.clone();
+        let datatype = match self.current.kind {
+            TokenKind::Integer => Iri::new("http://www.w3.org/2001/XMLSchema#integer"),
+            TokenKind::Decimal => Iri::new("http://www.w3.org/2001/XMLSchema#decimal"),
+            TokenKind::Double => Iri::new("http://www.w3.org/2001/XMLSchema#double"),
+            _ => return Err(self.error("expected numeric literal")),
+        };
+        self.advance();
+        Ok(Literal::typed(text, datatype))
+    }
+
+    fn parse_boolean_literal(&mut self) -> Result<Literal> {
+        let value = match self.current.kind {
+            TokenKind::True => "true",
+            TokenKind::False => "false",
+            _ => return Err(self.error("expected boolean literal")),
+        };
+        self.advance();
+        Ok(Literal::typed(
+            value,
+            Iri::new("http://www.w3.org/2001/XMLSchema#boolean"),
+        ))
+    }
+
+    // ==================== IRIs ====================
+
+    fn parse_iri(&mut self) -> Result<Iri> {
+        if self.current.kind != TokenKind::Iri {
+            return Err(self.error("expected IRI"));
+        }
+        let text = self.current.text.clone();
+        // Between the angle brackets, a `\u` or `\U` escape stands for its
+        // code point (SPARQL 1.1, section 19.2), so both spellings of an IRI
+        // are one IRI, as the N-Triples and Turtle loaders read them. The
+        // lexer took only escapes with all their digits, so what can still
+        // fail is a code point that is no character.
+        let iri = grafeo_common::types::rdf::unescape_iri(&text[1..text.len() - 1])
+            .map_err(|_| {
+                let reason = "an escape that spells no Unicode scalar value (a surrogate, or above U+10FFFF)";
+                self.error(&format!("the IRI {text} has {reason}"))
+            })?
+            .into_owned();
+        self.advance();
+        Ok(Iri::new(iri))
+    }
+
+    fn parse_prefixed_iri(&mut self) -> Result<Iri> {
+        if self.current.kind != TokenKind::PrefixedName {
+            return Err(self.error("expected prefixed name"));
+        }
+        let text = self.current.text.clone();
+        self.advance();
+        // For now, store as-is; resolution happens during binding
+        Ok(Iri::new(text))
+    }
+
+    fn parse_variable_or_iri(&mut self) -> Result<VariableOrIri> {
+        match self.current.kind {
+            TokenKind::Variable => {
+                let name = self.expect_variable_name()?;
+                Ok(VariableOrIri::Variable(name))
+            }
+            TokenKind::Iri => {
+                let iri = self.parse_iri()?;
+                Ok(VariableOrIri::Iri(iri))
+            }
+            TokenKind::PrefixedName => {
+                let iri = self.parse_prefixed_iri()?;
+                Ok(VariableOrIri::Iri(iri))
+            }
+            _ => Err(self.error("expected variable or IRI")),
+        }
+    }
+
+    // ==================== Helpers ====================
+
+    fn advance(&mut self) {
+        self.current = self.lexer.next_token();
+        // Notes the first use of a prefix not in scope (see `parse`).
+        if self.current.kind == TokenKind::PrefixedName
+            && !self.declaring_prefix
+            && self.undeclared.is_none()
+        {
+            // The lexer reads a bare name (a function such as `STRLEN`) as a
+            // prefixed name too: only one with a colon uses a prefix.
+            if let Some((prefix, _)) = self.current.text.split_once(':')
+                && !self.prefixes.contains(prefix)
+            {
+                self.undeclared = Some(self.current.clone());
+            }
+        }
+    }
+
+    fn expect(&mut self, kind: TokenKind) -> Result<()> {
+        if self.current.kind == kind {
+            self.advance();
+            Ok(())
+        } else {
+            Err(self.error(&format!("expected {:?}", kind)))
+        }
+    }
+
+    fn expect_iri(&mut self) -> Result<Iri> {
+        if self.current.kind == TokenKind::Iri {
+            self.parse_iri()
+        } else if self.current.kind == TokenKind::PrefixedName {
+            self.parse_prefixed_iri()
+        } else {
+            Err(self.error("expected IRI"))
+        }
+    }
+
+    fn expect_iri_or_prefixed(&mut self) -> Result<Iri> {
+        match self.current.kind {
+            TokenKind::Iri => self.parse_iri(),
+            TokenKind::PrefixedName => self.parse_prefixed_iri(),
+            TokenKind::A => {
+                self.advance();
+                Ok(Iri::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))
+            }
+            _ => Err(self.error("expected IRI or prefixed name")),
+        }
+    }
+
+    fn expect_variable_name(&mut self) -> Result<String> {
+        if self.current.kind != TokenKind::Variable {
+            return Err(self.error("expected variable"));
+        }
+        let text = self.current.text.clone();
+        self.advance();
+        // Remove ? or $ prefix
+        Ok(text[1..].to_string())
+    }
+
+    fn expect_integer(&mut self) -> Result<u64> {
+        if self.current.kind != TokenKind::Integer {
+            return Err(self.error("expected integer"));
+        }
+        let text = self.current.text.clone();
+        self.advance();
+        text.parse()
+            .map_err(|_| self.error(&format!("invalid integer: {}", text)))
+    }
+
+    /// Enters one level of nesting, or fails past the nesting limit.
+    fn enter_nesting(&mut self) -> Result<()> {
+        if self.nesting.enter() {
+            Ok(())
+        } else {
+            Err(self.error(&nesting_error_message()))
+        }
+    }
+
+    /// Leaves the level [`Self::enter_nesting`] entered.
+    fn exit_nesting(&mut self) {
+        self.nesting.exit();
+    }
+
+    /// Enters a group graph pattern, which nests two levels: translating
+    /// and planning one takes more stack than an expression in parentheses.
+    fn enter_group(&mut self) -> Result<()> {
+        self.enter_nesting()?;
+        self.enter_nesting()
+    }
+
+    /// Leaves the levels [`Self::enter_group`] entered.
+    fn exit_group(&mut self) {
+        self.exit_nesting();
+        self.exit_nesting();
+    }
+
+    /// Begins a chain of binary operators (see [`Nesting::begin_chain`]).
+    fn begin_chain(&mut self) -> Chain {
+        self.nesting.begin_chain()
+    }
+
+    /// Counts one operator of a chain, or fails past the nesting limit.
+    fn link_chain(&mut self) -> Result<()> {
+        if self.nesting.link() {
+            Ok(())
+        } else {
+            Err(self.error(&nesting_error_message()))
+        }
+    }
+
+    /// Ends a chain of binary operators.
+    fn end_chain(&mut self, chain: Chain) {
+        self.nesting.end_chain(chain);
+    }
+
+    fn error(&self, message: &str) -> Error {
+        Error::from(
+            QueryError::new(QueryErrorKind::Syntax, format!("[SPARQL] {message}"))
+                .with_span(self.current.span)
+                .with_source(self.source.to_string()),
+        )
+    }
+}
+
+/// The pattern of a group of `patterns`. A group of one element answers as
+/// that element, unless the element reads the group around it: `{ FILTER(F) }`,
+/// `{ BIND(E AS ?v) }`, `{ OPTIONAL { P } }` and `{ MINUS { P } }` start from
+/// their own group's one empty solution, not from the outer group's rows, and
+/// `{ { P FILTER(F) } }` keeps its inner group, whose FILTER scopes over P
+/// alone (SPARQL 1.1 sec 18.2.2.6 and 18.3.2.7).
+fn group_of(patterns: Vec<GraphPattern>) -> GraphPattern {
+    match <[GraphPattern; 1]>::try_from(patterns) {
+        Ok(
+            [
+                only @ (GraphPattern::Group(_)
+                | GraphPattern::Filter(_)
+                | GraphPattern::Bind { .. }
+                | GraphPattern::Optional(_)
+                | GraphPattern::Minus(_)),
+            ],
+        ) => GraphPattern::Group(vec![only]),
+        Ok([only]) => only,
+        Err(patterns) => GraphPattern::Group(patterns),
+    }
+}
+
+/// Collects the variables in scope after evaluating `pattern` (SPARQL 1.1 sec
+/// 18.2.1): those bound by triple patterns, `BIND`, `VALUES`, `GRAPH ?g`,
+/// `SERVICE` and sub-select projections. `FILTER` and `MINUS` bind nothing.
+fn collect_in_scope_variables(pattern: &GraphPattern, out: &mut std::collections::HashSet<String>) {
+    match pattern {
+        GraphPattern::Basic(triples) => {
+            for triple in triples {
+                for term in [&triple.subject, &triple.object] {
+                    if let TripleTerm::Variable(name) = term {
+                        out.insert(name.clone());
+                    }
+                }
+                if let PropertyPath::Variable(name) = &triple.predicate {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        GraphPattern::Group(patterns) | GraphPattern::Union(patterns) => {
+            for inner in patterns {
+                collect_in_scope_variables(inner, out);
+            }
+        }
+        GraphPattern::Optional(inner) => collect_in_scope_variables(inner, out),
+        GraphPattern::NamedGraph { graph, pattern } => {
+            if let VariableOrIri::Variable(name) = graph {
+                out.insert(name.clone());
+            }
+            collect_in_scope_variables(pattern, out);
+        }
+        GraphPattern::Service {
+            endpoint, pattern, ..
+        } => {
+            if let VariableOrIri::Variable(name) = endpoint {
+                out.insert(name.clone());
+            }
+            collect_in_scope_variables(pattern, out);
+        }
+        GraphPattern::Bind { variable, .. } => {
+            out.insert(variable.clone());
+        }
+        GraphPattern::InlineData(data) => out.extend(data.variables.iter().cloned()),
+        GraphPattern::SubSelect(query) => match &query.projection {
+            Projection::Wildcard => collect_in_scope_variables(&query.where_clause, out),
+            Projection::Variables(variables) => {
+                for var in variables {
+                    match (&var.alias, &var.expression) {
+                        (Some(alias), _) => {
+                            out.insert(alias.clone());
+                        }
+                        (None, Expression::Variable(name)) => {
+                            out.insert(name.clone());
+                        }
+                        (None, _) => {}
+                    }
+                }
+            }
+        },
+        GraphPattern::Minus(_) | GraphPattern::Filter(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(query: &str) -> Result<Query> {
+        let mut parser = Parser::new(query);
+        parser.parse()
+    }
+
+    #[test]
+    fn test_simple_select() {
+        let query = parse("SELECT ?x WHERE { ?x ?y ?z }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    /// `text` with every `~` a backslash, so an escape reads as written.
+    fn escaped(text: &str) -> String {
+        text.replace('~', "\\")
+    }
+
+    /// The subject, predicate and object of `query`, a SELECT of one triple
+    /// pattern.
+    fn the_pattern(query: &str) -> (TripleTerm, PropertyPath, TripleTerm) {
+        let query = parse(query).unwrap();
+        let QueryForm::Select(select) = query.query_form else {
+            panic!("expected SELECT query");
+        };
+        let GraphPattern::Basic(patterns) = select.where_clause else {
+            panic!(
+                "expected one basic graph pattern: {:?}",
+                select.where_clause
+            );
+        };
+        let [pattern] = patterns.as_slice() else {
+            panic!("expected one triple pattern: {patterns:?}");
+        };
+        (
+            pattern.subject.clone(),
+            pattern.predicate.clone(),
+            pattern.object.clone(),
+        )
+    }
+
+    /// A `\u` or `\U` escape in an IRI stands for its code point (SPARQL
+    /// 1.1, section 19.2), wherever the IRI stands, so both spellings are one
+    /// IRI.
+    #[test]
+    fn an_escape_in_an_iri_is_its_code_point() {
+        let (subject, predicate, object) = the_pattern(&escaped(
+            "SELECT * WHERE { <http://example.org/Krak~u00F3w> \
+             <http://example.org/~u0070> <http://example.org/~U0001F6B2> }",
+        ));
+        assert_eq!(
+            subject,
+            TripleTerm::Iri(Iri::new("http://example.org/Kraków"))
+        );
+        assert_eq!(
+            predicate,
+            PropertyPath::Predicate(Iri::new("http://example.org/p"))
+        );
+        assert_eq!(
+            object,
+            TripleTerm::Iri(Iri::new("http://example.org/\u{1F6B2}"))
+        );
+
+        let (subject, ..) = the_pattern("SELECT * WHERE { <http://example.org/Kraków> ?p ?o }");
+        assert_eq!(
+            subject,
+            TripleTerm::Iri(Iri::new("http://example.org/Kraków"))
+        );
+    }
+
+    /// An escape that spells no Unicode scalar value (a surrogate) is a parse
+    /// error naming it, not an IRI that keeps the escape.
+    #[test]
+    fn an_iri_escape_of_a_surrogate_is_a_parse_error() {
+        let query = escaped("SELECT * WHERE { <http://example.org/~uD800> ?p ?o }");
+        let error = parse(&query).unwrap_err().to_string();
+        assert!(
+            error.contains("uD800") && error.contains("IRI"),
+            "the error names the escape and the IRI: {error}"
+        );
+    }
+
+    #[test]
+    fn test_select_with_prefix() {
+        let query = parse(
+            r#"
+            PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+            SELECT ?name
+            WHERE { ?x foaf:name ?name }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(query.prefixes.len(), 1);
+        assert_eq!(query.prefixes[0].prefix, "foaf");
+    }
+
+    #[test]
+    fn test_select_distinct() {
+        let query = parse("SELECT DISTINCT ?x WHERE { ?x ?y ?z }").unwrap();
+        if let QueryForm::Select(select) = query.query_form {
+            assert_eq!(select.modifier, SelectModifier::Distinct);
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_select_star() {
+        let query = parse("SELECT * WHERE { ?x ?y ?z }").unwrap();
+        if let QueryForm::Select(select) = query.query_form {
+            assert!(matches!(select.projection, Projection::Wildcard));
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_optional() {
+        let query = parse("SELECT ?x ?y WHERE { ?x ?p ?y OPTIONAL { ?y ?q ?z } }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_filter() {
+        let query = parse("SELECT ?x WHERE { ?x ?y ?z FILTER(?z > 10) }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_order_by() {
+        let query = parse("SELECT ?x WHERE { ?x ?y ?z } ORDER BY ?x").unwrap();
+        if let QueryForm::Select(select) = query.query_form {
+            assert!(select.solution_modifiers.order_by.is_some());
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_limit_offset() {
+        let query = parse("SELECT ?x WHERE { ?x ?y ?z } LIMIT 10 OFFSET 5").unwrap();
+        if let QueryForm::Select(select) = query.query_form {
+            assert_eq!(select.solution_modifiers.limit, Some(10));
+            assert_eq!(select.solution_modifiers.offset, Some(5));
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_ask_query() {
+        let query = parse("ASK { ?x ?y ?z }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Ask(_)));
+    }
+
+    #[test]
+    fn test_construct_query() {
+        let query = parse("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Construct(_)));
+    }
+
+    #[test]
+    fn test_union() {
+        let query = parse("SELECT ?x WHERE { { ?x ?y ?z } UNION { ?x ?a ?b } }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_aggregates() {
+        let query = parse("SELECT (COUNT(?x) AS ?count) WHERE { ?x ?y ?z } GROUP BY ?z").unwrap();
+        if let QueryForm::Select(select) = query.query_form {
+            assert!(select.solution_modifiers.group_by.is_some());
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_property_path() {
+        let query = parse(
+            "PREFIX foaf: <http://xmlns.com/foaf/0.1/> SELECT ?x WHERE { ?x foaf:knows+ ?y }",
+        )
+        .unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_bind() {
+        let query =
+            parse("SELECT ?x ?doubled WHERE { ?x ?y ?z BIND(?z * 2 AS ?doubled) }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_literal_with_datatype() {
+        let query = parse(r#"SELECT ?x WHERE { ?x ?y "42"^^xsd:integer }"#).unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_literal_with_language() {
+        let query = parse(r#"SELECT ?x WHERE { ?x ?y "hello"@en }"#).unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_vector_cosine_similarity() {
+        let query = parse(
+            r#"SELECT ?doc WHERE { ?doc ?embed ?vec FILTER(COSINE_SIMILARITY(?vec, ?query) > 0.8) }"#,
+        )
+        .unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_vector_euclidean_distance() {
+        let query = parse(
+            r#"SELECT ?doc WHERE { ?doc ?embed ?vec FILTER(EUCLIDEAN_DISTANCE(?vec, ?query) < 1.5) }"#,
+        )
+        .unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_vector_function_order_by() {
+        let query = parse(
+            r#"SELECT ?doc (COSINE_SIMILARITY(?vec, ?query) AS ?score)
+               WHERE { ?doc ?embed ?vec }
+               ORDER BY DESC(?score)
+               LIMIT 10"#,
+        )
+        .unwrap();
+        if let QueryForm::Select(select) = query.query_form {
+            assert!(select.solution_modifiers.order_by.is_some());
+            assert_eq!(select.solution_modifiers.limit, Some(10));
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_vector_literal_function() {
+        // Test VECTOR() function call with list syntax
+        let query = parse(
+            r#"SELECT ?doc WHERE {
+                ?doc ?embed ?vec
+                BIND(VECTOR(?v1, ?v2, ?v3) AS ?query_vec)
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    // ==================== RDF Collection Tests ====================
+
+    /// Helper to extract triples from a WHERE clause (handles both Basic and Group).
+    fn extract_triples(pattern: &GraphPattern) -> &[TriplePattern] {
+        match pattern {
+            GraphPattern::Basic(triples) => triples,
+            GraphPattern::Group(patterns) => {
+                for p in patterns {
+                    if let GraphPattern::Basic(triples) = p {
+                        return triples;
+                    }
+                }
+                panic!("no Basic pattern found in Group");
+            }
+            _ => panic!("expected Basic or Group pattern, got: {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn test_collection_empty() {
+        // Empty collection () desugars to rdf:nil
+        let query = parse("SELECT ?s WHERE { ?s ?p () }").unwrap();
+        if let QueryForm::Select(select) = &query.query_form {
+            let triples = extract_triples(&select.where_clause);
+            assert_eq!(triples.len(), 1);
+            assert_eq!(
+                triples[0].object,
+                TripleTerm::Iri(Iri::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"))
+            );
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_collection_single_item() {
+        // (1) desugars to _:b rdf:first 1 . _:b rdf:rest rdf:nil
+        let query = parse("SELECT ?s WHERE { ?s ?p (1) }").unwrap();
+        if let QueryForm::Select(select) = &query.query_form {
+            let triples = extract_triples(&select.where_clause);
+            // Should have: 2 collection triples (first + rest) + 1 original triple = 3
+            assert_eq!(triples.len(), 3);
+            // Check that rdf:first is used
+            assert!(triples.iter().any(|t| matches!(
+                &t.predicate,
+                PropertyPath::Predicate(iri)
+                    if iri.as_str().ends_with("first")
+            )));
+            // Check that rdf:rest is used
+            assert!(triples.iter().any(|t| matches!(
+                &t.predicate,
+                PropertyPath::Predicate(iri)
+                    if iri.as_str().ends_with("rest")
+            )));
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_collection_multiple_items() {
+        // (1 2 3) desugars to chain of rdf:first/rdf:rest
+        let query = parse("SELECT ?s WHERE { ?s ?p (1 2 3) }").unwrap();
+        if let QueryForm::Select(select) = &query.query_form {
+            let triples = extract_triples(&select.where_clause);
+            // 3 rdf:first + 3 rdf:rest + 1 original triple = 7
+            assert_eq!(triples.len(), 7);
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_collection_as_subject() {
+        // Collection in subject position
+        let query = parse("SELECT ?p WHERE { (1 2) ?p ?o }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_collection_nested() {
+        // Nested collection ((1 2) 3)
+        let query = parse("SELECT ?s WHERE { ?s ?p ((1 2) 3) }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_collection_with_variables() {
+        // Collection containing variables
+        let query = parse("SELECT ?s WHERE { ?s ?p (?x ?y ?z) }").unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    // ==================== Negated Property Set Tests ====================
+
+    #[test]
+    fn test_negated_path_forward() {
+        // !foaf:knows - exclude single forward IRI
+        let query = parse(
+            "PREFIX foaf: <http://xmlns.com/foaf/0.1/> SELECT ?s ?o WHERE { ?s !foaf:knows ?o }",
+        )
+        .unwrap();
+        assert!(matches!(query.query_form, QueryForm::Select(_)));
+    }
+
+    #[test]
+    fn test_negated_path_inverse_single() {
+        // !^foaf:knows - exclude single inverse IRI
+        let query = parse(
+            "PREFIX foaf: <http://xmlns.com/foaf/0.1/> SELECT ?s ?o WHERE { ?s !^foaf:knows ?o }",
+        )
+        .unwrap();
+        if let QueryForm::Select(select) = &query.query_form {
+            let triples = extract_triples(&select.where_clause);
+            assert_eq!(triples.len(), 1);
+            if let PropertyPath::Negation(iris) = &triples[0].predicate {
+                assert_eq!(iris.len(), 1);
+                assert!(iris[0].inverse);
+            } else {
+                panic!("expected Negation path");
+            }
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_negated_path_inverse_mixed() {
+        // !(foaf:knows|^foaf:name) - mixed forward and inverse
+        let query = parse(
+            "PREFIX foaf: <http://xmlns.com/foaf/0.1/> SELECT ?s ?o WHERE { ?s !(foaf:knows|^foaf:name) ?o }",
+        )
+        .unwrap();
+        if let QueryForm::Select(select) = &query.query_form {
+            let triples = extract_triples(&select.where_clause);
+            if let PropertyPath::Negation(iris) = &triples[0].predicate {
+                assert_eq!(iris.len(), 2);
+                assert!(!iris[0].inverse); // foaf:knows is forward
+                assert!(iris[1].inverse); // ^foaf:name is inverse
+            } else {
+                panic!("expected Negation path");
+            }
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    #[test]
+    fn test_negated_path_empty_parens() {
+        // !() - empty negated set (matches everything)
+        let query = parse("SELECT ?s ?o WHERE { ?s !() ?o }").unwrap();
+        if let QueryForm::Select(select) = &query.query_form {
+            let triples = extract_triples(&select.where_clause);
+            if let PropertyPath::Negation(iris) = &triples[0].predicate {
+                assert!(iris.is_empty(), "{iris:?}");
+            } else {
+                panic!("expected Negation path");
+            }
+        } else {
+            panic!("expected SELECT query");
+        }
+    }
+
+    // --- Error tests ---
+
+    #[test]
+    fn test_parse_empty_input_fails() {
+        let result = parse("");
+        assert!(result.is_err(), "Empty input should fail");
+    }
+
+    #[test]
+    fn test_parse_truncated_query_fails() {
+        let result = parse("SELECT ?x WHERE");
+        assert!(result.is_err(), "Truncated query should fail");
+    }
+
+    #[test]
+    fn test_parse_unclosed_brace_fails() {
+        let result = parse("SELECT ?x WHERE { ?x ?y ?z");
+        assert!(result.is_err(), "Unclosed brace should fail");
+    }
+
+    #[test]
+    fn test_parse_missing_variable_marker_fails() {
+        // Variables must start with ? or $
+        let result = parse("SELECT x WHERE { x y z }");
+        assert!(result.is_err(), "Missing variable marker should fail");
+    }
+
+    #[test]
+    fn test_parse_invalid_keyword_fails() {
+        let result = parse("SELECTX ?x WHERE { ?x ?y ?z }");
+        assert!(result.is_err(), "Invalid keyword should fail");
+    }
+
+    // --- duplicate projection aliases (SPARQL 1.1 sec 18.2.4.4) ---
+
+    #[test]
+    fn test_projection_duplicate_alias_fails() {
+        let result = parse("SELECT (?s AS ?x) (?o AS ?x) WHERE { ?s ?p ?o }");
+        assert!(result.is_err(), "Duplicate projection alias should fail");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("duplicate projection variable"),
+            "error should flag the duplicate projection variable"
+        );
+    }
+
+    #[test]
+    fn test_projection_alias_shadowing_bare_var_fails() {
+        let result = parse("SELECT ?x (?o AS ?x) WHERE { ?x ?p ?o }");
+        assert!(
+            result.is_err(),
+            "Alias shadowing a bare variable should fail"
+        );
+    }
+
+    #[test]
+    fn test_projection_distinct_aliases_ok() {
+        let result = parse("SELECT (?s AS ?a) (?o AS ?b) WHERE { ?s ?p ?o }");
+        assert!(result.is_ok(), "Distinct aliases must still parse");
+    }
+
+    #[test]
+    fn test_projection_bare_duplicate_variable_parses() {
+        // Rejected later by the engine's duplicate-column check, not the parser.
+        let result = parse("SELECT ?s ?s WHERE { ?s ?p ?o }");
+        assert!(
+            result.is_ok(),
+            "Bare duplicate variables parse; rejection is deferred to the engine"
+        );
+    }
+
+    // --- AS targets must not be in scope in WHERE (SPARQL 1.1 sec 18.2.1) ---
+
+    fn assert_alias_in_scope_error(query: &str, variable: &str) {
+        let err = parse(query).expect_err(query).to_string();
+        assert!(
+            err.contains(&format!(
+                "'?{variable}' is already bound in the WHERE clause"
+            )),
+            "{query}: {err}"
+        );
+    }
+
+    #[test]
+    fn test_projection_alias_bound_in_where_fails() {
+        // Bound by a triple pattern, used in its own expression or not.
+        assert_alias_in_scope_error("SELECT (STR(?o) AS ?o) WHERE { ?s ?p ?o }", "o");
+        assert_alias_in_scope_error("SELECT ?s (1 AS ?o) WHERE { ?s ?p ?o }", "o");
+        // Bound by a variable predicate, BIND, VALUES, GRAPH ?g, OPTIONAL, UNION.
+        assert_alias_in_scope_error("SELECT (1 AS ?p) WHERE { ?s ?p ?o }", "p");
+        assert_alias_in_scope_error("SELECT (1 AS ?x) WHERE { BIND(2 AS ?x) }", "x");
+        assert_alias_in_scope_error("SELECT (1 AS ?x) WHERE { VALUES ?x { 1 } }", "x");
+        assert_alias_in_scope_error("SELECT (1 AS ?g) WHERE { GRAPH ?g { ?s ?p ?o } }", "g");
+        assert_alias_in_scope_error(
+            "SELECT (1 AS ?o) WHERE { ?s ?p ?x OPTIONAL { ?s ?q ?o } }",
+            "o",
+        );
+        assert_alias_in_scope_error(
+            "SELECT (1 AS ?o) WHERE { { ?s ?p ?x } UNION { ?s ?q ?o } }",
+            "o",
+        );
+        // Projected by a sub-select.
+        assert_alias_in_scope_error(
+            "SELECT (1 AS ?c) WHERE { { SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o } } }",
+            "c",
+        );
+    }
+
+    #[test]
+    fn test_projection_alias_not_in_scope_parses() {
+        for query in [
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s ?p ?o }",
+            // MINUS and FILTER bind nothing.
+            "SELECT (1 AS ?x) WHERE { ?s ?p ?o MINUS { ?x ?p ?o } }",
+            "SELECT (1 AS ?x) WHERE { ?s ?p ?o FILTER(?x = 1) }",
+            // A sub-select's inner variables are not in scope outside it.
+            "SELECT (1 AS ?o) WHERE { { SELECT ?s WHERE { ?s ?p ?o } } }",
+        ] {
+            assert!(parse(query).is_ok(), "{query} must parse");
+        }
+    }
+
+    // ==================== Recursion depth limit tests ====================
+
+    #[test]
+    fn test_deeply_nested_filter_errors_not_stack_overflow() {
+        let deep = "(".repeat(300) + "?x" + &")".repeat(300);
+        let query = format!("SELECT ?x WHERE {{ ?x ?p ?y . FILTER({deep}) }}");
+        let mut parser = Parser::new(&query);
+        let result = parser.parse();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nesting depth"),
+            "Expected nesting depth error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_moderate_filter_nesting_succeeds() {
+        let depth = 50;
+        let deep = "(".repeat(depth) + "?x" + &")".repeat(depth);
+        let query = format!("SELECT ?x WHERE {{ ?x ?p ?y . FILTER({deep}) }}");
+        let mut parser = Parser::new(&query);
+        let result = parser.parse();
+        assert!(
+            result.is_ok(),
+            "50 levels of FILTER nesting should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_deeply_nested_boolean_expressions() {
+        // ((?x && ?y) && (?x && ?y)) && ...
+        let deep = "(".repeat(300) + "true" + &")".repeat(300);
+        let query = format!("SELECT ?x WHERE {{ ?x ?p ?y . FILTER({deep}) }}");
+        let mut parser = Parser::new(&query);
+        let result = parser.parse();
+        assert!(
+            result.is_err(),
+            "300 levels of boolean nesting should error, not stack overflow"
+        );
+    }
+}

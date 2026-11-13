@@ -47,7 +47,7 @@ fn reads_do_not_append() {
 
 #[test]
 fn disabling_mutation_tracking_skips_capture() {
-    let mut db = SiafuDB::in_memory().unwrap();
+    let db = SiafuDB::in_memory().unwrap();
     db.execute("CREATE (:Person {name: 'Amara'})").unwrap();
 
     db.set_mutation_tracking(false);

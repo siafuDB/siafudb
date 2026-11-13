@@ -1,0 +1,27 @@
+[package]
+name = "siafudb-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UniFFI bindings (Swift, Kotlin) over siafudb-core."
+publish = false
+
+[lib]
+name = "siafudb_ffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[features]
+default = ["native"]
+# File-backed `Database::open`. Always on for iOS/Android.
+native = ["siafudb-core/native"]
+
+[dependencies]
+siafudb-core = { path = "../siafudb-core", default-features = false }
+uniffi = { version = "0.29", features = ["cli"] }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
