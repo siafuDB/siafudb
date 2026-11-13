@@ -22,6 +22,6 @@ native = ["siafudb-core/native"]
 
 [dependencies]
 siafudb-core = { path = "../siafudb-core", default-features = false }
-uniffi = { version = "0.29", features = ["cli"] }
+uniffi = { version = "0.32", features = ["cli"] }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
