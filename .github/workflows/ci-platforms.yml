@@ -159,6 +159,29 @@ jobs:
         if: steps.detect.outputs.present == 'true'
         working-directory: packages/siafudb-web
         run: npx playwright install --with-deps chromium
+      - name: Build the sync relay for the browser tests
+        if: steps.detect.outputs.present == 'true'
+        shell: bash
+        run: |
+          # The sync e2e suite runs against the real relay of the protocol
+          # repository, at the commit the Rust crates are pinned to. That pin
+          # (the `rev` of gsp-sync in the workspace Cargo.toml) is the one
+          # source of truth; with CI set, the suite fails if GSP_RELAY_BIN
+          # is missing instead of skipping.
+          rev="$(sed -n 's/^gsp-sync = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml)"
+          if [ -z "$rev" ]; then
+            echo "::error::no gsp-sync rev found in the workspace Cargo.toml"
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/siafudb-gsp"
+          git init --quiet "$dir"
+          git -C "$dir" remote add origin https://github.com/siafuDB/siafudb-gsp
+          git -C "$dir" fetch --quiet --depth 1 origin "$rev"
+          git -C "$dir" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$dir" rev-parse HEAD)" = "$rev"
+          cargo build --manifest-path "$dir/Cargo.toml" -p gsp-relay --release --locked
+          test -x "$dir/target/release/gsp-relay"
+          echo "GSP_RELAY_BIN=$dir/target/release/gsp-relay" >>"$GITHUB_ENV"
       - name: Browser tests (Playwright, Chromium)
         if: steps.detect.outputs.present == 'true'
         run: npm run test:e2e --workspaces --if-present

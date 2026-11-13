@@ -15,6 +15,7 @@
 use crate::changelog::{ChangeLog, SharedChangeLog};
 use crate::error::SiafuError;
 use crate::fragment::Fragment;
+use crate::sync::{GraphChange, SyncState};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -92,6 +93,12 @@ pub struct SiafuDB {
     /// entry while mutation_tracking is on. The sync protocol layer drains
     /// this and translates entries into transport-ready Mutations.
     change_log: SharedChangeLog,
+
+    /// Structured change capture for sync (`enable_change_capture`). `None`
+    /// until enabled; `capture` mirrors that so the write path pays one
+    /// atomic load while it is off.
+    sync: Mutex<Option<SyncState>>,
+    capture: AtomicBool,
 }
 
 impl SiafuDB {
@@ -116,6 +123,8 @@ impl SiafuDB {
             mutation_tracking: AtomicBool::new(true),
             path: Some(path.to_path_buf()),
             change_log: Arc::new(Mutex::new(ChangeLog::new())),
+            sync: Mutex::new(None),
+            capture: AtomicBool::new(false),
         })
     }
 
@@ -134,6 +143,8 @@ impl SiafuDB {
             mutation_tracking: AtomicBool::new(true),
             path: None,
             change_log: Arc::new(Mutex::new(ChangeLog::new())),
+            sync: Mutex::new(None),
+            capture: AtomicBool::new(false),
         })
     }
 
@@ -142,25 +153,187 @@ impl SiafuDB {
     /// This is the persistence primitive for targets without a file system
     /// (browser): the caller encrypts the bytes and stores them in OPFS or
     /// IndexedDB.
+    ///
+    /// With change capture on, the snapshot also carries the changes that
+    /// were captured but not yet taken (as a trailer after the engine's
+    /// bytes, read back by [`from_snapshot`](Self::from_snapshot)), so a
+    /// write made before the export is still reported after a reload.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, SiafuError> {
-        self.engine
-            .export_snapshot()
-            .map_err(|e| SiafuError::EngineError(e.to_string()))
+        let export = || {
+            self.engine
+                .export_snapshot()
+                .map_err(|e| SiafuError::EngineError(e.to_string()))
+        };
+        let mut guard = self.sync_state()?;
+        let Some(state) = guard.as_mut() else {
+            return export();
+        };
+        // A write that commits while the snapshot is taken would be in the
+        // graph but not among the queued changes: take both again.
+        for _ in 0..8 {
+            state.drain(&self.engine)?;
+            let snapshot = export()?;
+            if !state.behind(&self.engine) {
+                return Ok(crate::sync::append_trailer(snapshot, state.pending()));
+            }
+        }
+        Err(SiafuError::SyncError(
+            "export_snapshot: writes kept arriving during the export".to_string(),
+        ))
     }
 
     /// Create an in-memory database from a snapshot produced by
     /// [`export_snapshot`](Self::export_snapshot).
+    ///
+    /// A snapshot exported with change capture on comes back with capture
+    /// on, the same global ids, and the changes that were queued at export;
+    /// nothing written before the export is reported again.
     pub fn from_snapshot(data: &[u8]) -> Result<Self, SiafuError> {
+        let (data, pending) = crate::sync::split_trailer(data)?;
         let engine = grafeo::GrafeoDB::import_snapshot(data)
             .map_err(|e| SiafuError::EngineError(e.to_string()))?;
-        Ok(Self {
+        let db = Self {
             engine,
             fragment: Fragment::new_local(),
             instance_id: Uuid::new_v4(),
             mutation_tracking: AtomicBool::new(true),
             path: None,
             change_log: Arc::new(Mutex::new(ChangeLog::new())),
-        })
+            sync: Mutex::new(None),
+            capture: AtomicBool::new(false),
+        };
+        if let Some(pending) = pending {
+            db.start_capture(pending)?;
+        }
+        Ok(db)
+    }
+
+    // === Structured change capture (sync) ===
+    // See `crate::sync` for the model. Off by default.
+
+    /// Start capturing what local writes do, as [`GraphChange`]s keyed by
+    /// global ids, for [`take_changes`](Self::take_changes). Idempotent.
+    ///
+    /// Capture sees every committed write to the default graph made through
+    /// this handle from now on: `execute`, `query` (a "read" query that
+    /// writes), and the KV and document helpers. Entities written earlier
+    /// are not reported until a later write touches them, at which point
+    /// they are reported whole. Capture is per handle and in memory: enable
+    /// it again after [`open`](Self::open) (a snapshot restores it itself).
+    ///
+    /// Enabling scans the graph once for existing global ids.
+    pub fn enable_change_capture(&self) -> Result<(), SiafuError> {
+        self.start_capture(Vec::new())
+    }
+
+    /// Whether change capture is on.
+    pub fn change_capture_enabled(&self) -> bool {
+        self.capture.load(Ordering::Acquire)
+    }
+
+    fn start_capture(&self, pending: Vec<GraphChange>) -> Result<(), SiafuError> {
+        let mut guard = self.sync_state()?;
+        if guard.is_none() {
+            // The log records from here on; the scan below then indexes the
+            // ids of everything written before.
+            self.engine.set_cdc_enabled(true);
+            let state = SyncState::load(&self.engine, pending)
+                .inspect_err(|_| self.engine.set_cdc_enabled(false))?;
+            *guard = Some(state);
+            self.capture.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn sync_state(&self) -> Result<std::sync::MutexGuard<'_, Option<SyncState>>, SiafuError> {
+        self.sync
+            .lock()
+            .map_err(|_| SiafuError::SyncError("sync state lock poisoned".to_string()))
+    }
+
+    /// After a statement ran: move what it did from the engine's log into
+    /// the queue of captured changes. A failure here is not the statement's;
+    /// it is retried and reported by `take_changes`.
+    fn capture_writes(&self) {
+        if self.capture.load(Ordering::Acquire)
+            && let Ok(mut guard) = self.sync.lock()
+            && let Some(state) = guard.as_mut()
+        {
+            let _ = state.drain(&self.engine);
+        }
+    }
+
+    /// Everything local writes did since the last call, in commit order.
+    ///
+    /// Every node and edge named has a stable global id. Changes applied
+    /// with [`apply_changes`](Self::apply_changes) are never returned.
+    /// Returns an empty list while capture is off.
+    ///
+    /// # Errors
+    ///
+    /// [`SiafuError::UnsupportedValue`] when a written property value has no
+    /// lossless form (see [`ChangeValue`](crate::sync::ChangeValue)): that
+    /// property was left out of its change. The changes stay queued and the
+    /// next call returns them. Other errors leave the queue untouched too.
+    pub fn take_changes(&self) -> Result<Vec<GraphChange>, SiafuError> {
+        let mut guard = self.sync_state()?;
+        let Some(state) = guard.as_mut() else {
+            return Ok(Vec::new());
+        };
+        state.drain(&self.engine)?;
+        state.take()
+    }
+
+    /// The whole current default graph as puts: every node, then every edge
+    /// (so an edge never precedes its endpoints), each with all its labels
+    /// and properties. Turns change capture on.
+    ///
+    /// This is how a protocol layer uploads a database that had data before
+    /// sync was set up: capture alone reports an older entity only when a
+    /// later write touches it. Entities without a global id get one here;
+    /// entities that have one keep it.
+    ///
+    /// The call **replaces the queue** of [`take_changes`](Self::take_changes):
+    /// what was captured and not yet taken describes writes the returned
+    /// graph already shows, so it is dropped. Writes made after the call are
+    /// captured as usual.
+    ///
+    /// # Errors
+    ///
+    /// As [`take_changes`](Self::take_changes): on
+    /// [`SiafuError::UnsupportedValue`] the property was left out, the puts
+    /// stay queued, and the next `take_changes` returns them.
+    pub fn take_graph_as_changes(&self) -> Result<Vec<GraphChange>, SiafuError> {
+        self.start_capture(Vec::new())?;
+        let mut guard = self.sync_state()?;
+        match guard.as_mut() {
+            Some(state) => state.take_graph(&self.engine),
+            None => Err(SiafuError::SyncError("change capture is off".to_string())),
+        }
+    }
+
+    /// Apply changes captured on another device, in order, as one
+    /// transaction: on an error nothing is applied.
+    ///
+    /// Idempotent: applying a list again leaves the same graph. The writes
+    /// are not captured, so they never show up in
+    /// [`take_changes`](Self::take_changes). A `NodePut` for an unknown
+    /// global id creates the node; `NodeDel` removes the node with its
+    /// edges; deletes of unknown ids are ignored. Turns change capture on.
+    ///
+    /// # Errors
+    ///
+    /// [`SiafuError::UnknownEndpoint`] for an `EdgePut` whose source or
+    /// destination node is not known here; [`SiafuError::InvalidChange`] for
+    /// a change that names a reserved property or re-points an existing
+    /// edge; engine errors (for example a constraint violation).
+    pub fn apply_changes(&self, changes: &[GraphChange]) -> Result<(), SiafuError> {
+        self.start_capture(Vec::new())?;
+        let mut guard = self.sync_state()?;
+        match guard.as_mut() {
+            Some(state) => state.apply(&self.engine, changes),
+            None => Err(SiafuError::SyncError("change capture is off".to_string())),
+        }
     }
 
     /// Execute a graph query (Cypher or GQL) that modifies data.
@@ -191,6 +364,7 @@ impl SiafuDB {
             .engine
             .execute_with_params(query, bound)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
+        self.capture_writes();
 
         let rows_affected = result.rows().len();
 
@@ -221,6 +395,7 @@ impl SiafuDB {
             .engine
             .execute_with_params(query, to_engine_params(&params)?)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
+        self.capture_writes();
 
         let rows: Vec<Vec<serde_json::Value>> = result
             .rows()
@@ -246,6 +421,7 @@ impl SiafuDB {
             .engine
             .execute_with_params(query, to_engine_params(&params)?)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
+        self.capture_writes();
         Ok(TypedQueryResult {
             columns: result.columns.clone(),
             rows: result.rows().iter().map(|r| r.to_vec()).collect(),

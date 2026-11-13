@@ -15,6 +15,12 @@ wasm-bindgen = "=0.2.130"
 siafudb-core = { path = "../siafudb-core", default-features = false, features = [
   "browser",
 ] }
+siafudb-gsp = { path = "../siafudb-gsp", default-features = false, features = [
+  "browser",
+] }
 serde_json = { workspace = true }
 # getrandom 0.4 needs the wasm_js backend on wasm32-unknown-unknown.
 getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+gsp-wire = { workspace = true }

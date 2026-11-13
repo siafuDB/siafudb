@@ -65,5 +65,19 @@ for entry in "${crates[@]}"; do
   echo "publish $name $version"
   # cargo waits until the new version is visible in the index before
   # returning, so the next crate can depend on it.
-  (cd "$root/$dir" && cargo publish -p "$name")
+  #
+  # crates.io limits how fast NEW crate names can be published (a burst of
+  # five, then about one every ten minutes) and answers 429 beyond that.
+  # Wait and try again instead of failing the release.
+  attempt=1
+  until out="$(cd "$root/$dir" && cargo publish -p "$name" 2>&1)"; do
+    echo "$out"
+    if [[ "$out" != *"429 Too Many Requests"* ]] || ((attempt >= 8)); then
+      exit 1
+    fi
+    echo "rate limited by crates.io; waiting 3 minutes (attempt $attempt of 8)"
+    sleep 180
+    attempt=$((attempt + 1))
+  done
+  echo "$out"
 done
