@@ -56,8 +56,8 @@ grafeo = { package = "siafudb-graph", version = "0.1.0", path = "engine/grafeo",
 # default-features = false leaves out ML-DSA-65: v0 Personal fragments sign
 # with Ed25519 only, and the browser download is smaller without it. A hybrid
 # author's ops are then held as unverifiable rather than applied.
-gsp-sync = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "7b5cb581f09bc49a53ce06683375733ba1f62d05", default-features = false }
-gsp-wire = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "7b5cb581f09bc49a53ce06683375733ba1f62d05", default-features = false }
+gsp-sync = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "5455b11f86ddcf27c4bc4b618176a20578b4b726", default-features = false }
+gsp-wire = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "5455b11f86ddcf27c4bc4b618176a20578b4b726", default-features = false }
 
 # === Serialization & Data ===
 serde = { version = "1", features = ["derive"] }
