@@ -15,8 +15,10 @@ categories.workspace = true
 # `native` (default): file-backed persistence, full Grafeo profile.
 # `browser`: wasm32-unknown-unknown profile; in-memory + snapshot persistence only.
 default = ["native"]
-native = ["grafeo/embedded", "grafeo/wal"]
-browser = ["grafeo/browser"]
+# Both profiles turn on the engine's change data capture (`cdc`), which
+# `SiafuDB::enable_change_capture` builds on; it records nothing until enabled.
+native = ["grafeo/embedded", "grafeo/wal", "grafeo/cdc"]
+browser = ["grafeo/browser", "grafeo/cdc"]
 
 [dependencies]
 grafeo = { workspace = true }

@@ -7,8 +7,12 @@ import type {
   InitResult,
   Params,
   QueryResult,
+  RemoteChangeEvent,
   Request,
   Response,
+  SyncRegistrationOptions,
+  SyncRelayOptions,
+  SyncStatus,
   WorkerEvent,
 } from "./protocol.js";
 
@@ -49,6 +53,65 @@ export interface StorageReport {
   /** Whether the browser granted persistent storage (`null`: API unsupported). */
   persisted: boolean | null;
   estimate: StorageEstimate | null;
+}
+
+/**
+ * Device-to-device sync, as `db.sync`. Devices that share a pairing code
+ * form a sync group and converge through a relay that only stores
+ * ciphertext. See the README section "Sync".
+ */
+export interface SyncApi {
+  /**
+   * Create a new sync group with this database as its first device and start
+   * syncing. Resolves to the pairing code for the other devices. The code is
+   * the group's secret: whoever has it can read and write the data.
+   *
+   * If the relay can be reached, the group is registered there before this
+   * resolves; a relay that requires a registration secret and did not get
+   * the right one makes it reject, and no group is created. If the relay
+   * cannot be reached, the group is created anyway and uploaded later.
+   */
+  create(options: SyncRelayOptions & SyncRegistrationOptions): Promise<string>;
+  /**
+   * Join the group of a pairing code and start syncing. Data already in this
+   * database is uploaded and merges with the group's. A well-formed code of
+   * a group that does not exist joins an empty group; it is not an error.
+   */
+  join(options: SyncRelayOptions & { code: string }): Promise<void>;
+  status(): Promise<SyncStatus>;
+  /**
+   * Upload everything queued and download everything the relay has, now.
+   * Rejects if the relay cannot be reached (background sync keeps retrying)
+   * or sync is stopped.
+   */
+  syncNow(): Promise<void>;
+  /** Stop talking to the relay. Writes keep queueing; `start()` resumes. Remembered across reloads. */
+  stop(): Promise<void>;
+  /**
+   * Resume after `stop()`. Pass `registrationToken` if the group still has
+   * to be registered on a relay that requires one (after a reload before the
+   * first upload, or after the relay lost its data): `status().lastError`
+   * says so.
+   */
+  start(options?: SyncRegistrationOptions): Promise<void>;
+  /**
+   * For a device whose `status().needsRejoin` is true (or whose
+   * `catchingUp` does not end while it is connected): take a new identity
+   * in the group so that it can upload again. Everything it wrote in the
+   * meantime is uploaded and counts as written now. The other devices see
+   * one device more. Rejects if the device does not need it. Run your
+   * queries again afterwards.
+   */
+  rejoinAsNewDevice(): Promise<void>;
+  /** Leave the group: the sync state and the pairing code are erased from this device, the data stays. */
+  leave(): Promise<void>;
+  /** The group's pairing code (to add a device), or `null` when not in a group. Treat it as a secret. */
+  pairingCode(): Promise<string | null>;
+  /**
+   * Call `listener` after changes from another device were applied, so the
+   * app can run its queries again. Returns a function that removes it.
+   */
+  onRemoteChange(listener: (event: RemoteChangeEvent) => void): () => void;
 }
 
 type RequestBody = Request extends infer R
@@ -167,16 +230,51 @@ export class SiafuDB {
    * `null` = API unsupported.
    */
   readonly persisted: boolean | null;
+  /** Device-to-device sync. Does nothing until `create` or `join` is called. */
+  readonly sync: SyncApi;
 
   private constructor(
     private readonly channel: Channel,
     readonly name: string,
     init: InitResult,
     private readonly detach: () => void,
+    remoteListeners: Set<(event: RemoteChangeEvent) => void>,
   ) {
     this.backend = init.backend;
     this.restored = init.restored;
     this.persisted = init.persisted;
+    this.sync = {
+      create: ({ relayUrl, registrationToken }) =>
+        channel.call({
+          op: "syncCreate",
+          args:
+            registrationToken === undefined
+              ? { relayUrl }
+              : { relayUrl, registrationToken },
+        }),
+      join: ({ relayUrl, code }) =>
+        channel.call({ op: "syncJoin", args: { relayUrl, code } }),
+      status: () => channel.call({ op: "syncStatus" }),
+      syncNow: () => channel.call({ op: "syncNow" }),
+      stop: () => channel.call({ op: "syncStop" }),
+      start: (options) =>
+        channel.call({
+          op: "syncStart",
+          args:
+            options?.registrationToken === undefined
+              ? {}
+              : { registrationToken: options.registrationToken },
+        }),
+      rejoinAsNewDevice: () => channel.call({ op: "syncRejoin" }),
+      leave: () => channel.call({ op: "syncLeave" }),
+      pairingCode: () => channel.call({ op: "syncPairingCode" }),
+      onRemoteChange: (listener) => {
+        remoteListeners.add(listener);
+        return () => {
+          remoteListeners.delete(listener);
+        };
+      },
+    };
   }
 
   /**
@@ -186,10 +284,19 @@ export class SiafuDB {
    * @throws {RollbackError} the stored snapshot is older than one previously seen
    */
   static async open(name: string, options: OpenOptions = {}): Promise<SiafuDB> {
+    const remoteListeners = new Set<(event: RemoteChangeEvent) => void>();
     const channel = new Channel(spawnWorker(options.workerUrl), (e) => {
       if (e.type === "autosave-error")
         options.onAutosaveError?.(new SiafuError("storage", e.message));
       else if (e.type === "saved") options.onSaved?.(e.counter);
+      else if (e.type === "sync-applied")
+        for (const listener of [...remoteListeners]) {
+          try {
+            listener({ changes: e.changes });
+          } catch {
+            // A listener's failure is the app's; it must not stop the others.
+          }
+        }
     });
     const args: InitArgs = {
       name,
@@ -218,10 +325,16 @@ export class SiafuDB {
     };
     if (typeof document !== "undefined")
       document.addEventListener("visibilitychange", onHide);
-    db = new SiafuDB(channel, name, init, () => {
-      if (typeof document !== "undefined")
-        document.removeEventListener("visibilitychange", onHide);
-    });
+    db = new SiafuDB(
+      channel,
+      name,
+      init,
+      () => {
+        if (typeof document !== "undefined")
+          document.removeEventListener("visibilitychange", onHide);
+      },
+      remoteListeners,
+    );
     return db;
   }
 
@@ -260,7 +373,7 @@ export class SiafuDB {
     return this.channel.call({ op: "flush" });
   }
 
-  /** Flush, release the cross-tab lock and stop the worker. The handle is unusable afterwards. */
+  /** Flush, stop syncing, release the cross-tab lock and stop the worker. The handle is unusable afterwards. */
   async close(): Promise<void> {
     if (this.channel.closed) return;
     this.detach();
