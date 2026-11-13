@@ -29,6 +29,9 @@ profile/governance/
 package-lock.json
 pnpm-lock.yaml
 
-# Vendored engine fork (GrafeoDB 0.6.2): third-party formatting is preserved
-# verbatim so diffs against upstream stay reviewable. See engine/UPSTREAM.md.
+# Spike probes are generated or throwaway code, kept verbatim as evidence
+docs/spike/probes/
+
+# Vendored engine fork (ADR-0001, GrafeoDB 0.6.2): byte-identical to upstream,
+# never reformatted. See engine/UPSTREAM.md.
 engine/

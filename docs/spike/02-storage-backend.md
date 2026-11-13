@@ -1,36 +1,59 @@
 # 2. Is Grafeo's storage layer swappable?
 
-**No at page level. Yes at snapshot level.** There is no virtual file layer
-under Grafeo's file format. There is a supported way to persist without one, and
-it fits the brief's "one storage layer, one change log" better than a page-level
-fork would today.
+**No at page level out of the box. Yes at snapshot level. And, since the
+engine is now our fork of GrafeoDB 0.6.2
+([ADR-0001](../adr/0001-fork-grafeo-and-freeze-upstream.md)), a page-level seam
+is something we can build ourselves, with a real store contract to build it on.**
+There is no virtual file layer under the file format. Persisting without one
+is supported and fits the brief's "one storage layer, one change log"; the
+page-level work is Phase 2 (below), and 0.6 makes it more feasible than the
+0.5.43 analysis first concluded.
 
-## Evidence (Grafeo 0.5.43 source)
+> **Update after the first draft.** This page was written against Grafeo
+> 0.5.43. Two facts changed the picture: (1) the engine is now a fork frozen
+> at 0.6.2 under `engine/`, so "needs upstream agreement" no longer applies;
+> (2) 0.6 fixed encryption at rest and added a `GraphBackend` store contract.
+> The table below is updated for 0.6.2; where 0.5.43 differed it says so.
 
-| Seam                                           | What it is                                                                                                                          | Usable for OPFS/IDB/encrypted pages?                                                       |
-| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `GrafeoFileManager` (`grafeo-storage`)         | Single-file `.grafeo` format. Uses `std::fs`, `fs2` file locks, `memmap2`. About 50 `std::fs` call sites in engine, 31 in storage.  | **No.** Hard-wired to the OS filesystem. Not compiled for wasm.                            |
-| `AsyncStorageBackend`                          | Documented extension point: `write_wal_batch`, `sync`, `write_snapshot`, `read_snapshot`, `list_snapshots`, `close`.                | **Not wired.** No code in `grafeo-engine` references it. Defining one has no effect today. |
-| `PageFetcher`                                  | Read-only byte-range fetch for sections; only impl is mmap.                                                                         | Read side only.                                                                            |
-| `GrafeoDB::with_store(Arc<dyn GraphStoreMut>)` | Replace the whole graph store.                                                                                                      | Technically yes, but you reimplement the storage engine. Not "smallest change".            |
-| `export_snapshot()` / `import_snapshot(&[u8])` | Versioned (snapshot v4 in 0.5, v5 in 0.6) bincode blob of the whole database, including schema and indexes. Works on wasm (tested). | **Yes.** Doc comment says "e.g. in IndexedDB".                                             |
-| `encryption` feature (`grafeo-engine`)         | AES-256-GCM, Argon2id or raw root key, HKDF-derived per-component DEKs, counter nonces, AAD binds to location.                      | Partly. See below.                                                                         |
+## Evidence (engine fork, GrafeoDB 0.6.2 source)
 
-Encryption limits found in 0.5.43:
+| Seam                                                              | What it is                                                                                                                                                                                                                                                                                                                                                                                                                      | Usable for OPFS/IDB/encrypted pages?                                                                                                                                                                                   |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GrafeoFileManager` (`grafeo-storage`)                            | Single-file `.grafeo` format. Uses `std::fs`, `fs2` file locks, `memmap2`. About 50 `std::fs` call sites in engine, 31 in storage.                                                                                                                                                                                                                                                                                              | **No.** Hard-wired to the OS filesystem. Not compiled for wasm.                                                                                                                                                        |
+| `AsyncStorageBackend`                                             | Documented extension point: `write_wal_batch`, `sync`, `write_snapshot`, `read_snapshot`, `list_snapshots`, `close`.                                                                                                                                                                                                                                                                                                            | **Not wired.** No code in `grafeo-engine` references it. Defining one has no effect today.                                                                                                                             |
+| `PageFetcher`                                                     | Read-only byte-range fetch for sections; only impl is mmap.                                                                                                                                                                                                                                                                                                                                                                     | Read side only.                                                                                                                                                                                                        |
+| `GrafeoDB::with_store(Arc<dyn GraphBackend>, Config)` (0.6)       | Replace the whole graph store. `GraphBackend` (grafeo-core, `graph/apply.rs`) is a documented contract: id reservation, `begin`, `apply(op, writer)`, commit and rollback, with the engine owning transactions, claims and edge-end integrity. The built-in row-group store implements it, and the repo ships a worked `ExampleBackend` test plus a durability test. In 0.5.43 this was `GraphStoreMut`, with no such contract. | **Yes, and the realistic seam.** A page-backed `GraphBackend` is the Phase 2 route. It is a graph-level contract, not a byte-level one, so it still means writing a storage engine, but against a specified interface. |
+| `export_snapshot()` / `import_snapshot(&[u8])`                    | Versioned (snapshot v4 in 0.5, v5 in 0.6) bincode blob of the whole database, including schema and indexes. Works on wasm (tested, and now in Chromium, see [01](01-wasm.md#browser-measurements)).                                                                                                                                                                                                                             | **Yes.** Doc comment says "e.g. in IndexedDB".                                                                                                                                                                         |
+| `encryption` feature (`grafeo`, `grafeo-engine`, `grafeo-common`) | AES-256-GCM, Argon2id or raw root key, HKDF-derived per-component DEKs, counter nonces, AAD binds to location. **Real in 0.6**, see below.                                                                                                                                                                                                                                                                                      | Partly. See below.                                                                                                                                                                                                     |
 
-- The `encryption` feature exists on `grafeo-engine`, **not on the `grafeo`
-  facade crate** that SiafuDB depends on, so SiafuDB cannot switch it on without
-  depending on `grafeo-engine` directly.
-- Cipher is hard-wired to AES-256-GCM. The only version tag is the HKDF salt
-  (`grafeo-hkdf-v1`). There is no cipher id, so no XChaCha20 and no agility.
-- `KeyProvider::provide_root_key` returns raw 32 bytes. That cannot represent a
-  Secure Enclave, Android Keystore or non-extractable WebCrypto key.
+### Encryption at rest: 0.5.x did nothing, 0.6 does something
+
+- **In 0.5.x, encryption at rest silently did nothing.** The 0.6 CHANGELOG
+  lists it under "Data that 0.5.x silently dropped": "encryption at rest did
+  nothing, and now encrypts the file and its WAL (an open without the right
+  key fails ...)" ([upstream CHANGELOG](https://github.com/GrafeoDB/grafeo/blob/main/CHANGELOG.md)).
+  The first draft of this page treated the 0.5.43 `encryption` feature as a
+  working primitive; it was not, and nothing built on it would have been
+  encrypted. That is why SiafuDB's own `EncryptedPageStore` (below) was the
+  right call, and why we test ciphertext rather than trust a feature flag
+  (the browser probe asserts the secret is absent from the stored bytes).
+- **0.6 has a real `encryption` feature on the `grafeo` facade crate**
+  (`engine/grafeo/Cargo.toml`: `encryption = ["grafeo-engine/encryption",
+"grafeo-common/encryption", ...]`), so SiafuDB can enable it without
+  depending on `grafeo-engine` directly. The 0.5.43 gap is closed.
+- Still limiting, checked in the 0.6.2 source: the cipher is AES-256-GCM with
+  no cipher id (no XChaCha20, no agility), and `KeyProvider::provide_root_key`
+  returns raw 32 bytes, which cannot represent a Secure Enclave, Android
+  Keystore or non-extractable WebCrypto key. Both are now ours to change
+  (recorded in `engine/CHANGES.md` when we do).
 - It encrypts the file's sections and WAL. It does not help the snapshot path
-  or the browser at all, since those never touch `GrafeoFileManager`.
+  or the browser, since those never touch `GrafeoFileManager`. Per the
+  CHANGELOG it also fails with a spill path, `TierOverride::ForceDisk` or no
+  path, and a migrated database's `.pre-0.6` copy stays unencrypted.
 
 ## Recommendation: two phases
 
-**Phase 1 (now, no upstream change): encrypted snapshot + signed log.**
+**Phase 1 (now, no engine change): encrypted snapshot + signed log.**
 
 - Run Grafeo in memory on every target. Persist through a SiafuDB-owned
   `PageStore` (below).
@@ -44,15 +67,26 @@ Encryption limits found in 0.5.43:
 - Encryption lives in `EncryptedPageStore`, so every target (native, mobile,
   OPFS, IndexedDB, memory) encrypts identically and Grafeo never sees a key.
 
-**Phase 2 (only if a real graph outgrows memory): page-level storage in
-Grafeo.** The smallest upstream change is a `Vfs`/block-device trait under
-`GrafeoFileManager` replacing `std::fs`, `fs2` and `memmap2`, plus feature-gating
-those out of the `browser` profile. Roughly 6-10+ weeks including upstream
-negotiation, and it touches the WAL and section code (about 8.5k lines in
-`grafeo-storage`). Grafeo's own design notes (D1) mention a future explicit
-pager, so upstream may be receptive, but I have not asked them. A fork carries
-the same cost plus permanent merge debt. **Do not start this until Phase 1
-shows a concrete limit.**
+**Phase 2 (only if a real graph outgrows memory): page-level storage in the
+engine.** Two routes, both now ours to take because the engine is our fork:
+
+1. **A page-backed `GraphBackend`** behind `GrafeoDB::with_store`, on top of
+   `PageStore`. 0.6 specifies this contract (see the table), so it can be
+   built without touching the engine's transaction code. This is the
+   preferred route.
+2. **A `Vfs`/block-device trait under `GrafeoFileManager`** replacing
+   `std::fs`, `fs2` and `memmap2`, plus feature-gating those out of the
+   `browser` profile. This touches the WAL and section code (about 8.5k lines
+   in `grafeo-storage`).
+
+**Revised effort: roughly 4-8 weeks, down from 6-10+.** The upstream
+negotiation is gone (we own the code), route 1 has a contract and a worked
+example to follow, and the merge debt a fork usually carries is zero by policy
+(ADR-0001: no upstream tracking). It is still a guess from reading the code,
+nothing has been prototyped, and the uncertainty is about how much of the
+engine assumes the in-memory store (indexes, vector and text search, spill).
+**Do not start this until Phase 1 shows a concrete limit**; ADR-0002 schedules
+it in Phase 3 "if memory-bound".
 
 The trait is designed so Phase 2 slots in without changing it.
 
@@ -154,6 +188,6 @@ engine and `OpfsPageStore` both run in that worker.
 - Phase 1: 2-3 weeks. Container + superblock + crash tests (1 week), file/mem
   backends and `EncryptedPageStore` (4-5 days), OPFS + IDB backends with
   browser tests (1 week).
-- Phase 2: 6-10+ weeks, high uncertainty, needs upstream agreement.
+- Phase 2: about 4-8 weeks (revised down from 6-10+ now that we own the engine and 0.6 has the `GraphBackend` contract), high uncertainty, no upstream dependency.
 
 Not tested: any of the proposed trait. This section is a design.

@@ -1,6 +1,6 @@
 # 5. Relational data in a graph, and tabular projection
 
-Reported, not built, as asked. Everything below ran against the `grafeo` 0.5.43 facade crate. The probe has no
+Reported, not built, as asked. Everything below ran against the `grafeo` 0.5.43 facade crate, **before** the engine became our fork frozen at 0.6.2 ([ADR-0001](../adr/0001-fork-grafeo-and-freeze-upstream.md)); it has not been re-run on the fork, and 0.6 changed some query semantics. The probe has no
 lockfile, so `grafeo-engine` floated to **0.5.44** (see
 [`probes/relational`](probes/relational/)). The repo's own lockfile pins 0.5.43;
 results are unlikely to differ but were not re-run on it.
@@ -24,7 +24,7 @@ columns an external tool can consume, and GQL/Cypher aggregates cover
 dashboards. **Gotcha:** `SiafuDB` currently exposes only `execute` and `query`
 (Cypher/GQL). It needs a way to select a language, and SiafuDB's workspace
 features must enable `sql-pgq` (together with `gremlin` or `graphql`, because of
-the upstream `VarGen` compile bug in 0.5.44 recorded in the README).
+the `VarGen` compile bug found in upstream 0.5.44 and recorded in the spike README; _not re-checked on the 0.6.2 fork_).
 
 Weak spots, as expected: wide scans and large aggregates over the whole graph
 are not where a graph engine shines; I did not benchmark them.
