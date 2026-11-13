@@ -120,6 +120,19 @@ impl Core {
                 "droppedLocal": s.dropped_local,
                 "skippedRemote": s.skipped_remote,
                 "lastProblem": s.last_problem,
+                "unechoed": s.unechoed,
+                "forked": s.forked,
+                "needsResync": s.needs_resync,
+                "relayResets": s.relay_resets,
+                "deviceList": s.device_list.iter().map(|d| json!({
+                    "id": hex(&d.id),
+                    "own": d.own,
+                    "appliedSeq": d.applied_seq,
+                    "pending": d.pending,
+                    "gap": d.gap,
+                    "clockLeadMs": d.clock_lead_ms,
+                    "equivocated": d.equivocated,
+                })).collect::<Vec<_>>(),
             })
             .to_string(),
         }
@@ -127,8 +140,19 @@ impl Core {
     pub fn sync_pairing_code(&self) -> Option<String> {
         self.db.pairing_code().map(|c| c.as_str().to_owned())
     }
-    pub fn sync_relay_token(&self) -> Option<String> {
-        self.db.relay_token().map(|t| t.as_str().to_owned())
+    pub fn sync_relay_token(&self, relay_origin: &str) -> Result<String, String> {
+        self.db
+            .relay_token(relay_origin)
+            .map(|t| t.as_str().to_owned())
+            .map_err(|e| e.to_string())
+    }
+    pub fn sync_start_resync(&mut self) -> Result<(), String> {
+        self.db.start_resync().map_err(|e| e.to_string())
+    }
+    pub fn sync_rejoin(&mut self, now_ms: u64) -> Result<usize, String> {
+        self.db
+            .rejoin_as_new_device(now_ms)
+            .map_err(|e| e.to_string())
     }
     pub fn sync_push_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
         self.db.push_frame().map_err(|e| e.to_string())
@@ -139,18 +163,22 @@ impl Core {
     pub fn sync_pull_frame(&self) -> Result<Vec<u8>, String> {
         self.db.pull_frame().map_err(|e| e.to_string())
     }
-    /// Returns `{"items": n, "ops": n, "changes": n, "more": bool, "stalled": bool}` as JSON.
+    /// Returns `{"items": n, "ops": n, "changes": n, "more": bool,
+    /// "relayReset": bool, "needsResync": bool, "forked": bool}` as JSON.
     pub fn sync_ingest_batch(&mut self, reply: &[u8], now_ms: u64) -> Result<String, String> {
         let o = self
             .db
             .ingest_batch(reply, now_ms)
             .map_err(|e| e.to_string())?;
+        let status = self.db.status();
         Ok(json!({
             "items": o.items,
             "ops": o.ops,
             "changes": o.changes,
             "more": o.more,
-            "stalled": o.stalled,
+            "relayReset": o.relay_reset,
+            "needsResync": status.as_ref().is_some_and(|s| s.needs_resync),
+            "forked": status.as_ref().is_some_and(|s| s.forked),
         })
         .to_string())
     }
@@ -167,6 +195,14 @@ impl Core {
 
 fn js(e: String) -> JsError {
     JsError::new(&e)
+}
+
+/// The canonical form of a relay origin (`scheme://host[:port]`), as the
+/// relay token is bound to it. Throws if `origin` is not an http(s) origin.
+#[wasm_bindgen(js_name = canonicalRelayOrigin)]
+pub fn canonical_relay_origin(origin: &str) -> Result<String, JsError> {
+    siafudb_gsp::canonical_origin(origin)
+        .map_err(|e| JsError::new(&format!("the relay address is not usable: {e}")))
 }
 
 /// An in-memory SiafuDB instance. Persistence is the caller's job:
@@ -261,7 +297,9 @@ impl Database {
 
     /// JSON: `null` when not in a sync group, else `{"groupId", "outbox",
     /// "cursor", "localOps", "remoteOps", "pending", "devices", "rejected",
-    /// "droppedLocal", "skippedRemote", "lastProblem"}`.
+    /// "droppedLocal", "skippedRemote", "lastProblem", "unechoed", "forked",
+    /// "needsResync", "relayResets", "deviceList": [{"id", "own",
+    /// "appliedSeq", "pending", "gap", "clockLeadMs", "equivocated"}]}`.
     #[wasm_bindgen(js_name = syncStatus)]
     pub fn sync_status(&self) -> String {
         self.core.sync_status()
@@ -273,10 +311,32 @@ impl Database {
         self.core.sync_pairing_code()
     }
 
-    /// The relay bearer token (base64url) for `Authorization: Bearer ...`.
+    /// The bearer token (base64url) for `Authorization: Bearer ...` at the
+    /// relay with this origin (`scheme://host[:port]`). Every relay has its
+    /// own token. Throws if not in a sync group or the origin is not usable.
     #[wasm_bindgen(js_name = syncRelayToken)]
-    pub fn sync_relay_token(&self) -> Option<String> {
-        self.core.sync_relay_token()
+    pub fn sync_relay_token(&self, relay_origin: &str) -> Result<String, JsError> {
+        self.core.sync_relay_token(relay_origin).map_err(js)
+    }
+
+    /// Begin a resync: the next pulls read the relay's log from the start.
+    /// Call when a `syncIngestBatch` result or the status says
+    /// `needsResync`, with a growing delay between attempts.
+    #[wasm_bindgen(js_name = syncStartResync)]
+    pub fn sync_start_resync(&mut self) -> Result<(), JsError> {
+        self.core.sync_start_resync().map_err(js)
+    }
+
+    /// Give a device whose status says `forked` a new identity in the group
+    /// so that it can upload again; writes made while forked are queued for
+    /// upload. Returns the number of ops queued for them. Throws if the
+    /// device is not forked.
+    #[wasm_bindgen(js_name = syncRejoin)]
+    pub fn sync_rejoin(&mut self, now_ms: f64) -> Result<u32, JsError> {
+        self.core
+            .sync_rejoin(now_ms as u64)
+            .map(|n| n as u32)
+            .map_err(js)
     }
 
     /// The next `Push` frame for `POST /v0/push`, or `undefined` when there
@@ -302,9 +362,10 @@ impl Database {
     }
 
     /// Take the relay's `Batch` and apply it. Returns JSON `{"items": n,
-    /// "ops": n, "changes": n, "more": bool, "stalled": bool}`; `changes` is
-    /// the number of changes applied to the graph. Persist when `items > 0`.
-    /// With `stalled`, wait before pulling again.
+    /// "ops": n, "changes": n, "more": bool, "relayReset": bool,
+    /// "needsResync": bool, "forked": bool}`; `changes` is the number of
+    /// changes applied to the graph. Persist when `ops > 0`. With
+    /// `relayReset`, push again: what was in flight is back in the outbox.
     #[wasm_bindgen(js_name = syncIngestBatch)]
     pub fn sync_ingest_batch(&mut self, reply: &[u8], now_ms: f64) -> Result<String, JsError> {
         self.core
@@ -462,8 +523,15 @@ mod tests {
         assert!(!err.contains(&bad[5..20]), "{err}");
         assert!(!b.sync_enabled());
         b.sync_join(&code, 1_000).unwrap();
-        assert_eq!(b.sync_relay_token(), a.sync_relay_token());
-        assert_eq!(b.sync_relay_token().unwrap().len(), 43);
+        let token = a.sync_relay_token("http://relay.test").unwrap();
+        assert_eq!(b.sync_relay_token("HTTP://RELAY.TEST:80/").unwrap(), token);
+        assert_eq!(token.len(), 43);
+        assert_ne!(a.sync_relay_token("https://relay.test").unwrap(), token);
+        assert!(
+            a.sync_relay_token("http://relay.test/path")
+                .unwrap_err()
+                .contains("relay address")
+        );
 
         exchange(&mut a, 2_000);
         assert_eq!(exchange(&mut b, 2_000), 1);
@@ -487,6 +555,14 @@ mod tests {
         // Nothing in the status is secret.
         let text = restored.sync_status();
         assert!(!text.contains(&code[5..]));
-        assert!(!text.contains(restored.sync_relay_token().unwrap().as_str()));
+        assert!(!text.contains(&token));
+        assert_eq!(status["forked"], false);
+        assert_eq!(status["needsResync"], false);
+        let devices = status["deviceList"].as_array().unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices.iter().filter(|d| d["own"] == true).count(), 1);
+        assert!(devices.iter().all(|d| d["clockLeadMs"] == 0));
+        let mut restored = restored;
+        assert!(restored.sync_rejoin(9_000).unwrap_err().contains("rejoin"));
     }
 }

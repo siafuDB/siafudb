@@ -7,6 +7,8 @@ use siafudb_gsp::{Error, SyncedDb};
 use std::collections::BTreeSet;
 
 const MARKER: &str = "PLAINTEXT-MARKER-PANGOLIN-4471";
+/// Where the stand-in relay "lives"; the bearer token is bound to it.
+const ORIGIN: &str = "https://relay.test";
 
 /// What a relay does, without HTTP: per-fragment log of sealed items in
 /// arrival order, exact-bytes dedupe, token registered by the first push.
@@ -124,7 +126,7 @@ impl Device {
     }
 
     fn push(&mut self, relay: &mut FakeRelay) -> usize {
-        let token = self.db.relay_token().unwrap();
+        let token = self.db.relay_token(ORIGIN).unwrap();
         let mut pushed = 0;
         while let Some(frame) = self.db.push_frame().unwrap() {
             let ack = relay.push(&token, &frame);
@@ -135,7 +137,7 @@ impl Device {
 
     /// Pull until the relay has no more. Returns the changes applied.
     fn pull(&mut self, relay: &mut FakeRelay) -> usize {
-        let token = self.db.relay_token().unwrap();
+        let token = self.db.relay_token(ORIGIN).unwrap();
         let mut changes = 0;
         loop {
             let frame = self.db.pull_frame().unwrap();
@@ -413,12 +415,12 @@ fn the_combined_blob_round_trips_in_the_middle_of_a_sync() {
     }
     a.run("MATCH (x:Item {n: 0}), (y:Item {n: 1}) CREATE (x)-[:NEXT]->(y)");
     // A pushed part of its outbox, B pulled part of that, then both stop.
-    let token = a.db.relay_token().unwrap();
+    let token = a.db.relay_token(ORIGIN).unwrap();
     let frame = a.db.push_frame().unwrap().unwrap();
     let ack = relay.push(&token, &frame);
     a.db.accept_ack(&ack).unwrap();
     let frame = b.db.pull_frame().unwrap();
-    let batch = relay.pull(&b.db.relay_token().unwrap(), &frame);
+    let batch = relay.pull(&b.db.relay_token(ORIGIN).unwrap(), &frame);
     let now = b.tick();
     let first = b.db.ingest_batch(&batch, now).unwrap();
     assert!(first.more && first.items == 5 && first.changes > 0);
@@ -440,7 +442,7 @@ fn the_combined_blob_round_trips_in_the_middle_of_a_sync() {
     let status = b.db.status().unwrap();
     assert_eq!((status.cursor, status.outbox), (cursor, outbox));
     assert_eq!(a.db.pairing_code().unwrap(), b.db.pairing_code().unwrap());
-    assert_eq!(a.db.relay_token().unwrap(), token);
+    assert_eq!(a.db.relay_token(ORIGIN).unwrap(), token);
 
     converge(&mut a, &mut b, &mut relay);
     for d in [&a, &b] {
@@ -469,7 +471,8 @@ fn a_bare_snapshot_from_before_sync_still_loads() {
     let mut a = Device::new();
     a.db = SyncedDb::from_bytes(&legacy).unwrap();
     assert!(!a.db.sync_enabled());
-    assert!(a.db.status().is_none() && a.db.relay_token().is_none());
+    assert!(a.db.status().is_none());
+    assert!(matches!(a.db.relay_token(ORIGIN), Err(Error::NotEnabled)));
     assert!(matches!(a.db.pull_frame(), Err(Error::NotEnabled)));
     assert_eq!(a.count("MATCH (n:Note) RETURN count(n)"), 2);
     // Without a replica the blob stays a bare snapshot, byte for byte what
@@ -584,7 +587,7 @@ const MARKER_KEY: &str = "markerkeyaardvark";
 fn frames_that_are_not_what_was_asked_for_are_refused() {
     let (mut a, _b, mut relay) = pair();
     a.run("CREATE (:Item {n: 1})");
-    let token = a.db.relay_token().unwrap();
+    let token = a.db.relay_token(ORIGIN).unwrap();
     let push = a.db.push_frame().unwrap().unwrap();
     let pull = a.db.pull_frame().unwrap();
     let ack = relay.push(&token, &push);
@@ -619,4 +622,350 @@ fn frames_that_are_not_what_was_asked_for_are_refused() {
     assert_eq!(a.count("MATCH (n:Item) RETURN count(n)"), 2);
     a.run("CREATE (:Item {n: 3})");
     assert_eq!(a.db.commit_local(5).unwrap(), 0);
+}
+
+#[test]
+fn the_relay_token_is_bound_to_the_relay_origin() {
+    let (a, b, _relay) = pair();
+    let token = a.db.relay_token("https://relay.example").unwrap();
+    assert_eq!(token.len(), 43);
+    // Same group, same relay: same token, however the origin is spelled.
+    assert_eq!(
+        b.db.relay_token("HTTPS://Relay.Example:443/").unwrap(),
+        token
+    );
+    // Another relay, another token.
+    for other in [
+        "http://relay.example",
+        "https://relay.example:8443",
+        "https://other.example",
+        "http://localhost:8787",
+    ] {
+        assert_ne!(a.db.relay_token(other).unwrap(), token, "{other}");
+    }
+    // What is not an origin is refused, and says so.
+    for bad in [
+        "",
+        "relay.example",
+        "ftp://relay.example",
+        "https://relay.example/path",
+        "https://user@relay.example",
+        "https://relay.example?x=1",
+        "https://relay.example:0",
+        "https://",
+    ] {
+        let Err(e) = a.db.relay_token(bad) else {
+            panic!("accepted {bad:?}");
+        };
+        assert!(matches!(e, Error::Origin(_)), "{bad:?}: {e:?}");
+        assert!(e.to_string().contains("relay address"), "{e}");
+    }
+    assert_eq!(
+        siafudb_gsp::canonical_origin("HTTP://LOCALHOST:080/").unwrap(),
+        "http://localhost"
+    );
+}
+
+/// A device of the group that is not a SiafuDB: a bare replica, which can
+/// write things the engine will not accept.
+struct RawPeer {
+    replica: gsp_sync::Replica,
+    now: u64,
+    nonce: u8,
+}
+
+impl RawPeer {
+    fn join(code: &str) -> RawPeer {
+        let root = *gsp_sync::Pairing::parse(code).unwrap().root();
+        RawPeer {
+            replica: gsp_sync::Replica::create(
+                root,
+                [0x5e; 32],
+                [0xa0; 24],
+                gsp_sync::Config::default(),
+            )
+            .unwrap(),
+            now: 1_800_000_100_000,
+            nonce: 0,
+        }
+    }
+
+    fn commit(&mut self, changes: &[gsp_sync::Change]) {
+        self.now += 10;
+        self.nonce += 1;
+        self.replica
+            .local_commit(changes, self.now, [self.nonce; 24])
+            .unwrap();
+    }
+
+    fn push(&mut self, relay: &mut FakeRelay) {
+        let token = gsp_sync::base64url(&self.replica.relay_token(ORIGIN).unwrap()[..]);
+        let sealed: Vec<gsp_wire::SealedOp> = self
+            .replica
+            .outbox_peek(64)
+            .into_iter()
+            .map(|b| gsp_wire::SealedOp::from_bytes(b).unwrap())
+            .collect();
+        let count = sealed.len();
+        let frame = Message::Push {
+            fragment_id: self.replica.fragment_id().to_vec(),
+            sealed,
+        };
+        relay.push(&token, &frame.to_bytes().unwrap());
+        self.replica.outbox_ack(count);
+    }
+}
+
+#[test]
+fn a_remote_change_the_engine_refuses_is_counted_and_everything_else_applies() {
+    use gsp_sync::Change;
+    use gsp_wire::Value;
+    let (mut a, mut b, mut relay) = pair();
+    a.run("CREATE (:Item {n: 1})");
+    converge(&mut a, &mut b, &mut relay);
+
+    let mut peer = RawPeer::join(&a.db.pairing_code().unwrap());
+    let gid = |n: u8| [n; 16];
+    let node = |n: u8, key: &str, value: Value| {
+        let mut put = Change::node(gid(n));
+        if let Change::NodePut {
+            labels_add, set, ..
+        } = &mut put
+        {
+            labels_add.insert("Peer".to_string());
+            set.insert(key.to_string(), value);
+        }
+        put
+    };
+    peer.commit(&[
+        node(1, "name", Value::Text("fine".into())),
+        // The engine's reserved property: `apply_changes` refuses it.
+        node(2, "_gid", Value::Text("00".repeat(16))),
+        // An integer the engine's 64-bit type cannot hold: no conversion.
+        node(3, "big", Value::Int(i128::from(i64::MAX) + 1)),
+    ]);
+    peer.commit(&[
+        node(4, "name", Value::Text("also fine".into())),
+        Change::edge(gid(10), gid(1), gid(4), "GOOD"),
+        // An endpoint the engine does not have (its node was refused).
+        Change::edge(gid(11), gid(1), gid(2), "BAD"),
+    ]);
+    peer.push(&mut relay);
+
+    for d in [&mut a, &mut b] {
+        // Four changes arrive: two nodes and one edge are refused.
+        assert_eq!(d.pull(&mut relay), 3);
+        let status = d.db.status().unwrap();
+        assert_eq!(status.skipped_remote, 3, "{:?}", status.last_problem);
+        assert!(
+            status
+                .last_problem
+                .unwrap()
+                .contains("a remote change was not applied")
+        );
+        // The replica itself accepted both ops; nothing is stuck behind them.
+        assert_eq!((status.rejected, status.pending), (0, 0));
+        assert_eq!(status.devices, 3);
+        assert_eq!(d.count("MATCH (p:Peer) RETURN count(p)"), 2);
+        assert_eq!(
+            d.count(
+                "MATCH (:Peer {name: 'fine'})-[r:GOOD]->(:Peer {name: 'also fine'}) RETURN count(r)"
+            ),
+            1
+        );
+        assert_eq!(d.count("MATCH ()-[r:BAD]->() RETURN count(r)"), 0);
+        assert_eq!(d.count("MATCH (n:Item) RETURN count(n)"), 1);
+    }
+    // Later ops of that device, and of the others, still apply everywhere.
+    peer.commit(&[node(1, "name", Value::Text("renamed".into()))]);
+    peer.push(&mut relay);
+    a.run("MATCH (p:Peer {name: 'also fine'}) SET p.seen = true");
+    b.run("CREATE (:Item {n: 2})");
+    converge(&mut a, &mut b, &mut relay);
+    assert_eq!(
+        b.count("MATCH (p:Peer) WHERE p.name = 'renamed' OR p.seen RETURN count(p)"),
+        2
+    );
+    assert_eq!(a.count("MATCH (n:Item) RETURN count(n)"), 2);
+    assert_eq!(a.db.status().unwrap().skipped_remote, 3);
+}
+
+#[test]
+fn a_rolled_back_device_is_forked_keeps_its_writes_and_rejoins_as_a_new_device() {
+    let (mut a, mut b, mut relay) = pair();
+    a.run("CREATE (:Doc {k: 'shared', v: 0})");
+    converge(&mut a, &mut b, &mut relay);
+    let backup = a.db.to_bytes().unwrap();
+
+    // A writes and uploads, then loses that state: the backup comes back.
+    a.run("CREATE (:Doc {k: 'w1'})");
+    a.push(&mut relay);
+    a.db = SyncedDb::from_bytes(&backup).unwrap();
+    assert_eq!(a.count("MATCH (d:Doc {k: 'w1'}) RETURN count(d)"), 0);
+    assert!(!a.db.forked());
+
+    // Not knowing, it writes again (reusing the sequence number of `w1`)...
+    a.run("CREATE (:Doc {k: 'w2'})");
+    assert_eq!(a.db.status().unwrap().outbox, 1);
+    // ...and finds out when its own earlier op comes back from the relay.
+    a.sync(&mut relay);
+    assert!(a.db.forked());
+    assert!(a.db.status().unwrap().forked);
+    // It follows what it had published: `w1` is back.
+    assert_eq!(a.count("MATCH (d:Doc {k: 'w1'}) RETURN count(d)"), 1);
+
+    // Writes still work locally and are not handed to the replica.
+    let ops = a.db.status().unwrap().local_ops;
+    a.run("CREATE (:Doc {k: 'w3'})");
+    a.run("MATCH (d:Doc {k: 'shared'}) SET d.v = 3, d.by = 'a'");
+    assert_eq!(a.db.status().unwrap().local_ops, ops);
+    assert_eq!(a.count("MATCH (d:Doc) RETURN count(d)"), 4);
+    // Meanwhile B writes the same property; A still receives it.
+    b.now = a.now + 1_000;
+    b.run("MATCH (d:Doc {k: 'shared'}) SET d.v = 7");
+    b.run("CREATE (:Doc {k: 'from-b'})");
+    b.sync(&mut relay);
+    a.sync(&mut relay);
+    assert_eq!(a.count("MATCH (d:Doc {k: 'from-b'}) RETURN count(d)"), 1);
+    // B has none of what A wrote after the rollback, and holds the proof
+    // that A's old identity signed one position twice.
+    b.sync(&mut relay);
+    assert_eq!(
+        b.count("MATCH (d:Doc) WHERE d.k IN ['w2', 'w3'] RETURN count(d)"),
+        0
+    );
+    assert_eq!(b.count("MATCH (d:Doc {k: 'w1'}) RETURN count(d)"), 1);
+    assert!(
+        b.db.status()
+            .unwrap()
+            .device_list
+            .iter()
+            .any(|d| d.equivocated)
+    );
+
+    // The forked state and the waiting writes survive a reload.
+    a.reload();
+    assert!(a.db.forked());
+    assert_eq!(a.count("MATCH (d:Doc) RETURN count(d)"), 5);
+    assert!(matches!(
+        b.db.rejoin_as_new_device(1),
+        Err(Error::NotForked)
+    ));
+
+    a.now = b.now + 1_000;
+    let now = a.tick();
+    let queued = a.db.rejoin_as_new_device(now).unwrap();
+    assert!(queued >= 1);
+    assert!(!a.db.forked());
+    // Its local writes win over what B wrote while they waited, in its own
+    // engine too.
+    assert_eq!(a.count("MATCH (d:Doc {k: 'shared'}) RETURN d.v"), 3);
+
+    converge(&mut a, &mut b, &mut relay);
+    for d in [&a, &b] {
+        assert_eq!(
+            d.count("MATCH (d:Doc) WHERE d.k IN ['w1', 'w2', 'w3', 'from-b', 'shared'] RETURN count(DISTINCT d.k)"),
+            5
+        );
+        assert_eq!(d.count("MATCH (d:Doc) RETURN count(d)"), 5);
+        assert_eq!(
+            d.count("MATCH (d:Doc {k: 'shared', by: 'a'}) RETURN d.v"),
+            3
+        );
+    }
+    // B sees one device more; A can write again.
+    assert_eq!(b.db.status().unwrap().devices, 3);
+    a.run("CREATE (:Doc {k: 'after'})");
+    converge(&mut a, &mut b, &mut relay);
+    assert_eq!(b.count("MATCH (d:Doc {k: 'after'}) RETURN count(d)"), 1);
+    assert_eq!(a.db.status().unwrap().dropped_local, 0);
+}
+
+#[test]
+fn a_relay_that_lost_its_log_is_noticed_and_what_was_in_flight_is_pushed_again() {
+    let (mut a, mut b, mut relay) = pair();
+    a.run("CREATE (:Item {n: 1})");
+    converge(&mut a, &mut b, &mut relay);
+
+    // Acknowledged by the relay, read back by nobody, and then the relay is
+    // replaced by an empty one.
+    a.run("CREATE (:Item {n: 2})");
+    assert_eq!(a.push(&mut relay), 1);
+    assert_eq!(a.db.status().unwrap().unechoed, 1);
+    relay = FakeRelay::new(5);
+
+    let frame = a.db.pull_frame().unwrap();
+    let batch = relay.pull(&a.db.relay_token(ORIGIN).unwrap(), &frame);
+    let now = a.tick();
+    let outcome = a.db.ingest_batch(&batch, now).unwrap();
+    assert!(outcome.relay_reset);
+    let status = a.db.status().unwrap();
+    assert_eq!(
+        (status.relay_resets, status.cursor, status.outbox),
+        (1, 0, 1)
+    );
+
+    a.sync(&mut relay);
+    assert_eq!(b.pull(&mut relay), 1);
+    assert_eq!(b.db.status().unwrap().relay_resets, 1);
+    converge(&mut a, &mut b, &mut relay);
+    assert_eq!(b.count("MATCH (n:Item) RETURN count(n)"), 2);
+    // Detected once, not on every pull.
+    assert_eq!(a.db.status().unwrap().relay_resets, 1);
+
+    // History is gone: a device that joins now cannot read what A and B
+    // write (their key logs were only on the old relay), and says so.
+    let mut c = Device::new();
+    let now = c.tick();
+    c.db.sync_join(&a.db.pairing_code().unwrap(), now).unwrap();
+    c.run("CREATE (:Item {n: 3})");
+    c.sync(&mut relay);
+    assert_eq!(c.count("MATCH (n:Item) RETURN count(n)"), 1);
+    assert!(c.db.status().unwrap().pending >= 1);
+    // The others do receive what the new device writes.
+    converge(&mut a, &mut b, &mut relay);
+    assert_eq!(a.count("MATCH (n:Item) RETURN count(n)"), 3);
+}
+
+#[test]
+fn sync_state_from_an_older_format_version_is_refused_by_name() {
+    let engine = SiafuDB::in_memory().unwrap().export_snapshot().unwrap();
+    let state = |version: i128| {
+        gsp_wire::Value::Array(vec![
+            gsp_wire::Value::Text("gsp-sync-state".into()),
+            gsp_wire::Value::Int(version),
+        ])
+        .encode()
+        .unwrap()
+    };
+    let blob = |replica: &[u8]| {
+        let mut out = b"SIAFGSP\0\x01".to_vec();
+        for section in [engine.as_slice(), replica, b""] {
+            out.extend_from_slice(&(section.len() as u64).to_le_bytes());
+            out.extend_from_slice(section);
+        }
+        out
+    };
+    let Err(e) = SyncedDb::from_bytes(&blob(&state(0))) else {
+        panic!("version 0 state was accepted");
+    };
+    assert!(matches!(e, Error::SyncStateVersion { found: 0 }), "{e:?}");
+    let text = e.to_string();
+    assert!(
+        text.starts_with(siafudb_gsp::SYNC_STATE_VERSION_PREFIX),
+        "{text}"
+    );
+    assert!(
+        text.contains("version 0") && text.contains("reads version 1"),
+        "{text}"
+    );
+    assert!(matches!(
+        SyncedDb::from_bytes(&blob(&state(7))),
+        Err(Error::SyncStateVersion { found: 7 })
+    ));
+    // Damage is a different error.
+    assert!(matches!(
+        SyncedDb::from_bytes(&blob(b"junk")),
+        Err(Error::Replica(_))
+    ));
 }
