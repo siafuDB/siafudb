@@ -540,6 +540,75 @@ fn entities_written_before_capture_are_reported_whole_when_touched() {
 }
 
 #[test]
+fn the_whole_graph_is_reported_once_as_puts() {
+    // Data written before capture, and data captured but never taken.
+    let a = SiafuDB::in_memory().unwrap();
+    varied_script(&a);
+    a.enable_change_capture().unwrap();
+    run(
+        &a,
+        &[
+            "CREATE (:Late {name: 'captured'})",
+            "CREATE (:Gone {name: 'never seen'})",
+            "MATCH (g:Gone) DELETE g",
+        ],
+    );
+
+    let graph = a.take_graph_as_changes().unwrap();
+    // Nodes first, puts only, every gid once.
+    let first_edge = graph
+        .iter()
+        .position(|c| matches!(c, GraphChange::EdgePut { .. }))
+        .unwrap();
+    assert!(
+        graph[..first_edge]
+            .iter()
+            .all(|c| matches!(c, GraphChange::NodePut { .. }))
+    );
+    assert!(
+        graph[first_edge..]
+            .iter()
+            .all(|c| matches!(c, GraphChange::EdgePut { .. }))
+    );
+    let mut gids: Vec<Gid> = graph
+        .iter()
+        .map(|c| match c {
+            GraphChange::NodePut { gid, .. } | GraphChange::EdgePut { gid, .. } => *gid,
+            other => panic!("not a put: {other:?}"),
+        })
+        .collect();
+    let count = gids.len();
+    gids.sort_unstable();
+    gids.dedup();
+    assert_eq!(gids.len(), count);
+
+    // An empty database that applies it holds the same graph.
+    let b = capturing();
+    b.apply_changes(&graph).unwrap();
+    assert_eq!(dump(&a), dump(&b));
+    assert!(!dump(&a).nodes.is_empty() && !dump(&a).edges.is_empty());
+
+    // The queue was replaced: nothing from before comes out again, later
+    // writes do, and a second call names the same gids.
+    assert!(a.take_changes().unwrap().is_empty());
+    run(&a, &["MATCH (l:Late) SET l.n = 1"]);
+    let later = a.take_changes().unwrap();
+    assert_eq!(later.len(), 1);
+    b.apply_changes(&later).unwrap();
+    assert_eq!(dump(&a), dump(&b));
+    let again = a.take_graph_as_changes().unwrap();
+    assert_eq!(again.len(), count);
+    b.apply_changes(&again).unwrap();
+    assert_eq!(dump(&a), dump(&b));
+
+    // On a database without capture it turns capture on; an empty graph is
+    // an empty list.
+    let c = SiafuDB::in_memory().unwrap();
+    assert!(c.take_graph_as_changes().unwrap().is_empty());
+    assert!(c.change_capture_enabled());
+}
+
+#[test]
 fn user_writes_to_the_reserved_property_do_not_break_ids() {
     let (a, b) = (capturing(), capturing());
     run(&a, &["CREATE (:Person {name: 'Amara'})"]);

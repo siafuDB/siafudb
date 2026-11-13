@@ -248,6 +248,100 @@ impl SyncState {
         gid
     }
 
+    /// Replace the queue with the whole default graph as puts (every node,
+    /// then every edge), giving a gid to each entity that has none, and hand
+    /// it over like [`take`](Self::take).
+    ///
+    /// Changes captured before describe writes the graph already shows, so
+    /// they are dropped; writes after this call are captured as usual.
+    pub(crate) fn take_graph(
+        &mut self,
+        engine: &grafeo::GrafeoDB,
+    ) -> Result<Vec<GraphChange>, SiafuError> {
+        self.drain(engine)?;
+        let mut session = engine.session_with_cdc(false);
+        let ids = |query: &str| -> Result<Vec<u64>, SiafuError> {
+            let result = session.execute(query).map_err(engine_err)?;
+            let mut ids: Vec<u64> = result
+                .rows()
+                .iter()
+                .filter_map(|row| match row.first() {
+                    Some(grafeo::Value::Int64(id)) => u64::try_from(*id).ok(),
+                    _ => None,
+                })
+                .collect();
+            ids.sort_unstable();
+            Ok(ids)
+        };
+        let nodes = ids("MATCH (n) RETURN id(n)")?;
+        let edges = ids("MATCH ()-[r]->() RETURN id(r)")?;
+        self.pending.clear();
+        self.error = None;
+        for id in nodes {
+            match self.nodes.get(&id).copied() {
+                Some(gid) => {
+                    if let Some(put) = self.node_whole(&session, id, gid) {
+                        self.pending.push(put);
+                    }
+                }
+                // Reports the node whole as it binds it.
+                None => {
+                    self.node_gid(&session, id);
+                }
+            }
+        }
+        for id in edges {
+            let Some(edge) = session.get_edge(EdgeId(id)).ok().flatten() else {
+                continue;
+            };
+            let src = self.node_gid(&session, edge.src.0);
+            let dst = self.node_gid(&session, edge.dst.0);
+            let gid = match self.edges.get(&id) {
+                Some(gid) => *gid,
+                None => self.mint(Entity::Edge(id)),
+            };
+            let image: HashMap<String, grafeo::Value> = edge
+                .properties
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.clone()))
+                .collect();
+            let set = self.properties(Some(&image));
+            self.pending.push(GraphChange::EdgePut {
+                gid,
+                src,
+                dst,
+                edge_type: edge.edge_type.to_string(),
+                set,
+                unset: Vec::new(),
+            });
+        }
+        self.stamp(&mut session)?;
+        self.take()
+    }
+
+    /// A node as it is now, as one put. `None` if it is gone.
+    fn node_whole(
+        &mut self,
+        session: &grafeo::session::Session,
+        id: u64,
+        gid: Gid,
+    ) -> Option<GraphChange> {
+        let node = session.get_node(NodeId(id)).ok().flatten()?;
+        let image: HashMap<String, grafeo::Value> = node
+            .properties
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.clone()))
+            .collect();
+        let set = self.properties(Some(&image));
+        Some(GraphChange::NodePut {
+            gid,
+            labels_add: node.labels.iter().map(ToString::to_string).collect(),
+            labels_remove: Vec::new(),
+            set,
+            unset: Vec::new(),
+        })
+    }
+
     /// The property delta of an Update event: `(set, unset)`.
     fn delta(&mut self, event: &ChangeEvent) -> (Vec<(String, ChangeValue)>, Vec<String>) {
         let set = self.properties(event.after.as_ref());

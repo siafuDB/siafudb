@@ -9,6 +9,7 @@ export type SiafuErrorCode =
   | "closed" // the database handle was closed
   | "query" // the engine rejected a query
   | "storage" // the storage backend failed
+  | "sync" // sync is not set up, was stopped, or the relay could not be used
   | "internal";
 
 /** Base class for every error thrown by `@siafudb/web`. */
@@ -115,6 +116,7 @@ export function reviveError(e: {
     case "key-missing":
     case "query":
     case "storage":
+    case "sync":
       return new SiafuError(e.code, e.message);
     default:
       return new SiafuError("internal", e.message);

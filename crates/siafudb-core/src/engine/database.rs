@@ -284,6 +284,34 @@ impl SiafuDB {
         state.take()
     }
 
+    /// The whole current default graph as puts: every node, then every edge
+    /// (so an edge never precedes its endpoints), each with all its labels
+    /// and properties. Turns change capture on.
+    ///
+    /// This is how a protocol layer uploads a database that had data before
+    /// sync was set up: capture alone reports an older entity only when a
+    /// later write touches it. Entities without a global id get one here;
+    /// entities that have one keep it.
+    ///
+    /// The call **replaces the queue** of [`take_changes`](Self::take_changes):
+    /// what was captured and not yet taken describes writes the returned
+    /// graph already shows, so it is dropped. Writes made after the call are
+    /// captured as usual.
+    ///
+    /// # Errors
+    ///
+    /// As [`take_changes`](Self::take_changes): on
+    /// [`SiafuError::UnsupportedValue`] the property was left out, the puts
+    /// stay queued, and the next `take_changes` returns them.
+    pub fn take_graph_as_changes(&self) -> Result<Vec<GraphChange>, SiafuError> {
+        self.start_capture(Vec::new())?;
+        let mut guard = self.sync_state()?;
+        match guard.as_mut() {
+            Some(state) => state.take_graph(&self.engine),
+            None => Err(SiafuError::SyncError("change capture is off".to_string())),
+        }
+    }
+
     /// Apply changes captured on another device, in order, as one
     /// transaction: on an error nothing is applied.
     ///
