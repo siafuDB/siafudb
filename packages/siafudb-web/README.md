@@ -58,7 +58,7 @@ await db.sync.join({ relayUrl: 'https://relay.example.org', code });
 
 const off = db.sync.onRemoteChange(({ changes }) => rerunQueries()); // another device's writes were applied
 await db.sync.syncNow();              // optional: upload and download now, rejects if the relay is unreachable
-const s = await db.sync.status();     // { enabled, running, connected, pendingUploads, needsRejoin, deviceList, … }
+const s = await db.sync.status();     // { enabled, running, connected, pendingUploads, catchingUp, needsRejoin, deviceList, … }
 ```
 
 - `db.sync.create({ relayUrl, registrationToken? })` → pairing code; `db.sync.join({ relayUrl, code })`. Data
@@ -80,10 +80,19 @@ const s = await db.sync.status();     // { enabled, running, connected, pendingU
 
 **When something is wrong**, `status()` says what:
 
-- `needsRejoin`: this device's storage was rolled back (restored from a backup, a browser profile copied back)
-  and no longer matches what it had uploaded. It keeps receiving, and local writes keep working, but nothing
-  is uploaded until you call `db.sync.rejoinAsNewDevice()`. That gives the device a new identity; everything it
-  wrote in the meantime is then uploaded and counts as written at that moment. It is never done automatically.
+- **A device restored from an older copy** (a backup, a browser profile copied back) is behind what it had
+  itself uploaded. If it can read the relay before it uploads anything new, it simply gets its own later
+  writes back and carries on as the same device; nothing needs to be done. To make that the normal case,
+  after every `open()` local writes are held from upload until the relay has been read once
+  (`status().catchingUp`); they are in the local database at once and are uploaded right after. If the relay
+  cannot be reached (offline, relay down, a 15 s timeout) or sync is stopped, they are not held: they are
+  queued for upload as soon as that is known.
+- `needsRejoin`: the remaining case. The restored device queued a write for upload before it could read the
+  relay (it was offline or stopped), and that write now conflicts with its own earlier uploads. It keeps
+  receiving, and local writes keep working, but nothing is uploaded until you call
+  `db.sync.rejoinAsNewDevice()`. That gives the device a new identity; everything it wrote in the meantime is
+  then uploaded and counts as written at that moment. It is never done automatically. The same call is the
+  way out if `catchingUp` stays true while `connected` (the relay has lost part of this device's history).
 - `deviceList`: one entry per device, `{ id, own, appliedSeq, pending, gap, clockLeadMs, equivocated }`.
   `clockLeadMs > 0` means that device's writes were ahead of this device's clock: held if under 24 hours,
   refused if over (one of the two clocks is wrong). `gap` means it is stuck until a resync; `equivocated`
@@ -113,7 +122,7 @@ relay's address, so a relay operator cannot use it on another relay.
 - A new device downloads the group's whole history from the relay; there is no snapshot transfer. A relay
   that loses its data loses that history for good.
 - At most 64 devices per group. Each `rejoinAsNewDevice()` counts as one more.
-- A device that was rolled back and wrote before noticing leaves a permanent trace: the other devices may
+- A device that was rolled back and uploaded before it could read the relay leaves a permanent trace: the other devices may
   disagree about a few of that device's own writes from around the rollback. Nobody else's data is affected.
 - A device whose clock is more than 24 hours ahead cannot get its writes accepted until its clock is fixed;
   a device whose clock is far behind refuses everyone else's.

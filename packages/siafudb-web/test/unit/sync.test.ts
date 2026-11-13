@@ -51,12 +51,16 @@ class FakeEngine implements SyncEngine {
       this.outbox.unshift(...this.unechoed);
       this.unechoed = [];
     }
+    // At the relay's head, writes that were held are queued.
+    const queued = more === 1 ? 0 : this.held.length;
+    if (more !== 1) this.outbox.push(...this.held.splice(0));
     return JSON.stringify({
       items: items.length,
       ops: items.length,
       changes: items.length,
       more: more === 1,
       relayReset,
+      queued,
       needsResync: this.needsResync,
       forked: false,
     });
@@ -77,6 +81,15 @@ class FakeEngine implements SyncEngine {
     this.resyncs.push(Date.now());
     this.cursor = 0;
     this.needsResync = false;
+  }
+  /** Local writes held until the relay has been read (as after opening). */
+  held: number[] = [];
+  releases = 0;
+  syncReleaseWrites() {
+    this.releases += 1;
+    const n = this.held.length;
+    this.outbox.push(...this.held.splice(0));
+    return n;
   }
   /** A device whose ops can never apply: every replay raises the flag again. */
   stuck = false;
@@ -484,6 +497,39 @@ describe("SyncLoop", () => {
     expect(engine.needsResync).toBe(false);
     await until(() => relay.requests.at(-1)!.wait === 5_000);
     await loop.stop();
+  });
+
+  it("uploads writes held since opening after the first full read of the relay, or once the relay proves unreachable", async () => {
+    // Reachable: the held writes go out only after the pull reached the head.
+    const up = setup();
+    up.relay.log.push(101, 102, 103);
+    up.engine.held.push(1, 2);
+    up.loop.start();
+    await until(() => up.relay.log.includes(2));
+    expect(up.engine.releases).toBe(0);
+    const firstPush = up.relay.requests.findIndex((r) =>
+      r.path.endsWith("/push"),
+    );
+    const pullsBefore = up.relay.requests
+      .slice(0, firstPush)
+      .filter((r) => r.path.endsWith("/pull"));
+    // 3 items, two per frame: both frames were read first (the idle long
+    // poll that follows may already be open as well).
+    expect(pullsBefore.length).toBeGreaterThanOrEqual(2);
+    expect(up.seen.persisted).toBeGreaterThan(0);
+    await up.loop.stop();
+
+    // Unreachable: they are not held for as long as that lasts.
+    const down = setup();
+    down.relay.down = true;
+    down.engine.held.push(1, 2);
+    down.loop.start();
+    await until(() => down.engine.outbox.length === 2);
+    expect(down.engine.releases).toBeGreaterThan(0);
+    expect(down.relay.log).toEqual([]);
+    down.relay.down = false;
+    await until(() => down.relay.log.length === 2);
+    await down.loop.stop();
   });
 
   it("makes no request while offline and resumes on the online event", async () => {

@@ -95,7 +95,8 @@ export interface SyncApi {
    */
   start(options?: SyncRegistrationOptions): Promise<void>;
   /**
-   * For a device whose `status().needsRejoin` is true: take a new identity
+   * For a device whose `status().needsRejoin` is true (or whose
+   * `catchingUp` does not end while it is connected): take a new identity
    * in the group so that it can upload again. Everything it wrote in the
    * meantime is uploaded and counts as written now. The other devices see
    * one device more. Rejects if the device does not need it. Run your

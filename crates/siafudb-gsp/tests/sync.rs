@@ -804,7 +804,11 @@ fn a_rolled_back_device_is_forked_keeps_its_writes_and_rejoins_as_a_new_device()
     assert_eq!(a.count("MATCH (d:Doc {k: 'w1'}) RETURN count(d)"), 0);
     assert!(!a.db.forked());
 
-    // Not knowing, it writes again (reusing the sequence number of `w1`)...
+    // It cannot reach the relay, so its transport stops holding writes back.
+    // Not knowing better, it signs one (reusing the sequence number of `w1`)...
+    assert!(a.db.holding_writes());
+    let now = a.tick();
+    assert_eq!(a.db.release_writes(now).unwrap(), 0);
     a.run("CREATE (:Doc {k: 'w2'})");
     assert_eq!(a.db.status().unwrap().outbox, 1);
     // ...and finds out when its own earlier op comes back from the relay.
@@ -956,16 +960,111 @@ fn sync_state_from_an_older_format_version_is_refused_by_name() {
         "{text}"
     );
     assert!(
-        text.contains("version 0") && text.contains("reads version 1"),
+        text.contains("version 0") && text.contains("reads version 2"),
         "{text}"
     );
-    assert!(matches!(
-        SyncedDb::from_bytes(&blob(&state(7))),
-        Err(Error::SyncStateVersion { found: 7 })
-    ));
+    for other in [1, 7] {
+        assert!(matches!(
+            SyncedDb::from_bytes(&blob(&state(other))),
+            Err(Error::SyncStateVersion { found }) if found == other as u64
+        ));
+    }
     // Damage is a different error.
     assert!(matches!(
         SyncedDb::from_bytes(&blob(b"junk")),
         Err(Error::Replica(_))
     ));
+}
+
+#[test]
+fn a_restored_device_that_reads_the_relay_first_catches_up_without_a_fork() {
+    let (mut a, mut b, mut relay) = pair();
+    a.run("CREATE (:Doc {k: 'shared', v: 0})");
+    converge(&mut a, &mut b, &mut relay);
+    let backup = a.db.to_bytes().unwrap();
+    let devices = b.db.status().unwrap().devices;
+
+    // Eight more commits of A reach the relay and B; then A's storage is
+    // put back to the backup.
+    for i in 1..=8 {
+        a.run(&format!("CREATE (:Doc {{k: 'lost-{i}'}})"));
+    }
+    a.run("MATCH (d:Doc {k: 'shared'}) SET d.v = 1");
+    converge(&mut a, &mut b, &mut relay);
+    let level = a.dump();
+    a.db = SyncedDb::from_bytes(&backup).unwrap();
+    assert_eq!(a.count("MATCH (d:Doc) RETURN count(d)"), 1);
+
+    // A write made before the relay has been read is kept, not signed.
+    assert!(a.db.holding_writes());
+    let ops = a.db.status().unwrap().local_ops;
+    a.run("CREATE (:Doc {k: 'early'})");
+    a.run("MATCH (d:Doc {k: 'shared'}) SET d.v = 2");
+    let status = a.db.status().unwrap();
+    assert_eq!((status.local_ops, status.outbox), (ops, 0));
+    assert!(status.holding_writes && !status.forked);
+    // It survives a reload in that state.
+    a.reload();
+    assert_eq!(a.count("MATCH (d:Doc {k: 'early'}) RETURN count(d)"), 1);
+
+    // The first frame is not the whole log (five items per frame): A is
+    // still behind, and a write made now is held as well.
+    let token = a.db.relay_token(ORIGIN).unwrap();
+    let frame = a.db.pull_frame().unwrap();
+    let now = a.tick();
+    let first = a.db.ingest_batch(&relay.pull(&token, &frame), now).unwrap();
+    assert!(first.more && first.queued == 0);
+    assert!(a.db.holding_writes());
+    a.run("CREATE (:Doc {k: 'during'})");
+    assert_eq!(a.db.status().unwrap().outbox, 0);
+
+    // Reading on to the head: its own ops come back and apply, nothing
+    // forks, and the held writes are committed by that same call.
+    let mut queued = 0;
+    loop {
+        let frame = a.db.pull_frame().unwrap();
+        let now = a.tick();
+        let out = a.db.ingest_batch(&relay.pull(&token, &frame), now).unwrap();
+        queued += out.queued;
+        if !out.more {
+            break;
+        }
+    }
+    assert!(queued >= 1);
+    let status = a.db.status().unwrap();
+    assert!(!status.forked && !status.holding_writes);
+    assert_eq!(status.own_ops_missing, 0);
+    assert_eq!(status.outbox, queued);
+    assert_eq!(status.local_ops, ops + queued as u64);
+    assert_eq!(
+        a.count("MATCH (d:Doc) WHERE d.k STARTS WITH 'lost-' RETURN count(d)"),
+        8
+    );
+    // Its held write to `shared` is newer than the one that came back.
+    assert_eq!(a.count("MATCH (d:Doc {k: 'shared'}) RETURN d.v"), 2);
+    assert!(matches!(
+        a.db.rejoin_as_new_device(1),
+        Err(Error::NotForked)
+    ));
+
+    // The peer accepts them from the same device as before.
+    converge(&mut a, &mut b, &mut relay);
+    assert_ne!(a.dump(), level);
+    for d in [&a, &b] {
+        assert_eq!(d.count("MATCH (d:Doc) RETURN count(d)"), 11);
+        assert_eq!(
+            d.count("MATCH (d:Doc) WHERE d.k IN ['early', 'during'] RETURN count(d)"),
+            2
+        );
+        assert_eq!(d.count("MATCH (d:Doc {k: 'shared'}) RETURN d.v"), 2);
+    }
+    let status = b.db.status().unwrap();
+    assert_eq!(status.devices, devices);
+    assert!(status.device_list.iter().all(|d| !d.equivocated));
+    assert_eq!(status.rejected, 0);
+    // And A writes normally afterwards.
+    a.run("CREATE (:Doc {k: 'after'})");
+    assert_eq!(a.db.status().unwrap().outbox, 1);
+    converge(&mut a, &mut b, &mut relay);
+    assert_eq!(b.count("MATCH (d:Doc {k: 'after'}) RETURN count(d)"), 1);
 }

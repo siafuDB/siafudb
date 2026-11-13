@@ -24,6 +24,11 @@ export interface SyncEngine {
   /** The bearer token for the relay at this origin. Throws if there is none. */
   syncRelayToken(relayOrigin: string): string;
   syncStartResync(): void;
+  /**
+   * Stop holding local writes back for a read of the relay that is not
+   * going to happen now; returns the ops this queued.
+   */
+  syncReleaseWrites(nowMs: number): number;
 }
 
 /** What the transport needs from its surroundings (injected for tests). */
@@ -564,6 +569,7 @@ export class SyncLoop {
               changes: number;
               more: boolean;
               relayReset: boolean;
+              queued: number;
               needsResync: boolean;
             },
         );
@@ -577,9 +583,11 @@ export class SyncLoop {
         // reload continues from here. A frame that only echoed this
         // device's own items moved nothing but the cursor; the next
         // ordinary save covers that.
-        if (out.ops > 0 || late > 0 || out.relayReset)
+        if (out.ops > 0 || late > 0 || out.relayReset || out.queued > 0)
           await this.host.persist();
         else if (out.items > 0) this.host.touched();
+        // Writes that were held until the relay had been read are queued now.
+        if (out.queued > 0) this.pushSignal.set();
         if (out.relayReset) {
           // The relay lost its data: what it never handed back is in the
           // outbox again, and the group has to be registered again.
@@ -614,6 +622,17 @@ export class SyncLoop {
         }
         this.failed(e);
         for (const w of waiters) w.reject(e as Error);
+        // After opening, local writes wait for one read of the relay (the
+        // stored state could be an old copy). The relay cannot be read now:
+        // do not keep them waiting for as long as that lasts.
+        try {
+          if (this.db.syncReleaseWrites(this.host.now()) > 0) {
+            this.host.touched();
+            this.pushSignal.set();
+          }
+        } catch {
+          // Not in a group any more.
+        }
         failures += 1;
         more = true;
         await this.pause(this.backoff(failures, e));

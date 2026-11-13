@@ -122,6 +122,8 @@ impl Core {
                 "lastProblem": s.last_problem,
                 "unechoed": s.unechoed,
                 "forked": s.forked,
+                "ownOpsMissing": s.own_ops_missing,
+                "holdingWrites": s.holding_writes,
                 "needsResync": s.needs_resync,
                 "relayResets": s.relay_resets,
                 "deviceList": s.device_list.iter().map(|d| json!({
@@ -146,6 +148,9 @@ impl Core {
             .map(|t| t.as_str().to_owned())
             .map_err(|e| e.to_string())
     }
+    pub fn sync_release_writes(&mut self, now_ms: u64) -> Result<usize, String> {
+        self.db.release_writes(now_ms).map_err(|e| e.to_string())
+    }
     pub fn sync_start_resync(&mut self) -> Result<(), String> {
         self.db.start_resync().map_err(|e| e.to_string())
     }
@@ -164,7 +169,8 @@ impl Core {
         self.db.pull_frame().map_err(|e| e.to_string())
     }
     /// Returns `{"items": n, "ops": n, "changes": n, "more": bool,
-    /// "relayReset": bool, "needsResync": bool, "forked": bool}` as JSON.
+    /// "relayReset": bool, "queued": n, "needsResync": bool, "forked": bool}`
+    /// as JSON.
     pub fn sync_ingest_batch(&mut self, reply: &[u8], now_ms: u64) -> Result<String, String> {
         let o = self
             .db
@@ -177,6 +183,7 @@ impl Core {
             "changes": o.changes,
             "more": o.more,
             "relayReset": o.relay_reset,
+            "queued": o.queued,
             "needsResync": status.as_ref().is_some_and(|s| s.needs_resync),
             "forked": status.as_ref().is_some_and(|s| s.forked),
         })
@@ -298,7 +305,8 @@ impl Database {
     /// JSON: `null` when not in a sync group, else `{"groupId", "outbox",
     /// "cursor", "localOps", "remoteOps", "pending", "devices", "rejected",
     /// "droppedLocal", "skippedRemote", "lastProblem", "unechoed", "forked",
-    /// "needsResync", "relayResets", "deviceList": [{"id", "own",
+    /// "ownOpsMissing", "holdingWrites", "needsResync", "relayResets",
+    /// "deviceList": [{"id", "own",
     /// "appliedSeq", "pending", "gap", "clockLeadMs", "equivocated"}]}`.
     #[wasm_bindgen(js_name = syncStatus)]
     pub fn sync_status(&self) -> String {
@@ -319,6 +327,22 @@ impl Database {
         self.core.sync_relay_token(relay_origin).map_err(js)
     }
 
+    /// After `fromSnapshot`, local writes are held back (status
+    /// `holdingWrites`) until a `syncIngestBatch` result has `more: false`:
+    /// the stored state may be older than what this device last uploaded,
+    /// and it must read its own earlier uploads back before it signs
+    /// anything new. Call this when the relay cannot be reached, so that
+    /// writes are not held for as long as the device is offline. Returns the
+    /// number of ops queued. If the state really was old, the device will
+    /// report `forked` once it reads the relay.
+    #[wasm_bindgen(js_name = syncReleaseWrites)]
+    pub fn sync_release_writes(&mut self, now_ms: f64) -> Result<u32, JsError> {
+        self.core
+            .sync_release_writes(now_ms as u64)
+            .map(|n| n as u32)
+            .map_err(js)
+    }
+
     /// Begin a resync: the next pulls read the relay's log from the start.
     /// Call when a `syncIngestBatch` result or the status says
     /// `needsResync`, with a growing delay between attempts.
@@ -327,10 +351,11 @@ impl Database {
         self.core.sync_start_resync().map_err(js)
     }
 
-    /// Give a device whose status says `forked` a new identity in the group
-    /// so that it can upload again; writes made while forked are queued for
+    /// Give a device whose status says `forked` (or whose `ownOpsMissing`
+    /// stays above 0 after a complete pull) a new identity in the group so
+    /// that it can upload again; writes made meanwhile are queued for
     /// upload. Returns the number of ops queued for them. Throws if the
-    /// device is not forked.
+    /// device is in neither state.
     #[wasm_bindgen(js_name = syncRejoin)]
     pub fn sync_rejoin(&mut self, now_ms: f64) -> Result<u32, JsError> {
         self.core
@@ -362,10 +387,11 @@ impl Database {
     }
 
     /// Take the relay's `Batch` and apply it. Returns JSON `{"items": n,
-    /// "ops": n, "changes": n, "more": bool, "relayReset": bool,
+    /// "ops": n, "changes": n, "more": bool, "relayReset": bool, "queued": n,
     /// "needsResync": bool, "forked": bool}`; `changes` is the number of
     /// changes applied to the graph. Persist when `ops > 0`. With
-    /// `relayReset`, push again: what was in flight is back in the outbox.
+    /// `relayReset` or `queued > 0` (local writes that were held back until
+    /// the relay had been read are now queued), push.
     #[wasm_bindgen(js_name = syncIngestBatch)]
     pub fn sync_ingest_batch(&mut self, reply: &[u8], now_ms: f64) -> Result<String, JsError> {
         self.core
@@ -557,12 +583,23 @@ mod tests {
         assert!(!text.contains(&code[5..]));
         assert!(!text.contains(&token));
         assert_eq!(status["forked"], false);
+        assert_eq!(status["ownOpsMissing"], 0);
+        // Freshly loaded state holds writes until the relay has been read...
+        assert_eq!(status["holdingWrites"], true);
+        assert_eq!(v(&a.sync_status())["holdingWrites"], false);
         assert_eq!(status["needsResync"], false);
         let devices = status["deviceList"].as_array().unwrap();
         assert_eq!(devices.len(), 2);
         assert_eq!(devices.iter().filter(|d| d["own"] == true).count(), 1);
         assert!(devices.iter().all(|d| d["clockLeadMs"] == 0));
         let mut restored = restored;
+        restored
+            .execute("CREATE (:P {name: 'held'})", None)
+            .unwrap();
+        assert_eq!(restored.sync_commit(8_000).unwrap(), 0);
+        // ...or until the transport gives up waiting.
+        assert_eq!(restored.sync_release_writes(8_500).unwrap(), 1);
+        assert_eq!(v(&restored.sync_status())["holdingWrites"], false);
         assert!(restored.sync_rejoin(9_000).unwrap_err().contains("rejoin"));
     }
 }

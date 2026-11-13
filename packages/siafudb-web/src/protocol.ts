@@ -130,6 +130,16 @@ export interface SyncStatus {
    * `db.sync.rejoinAsNewDevice()` is called. Downloads continue.
    */
   needsRejoin: boolean;
+  /**
+   * Local writes are being held back from upload until this device has read
+   * the relay: right after opening (for one round trip, or until the relay
+   * turns out to be unreachable), or because the device was restored from
+   * an older copy and is reading its own earlier uploads back. The writes
+   * are in the database and are uploaded afterwards. If this stays true
+   * while `connected`, the relay has lost part of this device's history:
+   * call `db.sync.rejoinAsNewDevice()`.
+   */
+  catchingUp: boolean;
   /** Received commits were dropped for lack of room; the relay's log will be read again (automatic, with growing delays). */
   needsResync: boolean;
   /** Times the relay was found to have lost its data. History that only the relay held is gone. */

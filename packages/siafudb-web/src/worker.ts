@@ -207,6 +207,20 @@ class Session {
     await loop?.stop();
   }
 
+  /**
+   * No transport is running, so nothing will read the relay: local writes
+   * that were waiting for that (see `SyncStatus.catchingUp`) are queued for
+   * upload now.
+   */
+  releaseWrites(): void {
+    if (this.sync || !this.db.syncEnabled()) return;
+    try {
+      if (this.db.syncReleaseWrites(Date.now()) > 0) this.markDirty();
+    } catch {
+      // Nothing was waiting.
+    }
+  }
+
   /** Create (`code` undefined) or join a group, persist it, then start syncing. */
   async syncSetup(
     relayUrl: string,
@@ -274,7 +288,12 @@ class Session {
   /** Give a forked device a new identity; what it wrote meanwhile is queued for upload. */
   async syncRejoin(): Promise<void> {
     this.needGroup();
-    if (!this.syncStatus().needsRejoin)
+    const engine = JSON.parse(this.db.syncStatus()) as {
+      forked: boolean;
+      ownOpsMissing: number;
+    };
+    // Forked, or behind its own history with the relay unable to supply it.
+    if (!engine.forked && engine.ownOpsMissing === 0)
       throw new SiafuError(
         "sync",
         "this device does not need to rejoin (status().needsRejoin is false)",
@@ -295,6 +314,8 @@ class Session {
       skippedRemote: number;
       lastProblem: string | null;
       forked: boolean;
+      ownOpsMissing: number;
+      holdingWrites: boolean;
       needsResync: boolean;
       relayResets: number;
       deviceList: SyncStatus["deviceList"];
@@ -314,6 +335,7 @@ class Session {
       notApplied: (engine?.skippedRemote ?? 0) + (engine?.rejected ?? 0),
       lastProblem: engine?.lastProblem ?? null,
       needsRejoin: engine?.forked ?? false,
+      catchingUp: engine?.holdingWrites ?? false,
       needsResync: engine?.needsResync ?? false,
       relayResets: engine?.relayResets ?? 0,
       deviceList: engine?.deviceList ?? [],
@@ -335,7 +357,10 @@ class Session {
   async syncPause(stopped: boolean, registrationToken?: string): Promise<void> {
     this.needGroup();
     const meta = this.meta();
-    if (stopped) await this.stopSync();
+    if (stopped) {
+      await this.stopSync();
+      this.releaseWrites();
+    }
     if (Boolean(meta.stopped) !== stopped) {
       const next: SyncMeta = { ...meta };
       if (stopped) next.stopped = true;
@@ -406,6 +431,7 @@ async function doInit(a: InitArgs): Promise<InitResult> {
     // Writes captured before the last save but not yet queued for upload.
     session.afterQuery(false);
     session.startSync();
+    session.releaseWrites();
     let persisted: boolean | null = null;
     try {
       persisted = (await navigator.storage?.persist?.()) ?? null;

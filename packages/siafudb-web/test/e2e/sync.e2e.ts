@@ -850,56 +850,169 @@ describe.skipIf(!relayBin)("sync between two browser contexts", () => {
     await w.ctx.close();
   });
 
-  it("a device restored from an older copy needs to rejoin, and loses none of its writes", async () => {
-    // F lives in its own browser profile directory, so the whole of its
-    // storage (snapshot, keys, rollback counter) can be put back as it was.
-    const profile = path.join(scratch, "profile-f");
-    const backup = path.join(scratch, "profile-f.backup");
-    const launch = async () => {
-      const ctx = await chromium.launchPersistentContext(profile);
-      const f = await newDevice("F", ctx);
-      const opened = await openDb(f, "sync-f");
-      return { f, opened };
+  /**
+   * A device in its own browser profile directory, so the whole of its
+   * storage (snapshot, keys, rollback counter) can be put back as it was.
+   */
+  function profileDevice(label: string, dbName: string) {
+    const profile = path.join(scratch, `profile-${label}`);
+    const backup = `${profile}.backup`;
+    return {
+      async launch() {
+        const ctx = await chromium.launchPersistentContext(profile);
+        const d = await newDevice(label, ctx);
+        const opened = await openDb(d, dbName);
+        return { d, opened };
+      },
+      async shut(d: Device) {
+        await d.page.evaluate(() => (window as unknown as Win).db.close());
+        await d.ctx.close();
+      },
+      /** Copy the (closed) profile aside. */
+      backUp: () => cpSync(profile, backup, { recursive: true }),
+      /** Put the copy back over the (closed) profile. */
+      restore() {
+        rmSync(profile, { recursive: true, force: true });
+        cpSync(backup, profile, { recursive: true });
+      },
     };
-    const shut = async (f: Device) => {
-      await f.page.evaluate(() => (window as unknown as Win).db.close());
-      await f.ctx.close();
-    };
+  }
 
-    let { f } = await launch();
+  const oncePerKey = async (d: Device, wanted: string[]) => {
+    const k = await keys(d);
+    for (const key of wanted)
+      expect(
+        k.filter((x) => x === key),
+        `${key} on ${d.label}`,
+      ).toHaveLength(1);
+  };
+
+  it("a device restored from an older copy catches up by itself when it can read the relay first", async () => {
+    const p = profileDevice("G", "sync-g");
+    let { d: g } = await p.launch();
+    await join(g, code);
+    await run(g, "CREATE (:Note {key: 'g-base', text: 'before the backup'})");
+    await converged([a, g], "G to join", (x) => x.includes("g-base"));
+    const devicesBefore = (await status(a)).devices;
+    await p.shut(g);
+    p.backUp();
+
+    // G goes on and uploads writes that the backup does not have...
+    ({ d: g } = await p.launch());
+    await run(
+      g,
+      "CREATE (:Note {key: 'g-w1', text: 'uploaded, then lost locally'})",
+    );
+    await run(
+      g,
+      "MATCH (n:Note {key: 'g-base'}) SET n.text = 'edited before the restore'",
+    );
+    await converged([a, g], "G's writes to reach A", (x) => x.includes("g-w1"));
+    await p.shut(g);
+    // ...and then its storage is rolled back to the backup.
+    p.restore();
+
+    let opened;
+    ({ d: g, opened } = await p.launch());
+    expect(opened.restored).toBe(true);
+    expect(opened.status).toMatchObject({ enabled: true, running: true });
+    // The app writes at once, without waiting for anything: the write is in
+    // the database immediately and is held from upload until G has read its
+    // own earlier uploads back from the relay.
+    await run(
+      g,
+      "CREATE (:Note {key: 'g-during', text: 'written right after opening'})",
+    );
+    expect(await keys(g)).toContain("g-during");
+
+    await converged(
+      [a, b, g],
+      "the restored device to catch up and upload",
+      (x) => x.includes("g-during") && x.includes("edited before the restore"),
+    );
+    const s = await status(g);
+    expect(s).toMatchObject({
+      needsRejoin: false,
+      catchingUp: false,
+      connected: true,
+      pendingUploads: 0,
+      notUploaded: 0,
+    });
+    // Nothing lost, nothing twice, on any device.
+    for (const d of [a, b, g])
+      await oncePerKey(d, ["g-base", "g-w1", "g-during"]);
+    // It got its own lost writes back as remote changes.
+    expect((await remote(g)).changes).toBeGreaterThanOrEqual(2);
+    // To the others it is the same device as before, in good standing.
+    const sa = await status(a);
+    expect(sa.devices).toBe(devicesBefore);
+    expect(sa.deviceList.every((x) => !x.equivocated)).toBe(true);
+    // And its next write arrives like any other.
+    await run(g, "CREATE (:Note {key: 'g-after', text: 'G'})");
+    await converged([a, b, g], "G to sync normally again", (x) =>
+      x.includes("g-after"),
+    );
+    expect(await failure(g, "rejoinAsNewDevice")).toMatch(
+      /^sync: this device does not need to rejoin/,
+    );
+    await p.shut(g);
+  });
+
+  it("a restored device that uploads before reading the relay needs to rejoin, and loses none of its writes", async () => {
+    // The one way to write before reading: sync is stopped, so nothing reads
+    // the relay and writes are queued for upload as usual. The backup is
+    // taken in that state, which makes the order of events certain.
+    const p = profileDevice("F", "sync-f");
+    let { d: f } = await p.launch();
     await join(f, code);
     await run(f, "CREATE (:Note {key: 'f-base', text: 'before the backup'})");
-    await converged([a, f], "F to join", (g) => g.includes("f-base"));
+    await converged([a, f], "F to join", (x) => x.includes("f-base"));
     const devicesBefore = (await status(a)).devices;
-    await shut(f);
-    cpSync(profile, backup, { recursive: true });
+    await f.page.evaluate(() => (window as unknown as Win).db.sync.stop());
+    await p.shut(f);
+    p.backUp();
 
     // F goes on, uploads a write...
-    ({ f } = await launch());
+    ({ d: f } = await p.launch());
+    await f.page.evaluate(() => (window as unknown as Win).db.sync.start());
     await run(
       f,
       "CREATE (:Note {key: 'f-w1', text: 'uploaded, then lost locally'})",
     );
-    await converged([a, f], "F's write to reach A", (g) => g.includes("f-w1"));
-    await shut(f);
+    await converged([a, f], "F's write to reach A", (x) => x.includes("f-w1"));
+    await p.shut(f);
     // ...and then its storage is rolled back to the backup.
-    rmSync(profile, { recursive: true, force: true });
-    cpSync(backup, profile, { recursive: true });
+    p.restore();
 
     let opened;
-    ({ f, opened } = await launch());
+    ({ d: f, opened } = await p.launch());
     expect(opened.restored).toBe(true);
-    expect(opened.status).toMatchObject({ enabled: true, running: true });
-    // It finds its own lost write on the relay and knows it was rolled back.
+    expect(opened.status).toMatchObject({
+      enabled: true,
+      running: false,
+      needsRejoin: false,
+      catchingUp: false,
+    });
+    // Still stopped, it writes: queued for upload under a position in its
+    // history that it has already used for `f-w1`.
+    await run(
+      f,
+      "CREATE (:Note {key: 'f-w2', text: 'written before reading the relay'})",
+    );
+    expect((await status(f)).pendingUploads).toBe(1);
+    expect(await keys(f)).not.toContain("f-w1");
+
+    // On start it finds its own lost write on the relay: a conflict.
+    await f.page.evaluate(() => (window as unknown as Win).db.sync.start());
     await until(
-      "F to notice the rollback",
+      "F to notice the conflict with what it had uploaded",
       async () => (await status(f)).needsRejoin,
       () => status(f),
     );
     expect(await keys(f)).toContain("f-w1"); // it follows what it had published
 
     // Writes still work locally, but go nowhere.
-    await run(f, "CREATE (:Note {key: 'f-w2', text: 'written while forked'})");
+    await run(f, "CREATE (:Note {key: 'f-w3', text: 'written while forked'})");
     await run(
       f,
       "MATCH (n:Note {key: 'f-base'}) SET n.text = 'edited while forked'",
@@ -911,13 +1024,15 @@ describe.skipIf(!relayBin)("sync between two browser contexts", () => {
       () => status(f),
     );
     await syncNow(a);
-    expect(await keys(a)).not.toContain("f-w2");
+    const onA = await keys(a);
+    expect(onA).not.toContain("f-w2");
+    expect(onA).not.toContain("f-w3");
     expect(await status(f)).toMatchObject({ needsRejoin: true, running: true });
     // ...also across a reload.
-    await shut(f);
-    ({ f, opened } = await launch());
+    await p.shut(f);
+    ({ d: f, opened } = await p.launch());
     expect(opened.status.needsRejoin).toBe(true);
-    expect(await keys(f)).toContain("f-w2");
+    await oncePerKey(f, ["f-w2", "f-w3"]);
 
     // Only the forked device can rejoin.
     expect(await failure(a, "rejoinAsNewDevice")).toMatch(
@@ -930,28 +1045,28 @@ describe.skipIf(!relayBin)("sync between two browser contexts", () => {
     await converged(
       [a, b, f],
       "the rejoined device's writes to arrive",
-      (g) => g.includes("f-w2") && g.includes("edited while forked"),
+      (x) =>
+        x.includes("f-w2") &&
+        x.includes("f-w3") &&
+        x.includes("edited while forked"),
     );
-    for (const d of [a, f]) {
-      const k = await keys(d);
-      for (const key of ["f-base", "f-w1", "f-w2", "a-meanwhile"])
-        expect(
-          k.filter((x) => x === key),
-          key,
-        ).toHaveLength(1);
-    }
-    // To the others it is one device more.
+    for (const d of [a, b, f])
+      await oncePerKey(d, ["f-base", "f-w1", "f-w2", "f-w3", "a-meanwhile"]);
+    // To the others it is one device more, and the old one is marked.
     await until(
       "A to see the new identity",
       async () => (await status(a)).devices === devicesBefore + 1,
       () => status(a),
     );
+    expect(
+      (await status(a)).deviceList.filter((x) => x.equivocated),
+    ).toHaveLength(1);
     // And it can write again.
     await run(f, "CREATE (:Note {key: 'f-after-rejoin', text: 'F'})");
-    await converged([a, b, f], "F to sync normally again", (g) =>
-      g.includes("f-after-rejoin"),
+    await converged([a, b, f], "F to sync normally again", (x) =>
+      x.includes("f-after-rejoin"),
     );
-    await shut(f);
+    await p.shut(f);
   });
 
   it("a relay that requires a registration secret: create needs it, join does not", async () => {

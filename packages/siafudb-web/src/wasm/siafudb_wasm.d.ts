@@ -64,10 +64,11 @@ export class Database {
     syncEnabled(): boolean;
     /**
      * Take the relay's `Batch` and apply it. Returns JSON `{"items": n,
-     * "ops": n, "changes": n, "more": bool, "relayReset": bool,
+     * "ops": n, "changes": n, "more": bool, "relayReset": bool, "queued": n,
      * "needsResync": bool, "forked": bool}`; `changes` is the number of
      * changes applied to the graph. Persist when `ops > 0`. With
-     * `relayReset`, push again: what was in flight is back in the outbox.
+     * `relayReset` or `queued > 0` (local writes that were held back until
+     * the relay had been read are now queued), push.
      */
     syncIngestBatch(reply: Uint8Array | number[], now_ms: number): string;
     /**
@@ -101,10 +102,11 @@ export class Database {
      */
     syncPushFrame(): Uint8Array | undefined;
     /**
-     * Give a device whose status says `forked` a new identity in the group
-     * so that it can upload again; writes made while forked are queued for
+     * Give a device whose status says `forked` (or whose `ownOpsMissing`
+     * stays above 0 after a complete pull) a new identity in the group so
+     * that it can upload again; writes made meanwhile are queued for
      * upload. Returns the number of ops queued for them. Throws if the
-     * device is not forked.
+     * device is in neither state.
      */
     syncRejoin(now_ms: number): number;
     /**
@@ -113,6 +115,17 @@ export class Database {
      * own token. Throws if not in a sync group or the origin is not usable.
      */
     syncRelayToken(relay_origin: string): string;
+    /**
+     * After `fromSnapshot`, local writes are held back (status
+     * `holdingWrites`) until a `syncIngestBatch` result has `more: false`:
+     * the stored state may be older than what this device last uploaded,
+     * and it must read its own earlier uploads back before it signs
+     * anything new. Call this when the relay cannot be reached, so that
+     * writes are not held for as long as the device is offline. Returns the
+     * number of ops queued. If the state really was old, the device will
+     * report `forked` once it reads the relay.
+     */
+    syncReleaseWrites(now_ms: number): number;
     /**
      * Begin a resync: the next pulls read the relay's log from the start.
      * Call when a `syncIngestBatch` result or the status says
@@ -123,7 +136,8 @@ export class Database {
      * JSON: `null` when not in a sync group, else `{"groupId", "outbox",
      * "cursor", "localOps", "remoteOps", "pending", "devices", "rejected",
      * "droppedLocal", "skippedRemote", "lastProblem", "unechoed", "forked",
-     * "needsResync", "relayResets", "deviceList": [{"id", "own",
+     * "ownOpsMissing", "holdingWrites", "needsResync", "relayResets",
+     * "deviceList": [{"id", "own",
      * "appliedSeq", "pending", "gap", "clockLeadMs", "equivocated"}]}`.
      */
     syncStatus(): string;
@@ -162,6 +176,7 @@ export interface InitOutput {
     readonly database_syncPushFrame: (a: number) => [number, number, number, number];
     readonly database_syncRejoin: (a: number, b: number) => [number, number, number];
     readonly database_syncRelayToken: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly database_syncReleaseWrites: (a: number, b: number) => [number, number, number];
     readonly database_syncStartResync: (a: number) => [number, number];
     readonly database_syncStatus: (a: number) => [number, number];
     readonly __wbindgen_exn_store: (a: number) => void;

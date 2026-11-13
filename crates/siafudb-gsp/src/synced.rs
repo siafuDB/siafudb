@@ -36,8 +36,8 @@ pub enum Error {
         /// The version the stored state declares.
         found: u64,
     },
-    /// [`SyncedDb::rejoin_as_new_device`] was called on a device that is not
-    /// forked.
+    /// [`SyncedDb::rejoin_as_new_device`] was called on a device that is
+    /// neither forked nor behind its own chain.
     NotForked,
     /// The operating system gave no random bytes.
     Random,
@@ -87,7 +87,7 @@ impl From<gsp_sync::Error> for Error {
 }
 
 /// The replica state version this build reads and writes.
-pub const SYNC_STATE_VERSION: u64 = 1;
+pub const SYNC_STATE_VERSION: u64 = 2;
 /// How the message of [`Error::SyncStateVersion`] starts, for callers that
 /// only get the text.
 pub const SYNC_STATE_VERSION_PREFIX: &str = "stored sync state version";
@@ -108,6 +108,9 @@ pub struct BatchOutcome {
     /// from it: it lost its log. The cursor is back at 0 and what was in
     /// flight is in the outbox again; push and pull.
     pub relay_reset: bool,
+    /// Ops queued by this call for local writes that had been held back
+    /// (see [`SyncedDb::holding_writes`]): push.
+    pub queued: usize,
 }
 
 /// What this device knows about one device of the group.
@@ -166,6 +169,15 @@ pub struct SyncStatus {
     /// This device's state was rolled back: local writes stay local until
     /// [`SyncedDb::rejoin_as_new_device`].
     pub forked: bool,
+    /// Ops of this device's own that the relay holds and this device has
+    /// seen but not yet applied (it was restored from an older copy and is
+    /// catching up). If this stays above 0 after a complete pull, the relay
+    /// no longer has one of them and only
+    /// [`SyncedDb::rejoin_as_new_device`] gets the device uploading again.
+    pub own_ops_missing: u64,
+    /// Local writes are being held back, not yet handed to the replica (see
+    /// [`SyncedDb::holding_writes`]).
+    pub holding_writes: bool,
     /// Received ops were dropped for lack of room: the transport should
     /// [`SyncedDb::start_resync`], with a growing delay.
     pub needs_resync: bool,
@@ -184,6 +196,13 @@ pub struct SyncedDb {
     meta: Vec<u8>,
     /// Items in the `Push` frame last built and not yet acknowledged.
     in_flight: usize,
+    /// The state was loaded from storage and the relay's head has not been
+    /// read since: it may be older than what this device last pushed.
+    /// Never persisted.
+    head_unread: bool,
+    /// A local write was held back while remote effects may have been
+    /// applied: the next commit writes its changes to the engine again.
+    held: bool,
     dropped_local: u64,
     skipped_remote: u64,
     last_problem: Option<String>,
@@ -274,6 +293,8 @@ impl SyncedDb {
             replica: None,
             meta: Vec::new(),
             in_flight: 0,
+            head_unread: false,
+            held: false,
             dropped_local: 0,
             skipped_remote: 0,
             last_problem: None,
@@ -335,6 +356,8 @@ impl SyncedDb {
                 })?,
             );
             synced.db.enable_change_capture()?;
+            // SYNC-V0 section 6.1 step 6: this may be an old copy.
+            synced.head_unread = true;
         }
         Ok(synced)
     }
@@ -434,6 +457,8 @@ impl SyncedDb {
                 + stats.refused,
             unechoed: stats.unechoed,
             forked: stats.forked,
+            own_ops_missing: stats.own_ops_missing,
+            holding_writes: self.holding_writes(),
             needs_resync: stats.needs_resync,
             relay_resets: stats.relay_resets,
             device_list: replica
@@ -505,16 +530,51 @@ impl SyncedDb {
             // committed by `rejoin_as_new_device`.
             return Ok(0);
         }
-        if self.catching_up() {
-            // The device was restored from an older copy and has not yet
-            // received all of its own earlier ops back. Signing now would
-            // reuse a position it already published. The writes wait in the
-            // capture queue and are committed by the first call after the
-            // pull that completes the catch-up.
+        if self.holding_writes() {
+            // Signing now could reuse a position this device already
+            // published (see `holding_writes`). The writes stay in the
+            // engine's capture queue, which the snapshot persists, and are
+            // committed when the hold ends.
+            self.held = true;
             return Ok(0);
         }
         let changes = self.take(|db| db.take_changes())?;
-        Ok(self.commit(changes, now_ms, false))
+        // Remote effects may have reached the engine while these waited.
+        let reassert = core::mem::take(&mut self.held);
+        Ok(self.commit(changes, now_ms, reassert))
+    }
+
+    /// Whether local writes are being held back instead of handed to the
+    /// replica. They are safe (in the engine and in every snapshot) and are
+    /// committed, with the stamp of that moment, when the hold ends. Two
+    /// reasons:
+    ///
+    /// - the state was loaded from storage and the relay has not been read
+    ///   to its head since. Stored state can be older than what the device
+    ///   last pushed (a restored backup), and an op signed before the
+    ///   device's own later ops have come back takes a position that is
+    ///   already used: a fork (SYNC-V0 section 6.1 step 6). The hold ends
+    ///   with the first [`ingest_batch`](Self::ingest_batch) whose `more` is
+    ///   false, or when the transport gives up waiting with
+    ///   [`release_writes`](Self::release_writes);
+    /// - the replica has seen ops of its own that it has not applied yet
+    ///   ([`catching_up`](Self::catching_up)). Only applying them ends that.
+    pub fn holding_writes(&self) -> bool {
+        self.replica.is_some() && !self.forked() && (self.head_unread || self.catching_up())
+    }
+
+    /// Stop waiting for the relay's head: the transport cannot reach the
+    /// relay (or is not running), and holding writes until it can would
+    /// stamp them with the time of the reconnection instead of the time
+    /// they were made. Commits what was held, unless the device is known to
+    /// be behind its own chain. Returns the ops queued.
+    ///
+    /// The price: if the stored state was in fact rolled back, these ops
+    /// conflict with the device's earlier ones and it will be
+    /// [`forked`](Self::forked) once it reads the relay.
+    pub fn release_writes(&mut self, now_ms: u64) -> Result<usize, Error> {
+        self.head_unread = false;
+        self.commit_local(now_ms)
     }
 
     /// True while a restored device is still receiving its own earlier ops
@@ -531,7 +591,8 @@ impl SyncedDb {
         self.replica.as_ref().is_some_and(Replica::forked)
     }
 
-    /// Give a forked device a new identity in the group, so that it can
+    /// Give a forked device (or one that stays behind its own chain because
+    /// the relay lost part of it) a new identity in the group, so that it can
     /// upload again. To the other devices this is a new device joining.
     ///
     /// What the device wrote while forked is not lost: writes it had already
@@ -544,9 +605,13 @@ impl SyncedDb {
     /// engine. Not done automatically: the application decides.
     pub fn rejoin_as_new_device(&mut self, now_ms: u64) -> Result<usize, Error> {
         let replica = self.replica.as_mut().ok_or(Error::NotEnabled)?;
-        if !replica.forked() {
+        // A device that is behind its own chain and cannot catch up (the
+        // relay no longer has the op) recovers the same way.
+        if !replica.forked() && replica.stats().own_ops_missing == 0 {
             return Err(Error::NotForked);
         }
+        self.head_unread = false;
+        self.held = false;
         let seed = random::<32>()?;
         let nonce = random::<24>()?;
         let effects = replica.reset_identity(*seed, *nonce)?;
@@ -823,6 +888,15 @@ impl SyncedDb {
         {
             // A `next` that cannot be right; trust it only as a cursor.
             replica.set_cursor(next.max(replica.cursor()));
+        }
+        // Read to the relay's head: stored state that was old has now seen
+        // the device's own later ops, and held writes can be signed.
+        let was_holding = self.holding_writes();
+        if !outcome.more {
+            self.head_unread = false;
+        }
+        if was_holding && !self.holding_writes() {
+            outcome.queued = self.commit_local(now_ms)?;
         }
         Ok(outcome)
     }
