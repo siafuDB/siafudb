@@ -122,7 +122,7 @@ nothing has been published under those names.
 
 Phase 1 adds, as they land: `crates/siafudb-wasm` (browser bindings),
 `crates/siafudb-store` (page store and encryption), `crates/siafudb-ffi`
-(UniFFI for Swift and Kotlin), `packages/*` (`@siafudb/web`, TypeScript) and
+(UniFFI for Swift and Kotlin), `packages/*` (`@bundu/siafudb-web`, TypeScript) and
 `apps/*` (Astro PWA demo). The Documentation site is Mintlify
 (`siafudb-docs`).
 
@@ -198,7 +198,7 @@ the list below keeps the long-range themes.
 - [x] Stand up the Cargo workspace
 - [x] Fork GrafeoDB 0.6.2 and pin it under `engine/` ([ADR-0001](docs/adr/0001-fork-grafeo-and-freeze-upstream.md))
 - [x] Node 24 baseline; CI for Rust, wasm, mobile libs and the engine pin
-- [ ] `@siafudb/web`: wasm + TypeScript API + encrypted OPFS/IndexedDB persistence
+- [ ] `@bundu/siafudb-web`: wasm + TypeScript API + encrypted OPFS/IndexedDB persistence
 - [ ] `siafudb-store` (page store trait + encryption), `gsp-wire` (signed op envelope), `siafudb-ffi` (UniFFI)
 - [ ] Publish initial SiafuDB releases (Rust and npm first)
 - [x] Launch siafudb.org documentation site

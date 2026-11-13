@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Browser (wasm-bindgen) bindings for SiafuDB. Consumed by @siafudb/web."
+description = "Browser (wasm-bindgen) bindings for SiafuDB. Consumed by @bundu/siafudb-web."
 publish = false
 
 [lib]
