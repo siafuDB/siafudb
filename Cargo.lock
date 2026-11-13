@@ -912,7 +912,7 @@ dependencies = [
 [[package]]
 name = "gsp-sync"
 version = "0.1.0"
-source = "git+https://github.com/siafuDB/siafudb-gsp?rev=7b5cb581f09bc49a53ce06683375733ba1f62d05#7b5cb581f09bc49a53ce06683375733ba1f62d05"
+source = "git+https://github.com/siafuDB/siafudb-gsp?rev=5455b11f86ddcf27c4bc4b618176a20578b4b726#5455b11f86ddcf27c4bc4b618176a20578b4b726"
 dependencies = [
  "blake3",
  "gsp-wire",
@@ -922,7 +922,7 @@ dependencies = [
 [[package]]
 name = "gsp-wire"
 version = "0.1.0"
-source = "git+https://github.com/siafuDB/siafudb-gsp?rev=7b5cb581f09bc49a53ce06683375733ba1f62d05#7b5cb581f09bc49a53ce06683375733ba1f62d05"
+source = "git+https://github.com/siafuDB/siafudb-gsp?rev=5455b11f86ddcf27c4bc4b618176a20578b4b726#5455b11f86ddcf27c4bc4b618176a20578b4b726"
 dependencies = [
  "blake3",
  "chacha20poly1305",
