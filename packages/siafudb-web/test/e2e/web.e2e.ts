@@ -158,7 +158,7 @@ function openIn(
   );
 }
 
-describe("@siafudb/web in headless Chromium", () => {
+describe("@bundu/siafudb-web in headless Chromium", () => {
   it("create + query with hostile parameters, typed results, persist() and estimate()", async () => {
     const page = await newPage();
     const opened = await openIn(page, "hostile");

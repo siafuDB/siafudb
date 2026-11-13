@@ -11,7 +11,7 @@ export type SiafuErrorCode =
   | "storage" // the storage backend failed
   | "internal";
 
-/** Base class for every error thrown by `@siafudb/web`. */
+/** Base class for every error thrown by `@bundu/siafudb-web`. */
 export class SiafuError extends Error {
   readonly code: SiafuErrorCode;
   constructor(

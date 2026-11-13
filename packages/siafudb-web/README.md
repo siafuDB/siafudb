@@ -1,4 +1,4 @@
-# @siafudb/web
+# @bundu/siafudb-web
 
 SiafuDB in the browser: the Rust graph engine compiled to WebAssembly, running in a
 dedicated Worker, persisted as an **encrypted** snapshot in OPFS (preferred) or
@@ -8,7 +8,7 @@ IndexedDB. Requires Node >= 24 for tooling and a secure context (https or localh
 
 ```ts
 // main.ts
-import { SiafuDB } from '@siafudb/web';
+import { SiafuDB } from '@bundu/siafudb-web';
 
 const db = await SiafuDB.open('notes');                       // OPFS if available, else IndexedDB
 await db.execute('CREATE (:Note {title: $t})', { t: `it's "quoted" \\ safe` }); // always bind parameters
@@ -20,14 +20,14 @@ await db.flush();                                             // optional: autos
 ```ts
 // vite.config.ts  (the worker + wasm are bundled via `new URL(..., import.meta.url)`)
 import { defineConfig } from 'vite';
-export default defineConfig({ build: { target: 'esnext' }, worker: { format: 'es' }, optimizeDeps: { exclude: ['@siafudb/web'] } });
+export default defineConfig({ build: { target: 'esnext' }, worker: { format: 'es' }, optimizeDeps: { exclude: ['@bundu/siafudb-web'] } });
 ```
 
 ## Quickstart (Astro island)
 
 Run it client-only, never during SSR: `<Notes client:only="react" />` (or any framework island),
 or a plain `<script>` in an `.astro` page. Put the same Vite settings under `vite:` in `astro.config.mjs`
-(`vite: { build: { target: 'esnext' }, worker: { format: 'es' }, optimizeDeps: { exclude: ['@siafudb/web'] } }`).
+(`vite: { build: { target: 'esnext' }, worker: { format: 'es' }, optimizeDeps: { exclude: ['@bundu/siafudb-web'] } }`).
 The Astro integration is not covered by this package's tests; the Vite recipe above is verified.
 
 ## API
