@@ -18,10 +18,12 @@ export interface SyncEngine {
   syncPushFrame(): Uint8Array | undefined;
   syncAcceptAck(reply: Uint8Array): number;
   syncPullFrame(): Uint8Array;
-  /** JSON `{"items": n, "ops": n, "changes": n, "more": bool, "stalled": bool}`. */
+  /** JSON `{"items", "ops", "changes", "more", "relayReset", "needsResync", "forked"}`. */
   syncIngestBatch(reply: Uint8Array, nowMs: number): string;
   syncPoll(nowMs: number): number;
-  syncRelayToken(): string | undefined;
+  /** The bearer token for the relay at this origin. Throws if there is none. */
+  syncRelayToken(relayOrigin: string): string;
+  syncStartResync(): void;
 }
 
 /** What the transport needs from its surroundings (injected for tests). */
@@ -51,6 +53,16 @@ export interface SyncHost {
 
 export interface SyncLoopOptions {
   relayUrl: string;
+  /**
+   * The relay's registration secret, for a relay that requires one to accept
+   * a new group. Sent as `x-gsp-registration` with pushes until one succeeds
+   * (and again after the relay is seen to have lost its data). Kept in
+   * memory only.
+   */
+  registrationToken?: string;
+  /** First delay before a resync the engine asked for; doubles up to `resyncMaxMs`. */
+  resyncMinMs?: number;
+  resyncMaxMs?: number;
   /** `wait_ms` of an idle pull. The relay caps it at 25000. */
   longPollMs?: number;
   /** Delay between a local write and its push, to batch bursts. */
@@ -73,34 +85,76 @@ export interface SyncLoopState {
 /** Slack on top of `wait_ms` before a pull is given up as hung. */
 const REQUEST_SLACK_MS = 15_000;
 
+/** A relay address: where requests go, and the origin the token is bound to. */
+export interface RelayAddress {
+  /** Base URL without a trailing slash; `/v0/push` and `/v0/pull` are appended. */
+  url: string;
+  /** `scheme://host[:port]`. */
+  origin: string;
+}
+
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
 /**
- * Check a relay URL and return its canonical form (no trailing slash).
- * Only `http:` and `https:`; no credentials, query or fragment.
+ * Check a relay URL. `https:` only, except that `http:` is accepted for
+ * `localhost`, `127.0.0.1` and `[::1]` (development); no credentials, query
+ * or fragment. The relay token and everything pushed travel over this
+ * connection, and the protocol adds no transport security of its own.
  */
-export function normalizeRelayUrl(input: string): string {
+export function parseRelayUrl(input: string): RelayAddress {
   let url: URL;
   try {
     url = new URL(input);
   } catch {
     throw new SiafuError("sync", "relayUrl is not a valid URL");
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:")
-    throw new SiafuError("sync", "relayUrl must be an http(s) URL");
+  if (url.protocol === "http:") {
+    if (!LOOPBACK.has(url.hostname))
+      throw new SiafuError(
+        "sync",
+        "relayUrl must use https:// (plain http:// is accepted for localhost, 127.0.0.1 and [::1] only)",
+      );
+  } else if (url.protocol !== "https:")
+    throw new SiafuError("sync", "relayUrl must be an https:// URL");
   if (url.username || url.password || url.search || url.hash)
     throw new SiafuError(
       "sync",
       "relayUrl must not carry credentials, a query or a fragment",
     );
-  return url.origin + url.pathname.replace(/\/+$/, "");
+  return {
+    url: url.origin + url.pathname.replace(/\/+$/, ""),
+    origin: url.origin,
+  };
 }
 
 /** A failed relay request. `permanent`: retrying soon will not help. */
-class RelayError extends SiafuError {
+export class RelayError extends SiafuError {
   constructor(
     message: string,
     readonly permanent: boolean,
+    /** The HTTP status, when the relay answered. */
+    readonly status?: number,
+    /** The delay the relay asked for (`retry-after`), in ms. */
+    readonly retryAfterMs?: number,
   ) {
     super("sync", message);
+  }
+}
+
+/** What the relay's refusal means, in words. Never holds a secret. */
+function refusal(status: number): string {
+  switch (status) {
+    case 401:
+      return "the relay does not accept this sync group's token (relay answered 401)";
+    case 403:
+      return "the relay requires a registration token to accept a new sync group, and none or a wrong one was sent (relay answered 403)";
+    case 413:
+      return "the relay refused the upload as too large or over its quota (relay answered 413)";
+    case 429:
+    case 503:
+      return `the relay is busy (relay answered ${status})`;
+    default:
+      return `relay answered ${status}`;
   }
 }
 
@@ -128,6 +182,16 @@ const stopped = () => new SiafuError("sync", "sync was stopped");
 
 export class SyncLoop {
   private readonly url: string;
+  private readonly origin: string;
+  private readonly registrationToken: string | undefined;
+  /** Whether the next push carries the registration secret. */
+  private register: boolean;
+  private readonly resyncMinMs: number;
+  private readonly resyncMaxMs: number;
+  /** Resyncs started since the engine last got through a replay without asking for another. */
+  private resyncAttempts = 0;
+  /** When the next resync may start (`now()` scale); `null`: none wanted. */
+  private resyncAt: number | null = null;
   private readonly longPollMs: number;
   private readonly pushDebounceMs: number;
   private readonly minBackoffMs: number;
@@ -156,7 +220,16 @@ export class SyncLoop {
     private readonly host: SyncHost,
     options: SyncLoopOptions,
   ) {
-    this.url = normalizeRelayUrl(options.relayUrl);
+    const relay = parseRelayUrl(options.relayUrl);
+    this.url = relay.url;
+    this.origin = relay.origin;
+    this.registrationToken = options.registrationToken || undefined;
+    this.register = this.registrationToken !== undefined;
+    this.resyncMinMs = Math.max(1, options.resyncMinMs ?? 5_000);
+    this.resyncMaxMs = Math.max(
+      this.resyncMinMs,
+      options.resyncMaxMs ?? 600_000,
+    );
     this.longPollMs = Math.min(
       25_000,
       Math.max(0, options.longPollMs ?? 20_000),
@@ -226,6 +299,22 @@ export class SyncLoop {
    * when both are done; rejects if the relay could not be reached (the loops
    * keep retrying on their own).
    */
+  /**
+   * Push everything queued, now. Resolves when the outbox is empty; rejects
+   * with a {@link RelayError} if the relay could not be used.
+   */
+  pushNow(): Promise<void> {
+    if (!this.running) return Promise.reject(stopped());
+    const done = new Promise<void>((resolve, reject) =>
+      this.pushWaiters.push({ resolve, reject }),
+    );
+    clearTimeout(this.pushTimer);
+    this.pushTimer = undefined;
+    this.pushSignal.set();
+    this.wake();
+    return done;
+  }
+
   syncNow(): Promise<void> {
     if (!this.running) return Promise.reject(stopped());
     const wait = (list: Waiter[]) =>
@@ -263,7 +352,11 @@ export class SyncLoop {
   }
 
   /** Delay before retry number `failures` (1-based), with jitter in [50%, 100%]. */
-  private backoff(failures: number, permanent: boolean): number {
+  private backoff(failures: number, error: unknown): number {
+    // The relay named a delay: wait that long, plus up to half as much again.
+    if (error instanceof RelayError && error.retryAfterMs !== undefined)
+      return Math.ceil(error.retryAfterMs * (1 + this.host.random() / 2));
+    const permanent = error instanceof RelayError && error.permanent;
     const ceiling = permanent
       ? this.maxBackoffMs
       : Math.min(
@@ -273,12 +366,11 @@ export class SyncLoop {
     return Math.ceil(ceiling * (0.5 + this.host.random() / 2));
   }
 
-  private failed(e: unknown): boolean {
+  private failed(e: unknown): void {
     this.connected = false;
     // Only our own fixed texts are kept; anything else could quote a request.
     this.lastError =
       e instanceof RelayError ? e.message : "sync failed unexpectedly";
-    return e instanceof RelayError && e.permanent;
   }
 
   private succeeded(): void {
@@ -294,9 +386,21 @@ export class SyncLoop {
     extra?: AbortSignal,
   ): Promise<Uint8Array> {
     if (!this.host.isOnline()) throw new RelayError("offline", false);
-    const token = this.db.syncRelayToken();
-    if (token === undefined)
-      throw new RelayError("sync is not set up for this database", true);
+    let token: string;
+    try {
+      token = this.db.syncRelayToken(this.origin);
+    } catch {
+      throw new RelayError(
+        "sync is not set up for this database, or the relay address is not usable",
+        true,
+      );
+    }
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/cbor",
+    };
+    const registering = path === "/v0/push" && this.register;
+    if (registering) headers["x-gsp-registration"] = this.registrationToken!;
     const ctl = new AbortController();
     const cancel = () => ctl.abort();
     const timer = setTimeout(cancel, timeoutMs);
@@ -308,10 +412,7 @@ export class SyncLoop {
       try {
         res = await this.host.fetch(this.url + path, {
           method: "POST",
-          headers: {
-            authorization: `Bearer ${token}`,
-            "content-type": "application/cbor",
-          },
+          headers,
           body: body as BufferSource,
           signal: ctl.signal,
           cache: "no-store",
@@ -324,8 +425,26 @@ export class SyncLoop {
       if (!res.ok) {
         const retry =
           res.status >= 500 || res.status === 429 || res.status === 408;
-        throw new RelayError(`relay answered ${res.status}`, !retry);
+        let retryAfterMs: number | undefined;
+        if (res.status === 429 || res.status === 503) {
+          // `retry-after` in seconds. A cross-origin page can only read it
+          // if the relay exposes the header; both statuses mean 1 s on the
+          // reference relay.
+          const seconds = Number(res.headers.get("retry-after") ?? "");
+          retryAfterMs =
+            Number.isFinite(seconds) && seconds > 0
+              ? Math.min(seconds * 1000, this.maxBackoffMs)
+              : 1_000;
+        }
+        throw new RelayError(
+          refusal(res.status),
+          !retry,
+          res.status,
+          retryAfterMs,
+        );
       }
+      // The group is registered on this relay now.
+      if (registering) this.register = false;
       try {
         return new Uint8Array(await res.arrayBuffer());
       } catch {
@@ -383,10 +502,10 @@ export class SyncLoop {
           for (const w of waiters) w.reject(stopped());
           break;
         }
-        const permanent = this.failed(e);
+        this.failed(e);
         for (const w of waiters) w.reject(e as Error);
         failures += 1;
-        await this.pause(this.backoff(failures, permanent));
+        await this.pause(this.backoff(failures, e));
         // What is still in the outbox is tried again.
         this.pushSignal.set();
       }
@@ -400,7 +519,21 @@ export class SyncLoop {
     while (this.running) {
       const waiters = this.pullWaiters;
       this.pullWaiters = [];
-      const waitMs = more || waiters.length > 0 ? 0 : this.longPollMs;
+      // A resync the engine asked for, once its delay has passed: read the
+      // relay's log from the start again.
+      if (this.resyncAt !== null && this.host.now() >= this.resyncAt) {
+        this.resyncAt = null;
+        this.resyncAttempts += 1;
+        try {
+          this.db.syncStartResync();
+          more = true;
+        } catch {
+          // Not in a group any more; the pull below reports it.
+        }
+      }
+      let waitMs = more || waiters.length > 0 ? 0 : this.longPollMs;
+      if (this.resyncAt !== null)
+        waitMs = Math.min(waitMs, Math.max(0, this.resyncAt - this.host.now()));
       const mine = new AbortController();
       this.pullAbort = mine;
       try {
@@ -419,7 +552,8 @@ export class SyncLoop {
               ops: number;
               changes: number;
               more: boolean;
-              stalled: boolean;
+              relayReset: boolean;
+              needsResync: boolean;
             },
         );
         // Ops held for a clock ahead of ours may be due by now.
@@ -432,13 +566,29 @@ export class SyncLoop {
         // reload continues from here. A frame that only echoed this
         // device's own items moved nothing but the cursor; the next
         // ordinary save covers that.
-        if (out.ops > 0 || late > 0) await this.host.persist();
+        if (out.ops > 0 || late > 0 || out.relayReset)
+          await this.host.persist();
         else if (out.items > 0) this.host.touched();
+        if (out.relayReset) {
+          // The relay lost its data: what it never handed back is in the
+          // outbox again, and the group has to be registered again.
+          this.register = this.registrationToken !== undefined;
+          this.pushSignal.set();
+        }
+        if (out.needsResync) {
+          // Received ops were dropped for lack of room. Replaying helps only
+          // if what blocked them is gone, so wait longer each time.
+          this.resyncAt ??=
+            now +
+            Math.min(
+              this.resyncMaxMs,
+              this.resyncMinMs * 2 ** Math.min(this.resyncAttempts, 20),
+            );
+        } else if (!more && this.resyncAt === null) {
+          // A whole replay went through without the engine asking again.
+          this.resyncAttempts = 0;
+        }
         if (out.changes + late > 0) this.host.applied(out.changes + late);
-        // The engine could not take an item yet and the relay would hand it
-        // straight back: retry after a long delay instead.
-        if (out.stalled)
-          throw new RelayError("received changes cannot be applied yet", true);
         if (more) this.pullWaiters.unshift(...waiters);
         else for (const w of waiters) w.resolve();
       } catch (e) {
@@ -451,11 +601,11 @@ export class SyncLoop {
           this.pullWaiters.unshift(...waiters);
           continue;
         }
-        const permanent = this.failed(e);
+        this.failed(e);
         for (const w of waiters) w.reject(e as Error);
         failures += 1;
         more = true;
-        await this.pause(this.backoff(failures, permanent));
+        await this.pause(this.backoff(failures, e));
       } finally {
         if (this.pullAbort === mine) this.pullAbort = undefined;
       }
