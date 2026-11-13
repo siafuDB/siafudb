@@ -4,16 +4,24 @@
   "description": "SiafuDB for the browser: wasm graph engine in a Worker with encrypted OPFS / IndexedDB persistence.",
   "license": "Apache-2.0",
   "type": "module",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "sideEffects": false,
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
     "./worker": "./dist/worker.js",
     "./siafudb_wasm_bg.wasm": "./dist/wasm/siafudb_wasm_bg.wasm"
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build:wasm": "node scripts/build-wasm.mjs",
     "build:ts": "tsc -p tsconfig.json && node scripts/copy-wasm.mjs",
