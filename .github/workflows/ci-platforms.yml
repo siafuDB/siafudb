@@ -1,0 +1,152 @@
+# Platform CI — engine pin, workspace, wasm, mobile libs, web (Node 24).
+#
+# Complements CI / Rust (the org's reusable workflow, which release.yml waits
+# on and which stays the required Rust gate). Nothing here gates a release.
+#
+# Status of each job (see ADR-0002 for the phases):
+#   engine-pin   passes today          candidate required check
+#   rust         fmt/clippy/test       candidate required check once it has a green run on main
+#   wasm         builds today          candidate required check once it has a green run on main
+#   mobile-libs  builds today (Linux)  candidate required check once it has a green run on main
+#   web          NOT required; skips itself until packages/ exists (Phase 1)
+#
+# Action pinning: third-party actions are pinned to commit SHAs, resolved from
+# the upstream tags with `git ls-remote` on 2026-11-13 (checkout v6.1.0,
+# setup-node v6.5.0, upload-artifact v7.0.2). The org's reusable workflows are
+# pinned the same way in the other files. Rust comes from the runner's rustup,
+# so no Rust-toolchain action is needed.
+
+name: CI / Platforms
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+  # The vendored engine (ADR-0001) is large; keep debug info small.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  engine-pin:
+    name: Engine pin (crates.io 0.6.2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Check engine/ against crates.io 0.6.2 packages
+        run: scripts/ci/check-engine-pin.sh
+
+  rust:
+    name: Rust (workspace, rustc 1.99+)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable, must be >= 1.99)
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          v="$(rustc --version | sed -E 's/rustc 1\.([0-9]+).*/\1/')"
+          [ "$v" -ge 99 ] || { echo "rustc is older than 1.99"; exit 1; }
+          rustc --version
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+
+  wasm:
+    name: wasm32 browser build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust with the wasm target
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+      - name: Build siafudb-core for the browser
+        run: cargo build -p siafudb-core --no-default-features --features browser --target wasm32-unknown-unknown
+
+  mobile-libs:
+    name: Mobile libs (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-ios, aarch64-linux-android]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust with the target
+        run: |
+          rustup toolchain install stable --profile minimal --target "${{ matrix.target }}"
+          rustup default stable
+      # --lib only: linking needs the platform SDK/NDK, compiling the Rust does not.
+      - name: Build the core library
+        run: cargo build -p siafudb-core --lib --target "${{ matrix.target }}"
+
+  web:
+    name: Web (Node 24, typecheck, vitest, Playwright Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Detect JavaScript workspaces
+        id: detect
+        run: |
+          if ls -d packages/*/package.json apps/*/package.json >/dev/null 2>&1; then
+            echo "present=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "present=false" >>"$GITHUB_OUTPUT"
+            echo "No packages/ or apps/ workspaces yet; skipping." >>"$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: steps.detect.outputs.present == 'true'
+        with:
+          node-version-file: .nvmrc # 24
+          cache: npm
+      - name: Install
+        if: steps.detect.outputs.present == 'true'
+        run: npm ci
+      - name: Typecheck
+        if: steps.detect.outputs.present == 'true'
+        run: npm run typecheck --workspaces --if-present
+      - name: Unit tests (vitest)
+        if: steps.detect.outputs.present == 'true'
+        run: npm test --workspaces --if-present
+      - name: Install Chromium for Playwright
+        if: steps.detect.outputs.present == 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Browser tests (Playwright, Chromium)
+        if: steps.detect.outputs.present == 'true'
+        run: npm run test:browser --workspaces --if-present
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure() && steps.detect.outputs.present == 'true'
+        with:
+          name: playwright-report
+          path: "**/playwright-report"
+          if-no-files-found: ignore

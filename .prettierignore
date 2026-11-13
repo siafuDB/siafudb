@@ -28,3 +28,9 @@ profile/governance/
 *-lock.yaml
 package-lock.json
 pnpm-lock.yaml
+
+# Spike probes are generated or throwaway code, kept verbatim as evidence
+docs/spike/probes/
+
+# Vendored engine fork (ADR-0001): byte-identical to upstream, never reformatted
+engine/
