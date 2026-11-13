@@ -23,3 +23,12 @@ target
 # macOS Finder metadata
 .DS_Store
 **/.DS_Store
+
+# probes are standalone; lockfiles are intentionally not committed
+**/docs/spike/probes/*/Cargo.lock
+
+# JS dependencies
+node_modules
+
+# agent worktrees
+.claude/worktrees/

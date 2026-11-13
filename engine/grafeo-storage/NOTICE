@@ -1,0 +1,9 @@
+siafudb-graph-storage
+Copyright 2026 The Bundu Foundation and SiafuDB contributors
+
+This crate is a modified fork of grafeo-storage 0.6.2 from GrafeoDB
+(https://github.com/GrafeoDB/grafeo), Copyright its authors, licensed under
+the Apache License 2.0. Source files are unchanged from upstream 0.6.2 except
+as recorded in engine/CHANGES.md; the package manifest was changed to rename
+the package and point at this repository. This fork does not track upstream
+and is not endorsed by the GrafeoDB project.

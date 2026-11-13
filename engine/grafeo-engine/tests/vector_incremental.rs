@@ -1,0 +1,428 @@
+//! Integration tests for incremental vector index operations.
+//!
+//! Tests that nodes added/deleted after `create_vector_index` are
+//! automatically indexed/removed, and that drop/rebuild work correctly.
+
+#![cfg(feature = "vector-index")]
+
+use grafeo_common::types::Value;
+use grafeo_engine::GrafeoDB;
+
+/// Helper: create a 3D vector value.
+fn vec3(x: f32, y: f32, z: f32) -> Value {
+    Value::Vector(vec![x, y, z].into())
+}
+
+#[test]
+fn test_incremental_insert_via_set_property() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create initial nodes and build index
+    let n1 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .unwrap();
+    let n2 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+        .unwrap();
+
+    db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create index");
+
+    // Add a new node AFTER index creation
+    let n3 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n3, "emb", vec3(0.9, 0.1, 0.0))
+        .unwrap();
+
+    // Search should find the new node (closest to [1, 0, 0])
+    let results = db
+        .vector_search("Doc", "emb", &[1.0, 0.0, 0.0], 3, None, None)
+        .expect("search");
+
+    assert_eq!(results.len(), 3, "should find all 3 nodes");
+    // n1 and n3 should be closest to query [1, 0, 0]
+    let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+    assert!(ids.contains(&n3.as_u64()), "n3 should be in results");
+}
+
+#[test]
+fn test_repeated_vector_update_preserves_hnsw_reachability() {
+    const ITERATIONS: usize = 60;
+    const NODE_COUNT: usize = 6;
+
+    for iteration in 0..ITERATIONS {
+        let db = GrafeoDB::new_in_memory();
+        let mut nodes = Vec::with_capacity(NODE_COUNT);
+
+        for offset in 0..NODE_COUNT {
+            let node = db.create_node(&["Doc"]).unwrap();
+            db.set_node_property(node, "emb", vec3(0.5 + offset as f32 * 0.01, 0.0, 0.0))
+                .unwrap();
+            nodes.push(node);
+        }
+
+        db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
+            .expect("create index");
+
+        let target = nodes[NODE_COUNT / 2];
+        for _ in 0..5 {
+            db.set_node_property(target, "emb", vec3(0.53, 0.0, 0.0))
+                .unwrap();
+        }
+
+        let results = db
+            .vector_search("Doc", "emb", &[0.5, 0.0, 0.0], NODE_COUNT, None, None)
+            .expect("search");
+
+        assert_eq!(
+            results.len(),
+            NODE_COUNT,
+            "same-ID vector replay must not disconnect HNSW nodes (iteration {iteration})"
+        );
+    }
+}
+
+#[test]
+fn test_vector_replacement_moves_node_without_losing_neighbors() {
+    let db = GrafeoDB::new_in_memory();
+
+    let left = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(left, "emb", vec3(1.0, 0.0, 0.0))
+        .unwrap();
+    let moving = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(moving, "emb", vec3(0.9, 0.1, 0.0))
+        .unwrap();
+    let right = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(right, "emb", vec3(0.0, 1.0, 0.0))
+        .unwrap();
+
+    db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create index");
+
+    db.set_node_property(moving, "emb", vec3(0.0, 0.99, 0.01))
+        .unwrap();
+
+    let results = db
+        .vector_search("Doc", "emb", &[0.0, 1.0, 0.0], 3, None, None)
+        .expect("search");
+    let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+
+    assert_eq!(
+        results.len(),
+        3,
+        "replacement must keep all nodes reachable"
+    );
+    assert_eq!(
+        ids.first(),
+        Some(&right.as_u64()),
+        "the unchanged nearest node should remain first"
+    );
+    assert!(
+        ids.contains(&moving.as_u64()),
+        "the replaced vector must remain indexed"
+    );
+    assert!(
+        ids.contains(&left.as_u64()),
+        "unrelated nodes must remain indexed"
+    );
+}
+
+#[test]
+fn test_incremental_batch_create_after_index() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create initial node and build index
+    let n1 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .unwrap();
+
+    db.create_vector_index("Doc", "emb", Some(3), Some("euclidean"), None, None, None)
+        .expect("create index");
+
+    // Batch-create nodes AFTER index
+    let new_ids = db
+        .batch_create_nodes("Doc", "emb", vec![vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]])
+        .unwrap();
+
+    assert_eq!(new_ids.len(), 2);
+
+    // Search should find all 3 nodes
+    let results = db
+        .vector_search("Doc", "emb", &[0.5, 0.5, 0.5], 10, None, None)
+        .expect("search");
+
+    assert_eq!(results.len(), 3, "should find original + batch nodes");
+}
+
+#[test]
+fn test_delete_removes_from_index() {
+    let db = GrafeoDB::new_in_memory();
+
+    let n1 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .unwrap();
+    let n2 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+        .unwrap();
+    let n3 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n3, "emb", vec3(0.0, 0.0, 1.0))
+        .unwrap();
+
+    db.create_vector_index("Doc", "emb", Some(3), Some("euclidean"), None, None, None)
+        .expect("create index");
+
+    // Delete n2
+    assert!(db.delete_node(n2).unwrap());
+
+    // Search should NOT return n2
+    let results = db
+        .vector_search("Doc", "emb", &[0.0, 1.0, 0.0], 10, None, None)
+        .expect("search");
+
+    let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+    assert!(
+        !ids.contains(&n2.as_u64()),
+        "deleted node should not appear"
+    );
+    assert_eq!(results.len(), 2, "should find only 2 remaining nodes");
+}
+
+#[test]
+fn test_label_after_vector_triggers_index() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Build index on "Doc:emb" with an initial node
+    let n1 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .unwrap();
+
+    db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create index");
+
+    // Create a node WITHOUT the "Doc" label, set vector, THEN add label
+    let n2 = db.create_node(&["Other"]).unwrap();
+    db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+        .unwrap();
+    // At this point n2 has label "Other", not "Doc": no index match
+    db.add_node_label(n2, "Doc").unwrap();
+    // Now n2 has "Doc" label, should trigger auto-insert
+
+    let results = db
+        .vector_search("Doc", "emb", &[0.0, 1.0, 0.0], 10, None, None)
+        .expect("search");
+
+    let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+    assert!(
+        ids.contains(&n2.as_u64()),
+        "label-after-vector node should be found"
+    );
+}
+
+#[test]
+fn test_drop_vector_index() {
+    let db = GrafeoDB::new_in_memory();
+
+    let n1 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .unwrap();
+
+    db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create index");
+
+    // Search works
+    assert!(
+        db.vector_search("Doc", "emb", &[1.0, 0.0, 0.0], 1, None, None)
+            .is_ok()
+    );
+
+    // Drop
+    assert!(db.drop_vector_index("Doc", "emb").unwrap());
+    assert!(!db.drop_vector_index("Doc", "emb").unwrap()); // second drop returns false
+
+    // Search now fails
+    assert!(
+        db.vector_search("Doc", "emb", &[1.0, 0.0, 0.0], 1, None, None)
+            .is_err()
+    );
+}
+
+#[test]
+fn test_rebuild_vector_index() {
+    let db = GrafeoDB::new_in_memory();
+
+    let n1 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .unwrap();
+
+    db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create index");
+
+    // Add more nodes
+    let n2 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+        .unwrap();
+    let n3 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n3, "emb", vec3(0.0, 0.0, 1.0))
+        .unwrap();
+
+    // Rebuild rescans all nodes
+    db.rebuild_vector_index("Doc", "emb").expect("rebuild");
+
+    let results = db
+        .vector_search("Doc", "emb", &[0.5, 0.5, 0.5], 10, None, None)
+        .expect("search");
+
+    assert_eq!(results.len(), 3, "rebuild should include all nodes");
+}
+
+#[test]
+fn test_rebuild_nonexistent_index_fails() {
+    let db = GrafeoDB::new_in_memory();
+    assert!(db.rebuild_vector_index("Doc", "emb").is_err());
+}
+
+#[test]
+fn test_set_vector_without_index_is_noop() {
+    let db = GrafeoDB::new_in_memory();
+
+    // No vector index exists: setting a vector property should not crash
+    let n1 = db.create_node(&["Doc"]).unwrap();
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .unwrap();
+
+    // Node should exist with the property
+    let node = db.get_node(n1).unwrap();
+    assert!(node.is_some());
+}
+
+/// Six docs in distinct directions (cosine), an index on them, and the id
+/// of the fourth, the one the #374 tests update.
+fn six_docs(
+    db: &GrafeoDB,
+) -> (
+    Vec<grafeo_common::types::NodeId>,
+    grafeo_common::types::NodeId,
+) {
+    let nodes: Vec<_> = (0..6)
+        .map(|i| {
+            let node = db.create_node(&["Doc"]).unwrap();
+            db.set_node_property(node, "emb", vec3(1.0, i as f32 * 0.1, 0.0))
+                .unwrap();
+            node
+        })
+        .collect();
+    db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create index");
+    let target = nodes[3];
+    (nodes, target)
+}
+
+/// A search for all six from `[1, 0, 0]` finds every one of them.
+fn assert_every_doc_found(db: &GrafeoDB, nodes: &[grafeo_common::types::NodeId], stage: &str) {
+    let mut found: Vec<_> = db
+        .vector_search("Doc", "emb", &[1.0, 0.0, 0.0], nodes.len(), None, None)
+        .expect("search")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    found.sort_unstable();
+    let mut expected = nodes.to_vec();
+    expected.sort_unstable();
+    assert_eq!(found, expected, "{stage}");
+}
+
+/// #374: updates of a node's vector in a transaction that rolls back leave
+/// the index as it was: every node is found, the updated one at its old
+/// vector.
+#[test]
+fn rolled_back_vector_update_keeps_every_node_found() {
+    let db = GrafeoDB::new_in_memory();
+    let (nodes, target) = six_docs(&db);
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    for _ in 0..3 {
+        session
+            .set_node_property(target, "emb", vec3(1.0, 0.53, 0.0))
+            .unwrap();
+    }
+    session.rollback().unwrap();
+    assert_every_doc_found(&db, &nodes, "after the rollback");
+    assert_eq!(
+        db.get_node(target)
+            .unwrap()
+            .and_then(|node| node.get_property("emb").cloned()),
+        Some(vec3(1.0, 0.3, 0.0))
+    );
+    let nearest = db
+        .vector_search("Doc", "emb", &[1.0, 0.3, 0.0], 1, None, None)
+        .unwrap();
+    assert_eq!(nearest[0].0, target, "the index keeps the old vector");
+}
+
+/// #374 through a reopen and a crash: five updates of one vector, then the
+/// file opens again (after a close, and after a crash before any
+/// checkpoint): every node is found, the updated one at its new vector.
+#[cfg(all(feature = "wal", feature = "grafeo-file"))]
+mod after_a_reopen {
+    use super::*;
+    use crate::common::replay::reopened_after_crash;
+
+    fn update(db: &GrafeoDB) -> grafeo_common::types::NodeId {
+        let (_, target) = six_docs(db);
+        for _ in 0..5 {
+            db.set_node_property(target, "emb", vec3(1.0, 0.53, 0.0))
+                .unwrap();
+        }
+        target
+    }
+
+    fn assert_updated(db: &GrafeoDB, stage: &str) {
+        let nodes: Vec<_> = db
+            .execute("MATCH (d:Doc) RETURN id(d)")
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Int64(id) => grafeo_common::types::NodeId::new(u64::try_from(*id).unwrap()),
+                other => panic!("an id: {other:?}"),
+            })
+            .collect();
+        assert_eq!(nodes.len(), 6, "{stage}");
+        assert_every_doc_found(db, &nodes, stage);
+        let nearest = db
+            .vector_search("Doc", "emb", &[1.0, 0.53, 0.0], 1, None, None)
+            .unwrap();
+        assert_eq!(
+            db.get_node(nearest[0].0)
+                .unwrap()
+                .and_then(|node| node.get_property("emb").cloned()),
+            Some(vec3(1.0, 0.53, 0.0)),
+            "{stage}: the updated vector is the nearest"
+        );
+    }
+
+    #[test]
+    fn repeated_update_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docs.grafeo");
+        let db = GrafeoDB::open(&path).unwrap();
+        update(&db);
+        assert_updated(&db, "before the close");
+        db.close().unwrap();
+        let db = GrafeoDB::open(&path).unwrap();
+        assert_updated(&db, "after the reopen");
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn repeated_update_survives_a_crash_before_any_checkpoint() {
+        let (_dir, db) = reopened_after_crash(
+            &grafeo_common::test_path!("repeated_update_survives_a_crash_before_any_checkpoint"),
+            |path| GrafeoDB::open(path).unwrap(),
+            |db| {
+                update(db);
+            },
+        );
+        assert_updated(&db, "after the crash");
+        db.close().unwrap();
+    }
+}

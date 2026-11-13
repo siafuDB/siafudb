@@ -1,0 +1,16 @@
+[package]
+name="wasmprobe"
+version="0.0.0"
+edition="2024"
+[lib]
+crate-type=["cdylib"]
+[dependencies]
+wasm-bindgen = "=0.2.130"
+grafeo = { version="=0.5.43", default-features=false, features=["browser","cypher"] }
+uuid = { version = "1", features = ["v4","serde","js"] }
+ed25519-dalek = { version="3", features=["rand_core"] }
+sha2 = "0.11"
+# needs the wasm patches in 01-wasm.md applied to siafudb-core first
+siafudb-core = { path = "../../../../crates/siafudb-core" }
+
+[workspace]

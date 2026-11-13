@@ -1,0 +1,1079 @@
+//! Graph traversal algorithms: BFS and DFS.
+//!
+//! These algorithms use the visitor pattern to allow flexible customization
+//! of traversal behavior, including early termination and edge filtering.
+
+use std::collections::VecDeque;
+use std::sync::OnceLock;
+
+use grafeo_common::types::{NodeId, Value};
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
+use grafeo_core::graph::Direction;
+use grafeo_core::graph::GraphStore;
+#[cfg(test)]
+#[cfg(test)]
+use grafeo_core::graph::rowgroup::RowGroupStore;
+
+use super::super::{AlgorithmResult, Domain, ParameterDef, ParameterType};
+use super::traits::{Control, Ticker, TraversalEvent, impl_algorithm, node_id_from_param};
+
+// ============================================================================
+// BFS Implementation
+// ============================================================================
+
+/// Performs breadth-first search from a starting node.
+///
+/// Returns the set of visited nodes in BFS order.
+///
+/// # Arguments
+///
+/// * `store` - The graph store to traverse
+/// * `start` - The starting node ID
+///
+/// # Returns
+///
+/// A vector of node IDs in the order they were discovered.
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn bfs(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    start: NodeId,
+) -> grafeo_common::utils::error::Result<Vec<NodeId>> {
+    let graph = super::traits::GraphView::new(store, view);
+    let found = bfs_on(&graph, start);
+    graph.finish(found)?
+}
+
+/// [`bfs`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn bfs_on(
+    store: &super::traits::GraphView<'_>,
+    start: NodeId,
+) -> grafeo_common::utils::error::Result<Vec<NodeId>> {
+    let mut visited = Vec::new();
+    bfs_with_visitor_on(store, &mut Ticker::new(), start, |event| -> Control<()> {
+        if let TraversalEvent::Discover(node) = event {
+            visited.push(node);
+        }
+        Control::Continue
+    })?;
+    Ok(visited)
+}
+
+/// Performs breadth-first search with a visitor callback.
+///
+/// The visitor is called for each traversal event, allowing custom
+/// behavior such as early termination or path recording.
+///
+/// # Arguments
+///
+/// * `store` - The graph store to traverse
+/// * `start` - The starting node ID
+/// * `visitor` - Callback function receiving traversal events
+///
+/// # Returns
+///
+/// `Some(B)` if the visitor returned `Control::Break(B)`, otherwise `None`.
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn bfs_with_visitor<B, F>(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    start: NodeId,
+    visitor: F,
+) -> grafeo_common::utils::error::Result<Option<B>>
+where
+    F: FnMut(TraversalEvent) -> Control<B>,
+{
+    let graph = super::traits::GraphView::new(store, view);
+    let found = bfs_with_visitor_on::<B, F>(&graph, &mut Ticker::new(), start, visitor);
+    graph.finish(found)?
+}
+
+/// [`bfs_with_visitor`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn bfs_with_visitor_on<B, F>(
+    store: &super::traits::GraphView<'_>,
+    ticker: &mut Ticker,
+    start: NodeId,
+    mut visitor: F,
+) -> grafeo_common::utils::error::Result<Option<B>>
+where
+    F: FnMut(TraversalEvent) -> Control<B>,
+{
+    let mut discovered: FxHashSet<NodeId> = FxHashSet::default();
+    let mut queue: VecDeque<NodeId> = VecDeque::new();
+
+    // Check if start node exists
+    if store.node(start).is_none() {
+        return Ok(None);
+    }
+
+    // Discover the start node
+    discovered.insert(start);
+    queue.push_back(start);
+
+    match visitor(TraversalEvent::Discover(start)) {
+        Control::Break(b) => return Ok(Some(b)),
+        Control::Prune => {
+            // Prune means don't explore neighbors, but we still finish the node
+            match visitor(TraversalEvent::Finish(start)) {
+                Control::Break(b) => return Ok(Some(b)),
+                _ => return Ok(None),
+            }
+        }
+        Control::Continue => {}
+    }
+
+    while let Some(node) = queue.pop_front() {
+        ticker.tick()?;
+        // Iterate over outgoing edges
+        for (neighbor, edge_id) in store.edges(node, Direction::Outgoing) {
+            ticker.tick()?;
+            if discovered.insert(neighbor) {
+                // Tree edge - neighbor not yet discovered
+                match visitor(TraversalEvent::TreeEdge {
+                    source: node,
+                    target: neighbor,
+                    edge: edge_id,
+                }) {
+                    Control::Break(b) => return Ok(Some(b)),
+                    Control::Prune => continue, // Don't add to queue
+                    Control::Continue => {}
+                }
+
+                match visitor(TraversalEvent::Discover(neighbor)) {
+                    Control::Break(b) => return Ok(Some(b)),
+                    Control::Prune => continue, // Don't explore neighbors
+                    Control::Continue => {}
+                }
+
+                queue.push_back(neighbor);
+            } else {
+                // Non-tree edge - neighbor already discovered
+                match visitor(TraversalEvent::NonTreeEdge {
+                    source: node,
+                    target: neighbor,
+                    edge: edge_id,
+                }) {
+                    Control::Break(b) => return Ok(Some(b)),
+                    _ => {}
+                }
+            }
+        }
+
+        // Node processing complete
+        match visitor(TraversalEvent::Finish(node)) {
+            Control::Break(b) => return Ok(Some(b)),
+            _ => {}
+        }
+    }
+
+    Ok(None)
+}
+
+/// BFS layers - returns nodes grouped by their distance from the start.
+///
+/// # Arguments
+///
+/// * `store` - The graph store to traverse
+/// * `start` - The starting node ID
+///
+/// # Returns
+///
+/// A vector of vectors, where `result[i]` contains all nodes at distance `i` from start.
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn bfs_layers(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    start: NodeId,
+) -> grafeo_common::utils::error::Result<Vec<Vec<NodeId>>> {
+    let graph = super::traits::GraphView::new(store, view);
+    let found = bfs_layers_on(&graph, start);
+    graph.finish(found)?
+}
+
+/// [`bfs_layers`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn bfs_layers_on(
+    store: &super::traits::GraphView<'_>,
+    start: NodeId,
+) -> grafeo_common::utils::error::Result<Vec<Vec<NodeId>>> {
+    let mut ticker = Ticker::new();
+    let mut layers: Vec<Vec<NodeId>> = Vec::new();
+    let mut discovered: FxHashSet<NodeId> = FxHashSet::default();
+    let mut current_layer: Vec<NodeId> = Vec::new();
+    let mut next_layer: Vec<NodeId> = Vec::new();
+
+    if store.node(start).is_none() {
+        return Ok(layers);
+    }
+
+    discovered.insert(start);
+    current_layer.push(start);
+
+    while !current_layer.is_empty() {
+        layers.push(current_layer.clone());
+
+        for &node in &current_layer {
+            ticker.tick()?;
+            for (neighbor, _) in store.edges(node, Direction::Outgoing) {
+                ticker.tick()?;
+                if discovered.insert(neighbor) {
+                    next_layer.push(neighbor);
+                }
+            }
+        }
+
+        current_layer.clear();
+        std::mem::swap(&mut current_layer, &mut next_layer);
+    }
+
+    Ok(layers)
+}
+
+// ============================================================================
+// DFS Implementation
+// ============================================================================
+
+/// Node state during DFS traversal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeColor {
+    /// Not yet discovered
+    White,
+    /// Discovered but not finished (on stack)
+    Gray,
+    /// Finished processing
+    Black,
+}
+
+/// Performs depth-first search from a starting node.
+///
+/// Returns nodes in the order they were finished (post-order).
+///
+/// # Arguments
+///
+/// * `store` - The graph store to traverse
+/// * `start` - The starting node ID
+///
+/// # Returns
+///
+/// A vector of node IDs in post-order (finished order).
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn dfs(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    start: NodeId,
+) -> grafeo_common::utils::error::Result<Vec<NodeId>> {
+    let graph = super::traits::GraphView::new(store, view);
+    let found = dfs_on(&graph, start);
+    graph.finish(found)?
+}
+
+/// [`dfs`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn dfs_on(
+    store: &super::traits::GraphView<'_>,
+    start: NodeId,
+) -> grafeo_common::utils::error::Result<Vec<NodeId>> {
+    let mut finished = Vec::new();
+    dfs_with_visitor_on(store, &mut Ticker::new(), start, |event| -> Control<()> {
+        if let TraversalEvent::Finish(node) = event {
+            finished.push(node);
+        }
+        Control::Continue
+    })?;
+    Ok(finished)
+}
+
+/// Performs depth-first search with a visitor callback.
+///
+/// Uses an explicit stack to avoid stack overflow on deep graphs.
+///
+/// # Arguments
+///
+/// * `store` - The graph store to traverse
+/// * `start` - The starting node ID
+/// * `visitor` - Callback function receiving traversal events
+///
+/// # Returns
+///
+/// `Some(B)` if the visitor returned `Control::Break(B)`, otherwise `None`.
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn dfs_with_visitor<B, F>(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    start: NodeId,
+    visitor: F,
+) -> grafeo_common::utils::error::Result<Option<B>>
+where
+    F: FnMut(TraversalEvent) -> Control<B>,
+{
+    let graph = super::traits::GraphView::new(store, view);
+    let found = dfs_with_visitor_on::<B, F>(&graph, &mut Ticker::new(), start, visitor);
+    graph.finish(found)?
+}
+
+/// [`dfs_with_visitor`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn dfs_with_visitor_on<B, F>(
+    store: &super::traits::GraphView<'_>,
+    ticker: &mut Ticker,
+    start: NodeId,
+    mut visitor: F,
+) -> grafeo_common::utils::error::Result<Option<B>>
+where
+    F: FnMut(TraversalEvent) -> Control<B>,
+{
+    let mut color: FxHashMap<NodeId, NodeColor> = FxHashMap::default();
+
+    // Stack entries: (node, edge_iterator_index, is_first_visit)
+    // We use indices to track progress through neighbors
+    let mut stack: Vec<(NodeId, Vec<(NodeId, grafeo_common::types::EdgeId)>, usize)> = Vec::new();
+
+    // Check if start node exists
+    if store.node(start).is_none() {
+        return Ok(None);
+    }
+
+    // Discover start node
+    color.insert(start, NodeColor::Gray);
+    match visitor(TraversalEvent::Discover(start)) {
+        Control::Break(b) => return Ok(Some(b)),
+        Control::Prune => {
+            color.insert(start, NodeColor::Black);
+            match visitor(TraversalEvent::Finish(start)) {
+                Control::Break(b) => return Ok(Some(b)),
+                _ => return Ok(None),
+            }
+        }
+        Control::Continue => {}
+    }
+
+    let neighbors: Vec<_> = store
+        .edges(start, Direction::Outgoing)
+        .into_iter()
+        .collect();
+    stack.push((start, neighbors, 0));
+
+    while let Some((node, neighbors, idx)) = stack.last_mut() {
+        ticker.tick()?;
+        if *idx >= neighbors.len() {
+            // All neighbors processed, finish this node
+            let node = *node;
+            stack.pop();
+            color.insert(node, NodeColor::Black);
+            match visitor(TraversalEvent::Finish(node)) {
+                Control::Break(b) => return Ok(Some(b)),
+                _ => {}
+            }
+            continue;
+        }
+
+        let (neighbor, edge_id) = neighbors[*idx];
+        *idx += 1;
+
+        match color.get(&neighbor).copied().unwrap_or(NodeColor::White) {
+            NodeColor::White => {
+                // Tree edge - undiscovered node
+                match visitor(TraversalEvent::TreeEdge {
+                    source: *node,
+                    target: neighbor,
+                    edge: edge_id,
+                }) {
+                    Control::Break(b) => return Ok(Some(b)),
+                    Control::Prune => continue,
+                    Control::Continue => {}
+                }
+
+                color.insert(neighbor, NodeColor::Gray);
+                match visitor(TraversalEvent::Discover(neighbor)) {
+                    Control::Break(b) => return Ok(Some(b)),
+                    Control::Prune => {
+                        color.insert(neighbor, NodeColor::Black);
+                        match visitor(TraversalEvent::Finish(neighbor)) {
+                            Control::Break(b) => return Ok(Some(b)),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    Control::Continue => {}
+                }
+
+                let neighbor_neighbors: Vec<_> = store
+                    .edges(neighbor, Direction::Outgoing)
+                    .into_iter()
+                    .collect();
+                stack.push((neighbor, neighbor_neighbors, 0));
+            }
+            NodeColor::Gray => {
+                // Back edge - node is on the stack (ancestor)
+                match visitor(TraversalEvent::BackEdge {
+                    source: *node,
+                    target: neighbor,
+                    edge: edge_id,
+                }) {
+                    Control::Break(b) => return Ok(Some(b)),
+                    _ => {}
+                }
+            }
+            NodeColor::Black => {
+                // Non-tree edge (cross/forward) - already finished
+                match visitor(TraversalEvent::NonTreeEdge {
+                    source: *node,
+                    target: neighbor,
+                    edge: edge_id,
+                }) {
+                    Control::Break(b) => return Ok(Some(b)),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Performs DFS on all nodes, visiting each connected component.
+///
+/// Returns nodes in reverse post-order (useful for topological sort).
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn dfs_all(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+) -> grafeo_common::utils::error::Result<Vec<NodeId>> {
+    let graph = super::traits::GraphView::new(store, view);
+    let found = dfs_all_on(&graph);
+    graph.finish(found)?
+}
+
+/// [`dfs_all`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn dfs_all_on(
+    store: &super::traits::GraphView<'_>,
+) -> grafeo_common::utils::error::Result<Vec<NodeId>> {
+    let mut ticker = Ticker::new();
+    let mut finished = Vec::new();
+    let mut visited: FxHashSet<NodeId> = FxHashSet::default();
+
+    for node_id in store.node_ids() {
+        ticker.tick()?;
+        if visited.contains(&node_id) {
+            continue;
+        }
+
+        dfs_with_visitor_on(store, &mut ticker, node_id, |event| -> Control<()> {
+            match event {
+                TraversalEvent::Discover(n) => {
+                    visited.insert(n);
+                }
+                TraversalEvent::Finish(n) => {
+                    finished.push(n);
+                }
+                _ => {}
+            }
+            Control::Continue
+        })?;
+    }
+
+    Ok(finished)
+}
+
+// ============================================================================
+// Algorithm Wrappers for Plugin Registry
+// ============================================================================
+
+/// Static parameter definitions for BFS algorithm.
+static BFS_PARAMS: OnceLock<Vec<ParameterDef>> = OnceLock::new();
+
+fn bfs_params() -> &'static [ParameterDef] {
+    BFS_PARAMS.get_or_init(|| {
+        vec![ParameterDef {
+            name: "start".to_string(),
+            description: "Starting node ID".to_string(),
+            param_type: ParameterType::NodeId,
+            required: true,
+            default: None,
+            domain: Domain::OfType,
+        }]
+    })
+}
+
+/// BFS algorithm wrapper for the plugin registry.
+pub struct BfsAlgorithm;
+
+impl_algorithm! {
+    BfsAlgorithm,
+    name: "bfs",
+    description: "Breadth-first search traversal from a starting node",
+    params: bfs_params,
+    compute(store, params) {
+        let start_id = params.required_int("start")?;
+
+        let start = node_id_from_param(start_id, "start")?;
+        let layers = bfs_layers_on(store, start)?;
+
+        let mut result = AlgorithmResult::new(vec!["node_id".to_string(), "distance".to_string()]);
+
+        for (distance, layer) in layers.iter().enumerate() {
+            for &node in layer {
+                // reason: Node IDs and BFS distances are small, well within i64::MAX
+                #[allow(clippy::cast_possible_wrap)]
+                result.add_row(vec![
+                    Value::Int64(node.0 as i64),
+                    Value::Int64(distance as i64),
+                ]);
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+/// Static parameter definitions for DFS algorithm.
+static DFS_PARAMS: OnceLock<Vec<ParameterDef>> = OnceLock::new();
+
+fn dfs_params() -> &'static [ParameterDef] {
+    DFS_PARAMS.get_or_init(|| {
+        vec![ParameterDef {
+            name: "start".to_string(),
+            description: "Starting node ID".to_string(),
+            param_type: ParameterType::NodeId,
+            required: true,
+            default: None,
+            domain: Domain::OfType,
+        }]
+    })
+}
+
+/// DFS algorithm wrapper for the plugin registry.
+///
+/// One row per node DFS reaches from `start`, in discovery order: `depth`,
+/// the node's depth in the DFS tree (0 for the start; not the shortest
+/// distance, which BFS gives), `discovery`, its position in the order DFS
+/// reaches the nodes (pre-order), and `finish`, its position in the order
+/// DFS finishes them (post-order).
+pub struct DfsAlgorithm;
+
+impl_algorithm! {
+    DfsAlgorithm,
+    name: "dfs",
+    description: "Depth-first search traversal from a starting node",
+    params: dfs_params,
+    compute(store, params) {
+        let start_id = params.required_int("start")?;
+
+        let start = node_id_from_param(start_id, "start")?;
+        // Each node in discovery order, with its depth; and its finish position.
+        let mut discovered: Vec<(NodeId, usize)> = Vec::new();
+        let mut depth: FxHashMap<NodeId, usize> = FxHashMap::default();
+        let mut finish: FxHashMap<NodeId, usize> = FxHashMap::default();
+        dfs_with_visitor_on(store, &mut Ticker::new(), start, |event| -> Control<()> {
+            match event {
+                TraversalEvent::TreeEdge { source, target, .. } => {
+                    let below = depth.get(&source).map_or(0, |d| d + 1);
+                    depth.insert(target, below);
+                }
+                TraversalEvent::Discover(node) => {
+                    discovered.push((node, *depth.entry(node).or_insert(0)));
+                }
+                TraversalEvent::Finish(node) => {
+                    let position = finish.len();
+                    finish.insert(node, position);
+                }
+                _ => {}
+            }
+            Control::Continue
+        })?;
+
+        let count = |n: usize| Value::Int64(i64::try_from(n).unwrap_or(i64::MAX));
+        let mut result = AlgorithmResult::new(vec![
+            "node_id".to_string(),
+            "depth".to_string(),
+            "discovery".to_string(),
+            "finish".to_string(),
+        ]);
+        for (position, (node, node_depth)) in discovered.into_iter().enumerate() {
+            result.add_row(vec![
+                Value::Int64(node.as_u64().cast_signed()),
+                count(node_depth),
+                count(position),
+                count(finish[&node]),
+            ]);
+        }
+
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grafeo_common::types::ReadView;
+
+    fn create_test_graph() -> RowGroupStore {
+        let store = RowGroupStore::new();
+
+        // Create a simple graph:
+        //   0 -> 1 -> 2
+        //   |    |
+        //   v    v
+        //   3 -> 4
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        let n2 = store.create_node(&["Node"]);
+        let n3 = store.create_node(&["Node"]);
+        let n4 = store.create_node(&["Node"]);
+
+        store.create_edge(n0, n1, "EDGE");
+        store.create_edge(n0, n3, "EDGE");
+        store.create_edge(n1, n2, "EDGE");
+        store.create_edge(n1, n4, "EDGE");
+        store.create_edge(n3, n4, "EDGE");
+
+        store
+    }
+
+    #[test]
+    fn test_bfs_simple() {
+        let store = create_test_graph();
+        let visited = bfs(&store, ReadView::latest(), NodeId::new(0)).unwrap();
+
+        assert!(!visited.is_empty(), "visited is empty");
+        assert_eq!(visited[0], NodeId::new(0));
+        // Node 0 should be first
+    }
+
+    #[test]
+    fn test_bfs_layers() {
+        let store = create_test_graph();
+        let layers = bfs_layers(&store, ReadView::latest(), NodeId::new(0)).unwrap();
+
+        assert!(!layers.is_empty(), "layers is empty");
+        assert_eq!(layers[0], vec![NodeId::new(0)]);
+        // Distance 0: just the start node
+    }
+
+    #[test]
+    fn test_dfs_simple() {
+        let store = create_test_graph();
+        let finished = dfs(&store, ReadView::latest(), NodeId::new(0)).unwrap();
+
+        assert!(!finished.is_empty(), "finished is empty");
+        // Post-order means leaves are finished first
+    }
+
+    #[test]
+    fn test_bfs_nonexistent_start() {
+        let store = RowGroupStore::new();
+        let visited = bfs(&store, ReadView::latest(), NodeId::new(999)).unwrap();
+        assert!(visited.is_empty(), "{visited:?}");
+    }
+
+    #[test]
+    fn test_dfs_nonexistent_start() {
+        let store = RowGroupStore::new();
+        let finished = dfs(&store, ReadView::latest(), NodeId::new(999)).unwrap();
+        assert!(finished.is_empty(), "{finished:?}");
+    }
+
+    #[test]
+    fn test_bfs_early_termination() {
+        let store = create_test_graph();
+        let target = NodeId::new(2);
+
+        let found = bfs_with_visitor(&store, ReadView::latest(), NodeId::new(0), |event| {
+            if let TraversalEvent::Discover(node) = event
+                && node == target
+            {
+                return Control::Break(true);
+            }
+            Control::Continue
+        })
+        .unwrap();
+
+        assert_eq!(found, Some(true));
+    }
+
+    #[test]
+    fn test_bfs_visits_all_reachable() {
+        let store = create_test_graph();
+        let visited = bfs(&store, ReadView::latest(), NodeId::new(0)).unwrap();
+        // All 5 nodes are reachable from node 0
+        assert_eq!(visited.len(), 5);
+    }
+
+    #[test]
+    fn test_bfs_layers_distances() {
+        let store = create_test_graph();
+        let layers = bfs_layers(&store, ReadView::latest(), NodeId::new(0)).unwrap();
+
+        // Layer 0: node 0
+        // Layer 1: nodes 1, 3 (direct neighbors)
+        // Layer 2: nodes 2, 4 (distance 2)
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0].len(), 1);
+        assert_eq!(layers[1].len(), 2);
+        assert_eq!(layers[2].len(), 2);
+    }
+
+    #[test]
+    fn test_bfs_layers_empty_graph() {
+        let store = RowGroupStore::new();
+        let layers = bfs_layers(&store, ReadView::latest(), NodeId::new(0)).unwrap();
+        assert!(layers.is_empty(), "{layers:?}");
+    }
+
+    #[test]
+    fn test_bfs_single_node() {
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let visited = bfs(&store, ReadView::latest(), n0).unwrap();
+        assert_eq!(visited, vec![n0]);
+    }
+
+    #[test]
+    fn test_bfs_layers_single_node() {
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let layers = bfs_layers(&store, ReadView::latest(), n0).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0], vec![n0]);
+    }
+
+    #[test]
+    fn test_bfs_with_visitor_prune_on_start() {
+        let store = create_test_graph();
+        let result: Option<()> =
+            bfs_with_visitor(&store, ReadView::latest(), NodeId::new(0), |event| {
+                if let TraversalEvent::Discover(node) = event
+                    && node == NodeId::new(0)
+                {
+                    return Control::Prune;
+                }
+                Control::Continue
+            })
+            .unwrap();
+        // Pruning start node means no further traversal
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_bfs_with_visitor_collects_tree_edges() {
+        let store = create_test_graph();
+        let mut tree_edges = Vec::new();
+
+        bfs_with_visitor(
+            &store,
+            ReadView::latest(),
+            NodeId::new(0),
+            |event| -> Control<()> {
+                if let TraversalEvent::TreeEdge { source, target, .. } = event {
+                    tree_edges.push((source, target));
+                }
+                Control::Continue
+            },
+        )
+        .unwrap();
+
+        // BFS tree from node 0 has 4 tree edges (one per non-start node)
+        assert_eq!(tree_edges.len(), 4);
+    }
+
+    #[test]
+    fn test_bfs_with_visitor_detects_non_tree_edges() {
+        let store = create_test_graph();
+        let mut non_tree_edges = Vec::new();
+
+        bfs_with_visitor(
+            &store,
+            ReadView::latest(),
+            NodeId::new(0),
+            |event| -> Control<()> {
+                if let TraversalEvent::NonTreeEdge { source, target, .. } = event {
+                    non_tree_edges.push((source, target));
+                }
+                Control::Continue
+            },
+        )
+        .unwrap();
+
+        // There's at least one non-tree edge (3->4 or 1->4)
+        assert!(!non_tree_edges.is_empty(), "non_tree_edges is empty");
+    }
+
+    #[test]
+    fn test_dfs_visits_all_reachable() {
+        let store = create_test_graph();
+        let finished = dfs(&store, ReadView::latest(), NodeId::new(0)).unwrap();
+        assert_eq!(finished.len(), 5);
+    }
+
+    #[test]
+    fn test_dfs_post_order() {
+        let store = create_test_graph();
+        let finished = dfs(&store, ReadView::latest(), NodeId::new(0)).unwrap();
+        // In post-order, the start node is finished last
+        assert_eq!(*finished.last().unwrap(), NodeId::new(0));
+    }
+
+    #[test]
+    fn test_dfs_with_visitor_early_termination() {
+        let store = create_test_graph();
+        let found = dfs_with_visitor(&store, ReadView::latest(), NodeId::new(0), |event| {
+            if let TraversalEvent::Discover(node) = event
+                && node == NodeId::new(4)
+            {
+                return Control::Break(node);
+            }
+            Control::Continue
+        })
+        .unwrap();
+        assert_eq!(found, Some(NodeId::new(4)));
+    }
+
+    #[test]
+    fn test_dfs_with_visitor_prune() {
+        let store = create_test_graph();
+        let mut discovered = Vec::new();
+
+        dfs_with_visitor(
+            &store,
+            ReadView::latest(),
+            NodeId::new(0),
+            |event| -> Control<()> {
+                if let TraversalEvent::Discover(node) = event {
+                    discovered.push(node);
+                    if node == NodeId::new(1) {
+                        return Control::Prune; // Don't explore node 1's children
+                    }
+                }
+                Control::Continue
+            },
+        )
+        .unwrap();
+
+        // Node 1 is discovered but its children (2, 4) may not all be
+        assert!(discovered.contains(&NodeId::new(0)));
+        assert!(discovered.contains(&NodeId::new(1)));
+        // Node 2 should not be discovered since we pruned node 1
+        assert!(!discovered.contains(&NodeId::new(2)));
+    }
+
+    #[test]
+    fn test_dfs_with_visitor_back_edge() {
+        // Create a cycle: 0 -> 1 -> 2 -> 0
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        let n2 = store.create_node(&["Node"]);
+        store.create_edge(n0, n1, "EDGE");
+        store.create_edge(n1, n2, "EDGE");
+        store.create_edge(n2, n0, "EDGE");
+
+        let mut back_edges = Vec::new();
+        dfs_with_visitor(&store, ReadView::latest(), n0, |event| -> Control<()> {
+            if let TraversalEvent::BackEdge { source, target, .. } = event {
+                back_edges.push((source, target));
+            }
+            Control::Continue
+        })
+        .unwrap();
+
+        // Edge 2->0 is a back edge (0 is ancestor of 2)
+        assert_eq!(back_edges.len(), 1);
+        assert_eq!(back_edges[0], (n2, n0));
+    }
+
+    #[test]
+    fn test_dfs_single_node() {
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let finished = dfs(&store, ReadView::latest(), n0).unwrap();
+        assert_eq!(finished, vec![n0]);
+    }
+
+    #[test]
+    fn test_dfs_all_visits_all_components() {
+        let store = RowGroupStore::new();
+        // Component 1: 0 -> 1
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        store.create_edge(n0, n1, "EDGE");
+
+        // Component 2: 2 -> 3
+        let n2 = store.create_node(&["Node"]);
+        let n3 = store.create_node(&["Node"]);
+        store.create_edge(n2, n3, "EDGE");
+
+        let finished = dfs_all(&store, ReadView::latest()).unwrap();
+        assert_eq!(finished.len(), 4);
+    }
+
+    #[test]
+    fn test_dfs_all_empty_graph() {
+        let store = RowGroupStore::new();
+        let finished = dfs_all(&store, ReadView::latest()).unwrap();
+        assert!(finished.is_empty(), "{finished:?}");
+    }
+
+    #[test]
+    fn test_bfs_prune_tree_edge() {
+        let store = create_test_graph();
+        let mut discovered = Vec::new();
+
+        bfs_with_visitor(
+            &store,
+            ReadView::latest(),
+            NodeId::new(0),
+            |event| -> Control<()> {
+                match event {
+                    TraversalEvent::TreeEdge { target, .. } => {
+                        if target == NodeId::new(1) {
+                            return Control::Prune; // Skip node 1
+                        }
+                        Control::Continue
+                    }
+                    TraversalEvent::Discover(node) => {
+                        discovered.push(node);
+                        Control::Continue
+                    }
+                    _ => Control::Continue,
+                }
+            },
+        )
+        .unwrap();
+
+        // Node 1 should not be discovered due to pruned tree edge
+        assert!(discovered.contains(&NodeId::new(0)));
+        assert!(!discovered.contains(&NodeId::new(1)));
+    }
+
+    #[test]
+    fn test_dfs_with_visitor_prune_start() {
+        let store = create_test_graph();
+        let result: Option<()> =
+            dfs_with_visitor(&store, ReadView::latest(), NodeId::new(0), |event| {
+                if let TraversalEvent::Discover(node) = event
+                    && node == NodeId::new(0)
+                {
+                    return Control::Prune;
+                }
+                Control::Continue
+            })
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_bfs_with_self_loop() {
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        store.create_edge(n0, n0, "SELF"); // self-loop
+        store.create_edge(n0, n1, "EDGE");
+
+        let visited = bfs(&store, ReadView::latest(), n0).unwrap();
+        // Self-loop should not cause infinite traversal or duplicates
+        assert_eq!(visited.len(), 2);
+        assert_eq!(visited[0], n0);
+        assert!(visited.contains(&n1));
+    }
+
+    #[test]
+    fn test_dfs_with_self_loop() {
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        store.create_edge(n0, n0, "SELF"); // self-loop
+        store.create_edge(n0, n1, "EDGE");
+
+        let finished = dfs(&store, ReadView::latest(), n0).unwrap();
+        assert_eq!(finished.len(), 2);
+        assert!(finished.contains(&n0));
+        assert!(finished.contains(&n1));
+    }
+
+    /// The rows of `DfsAlgorithm` from `start`, by node: (depth, discovery,
+    /// finish).
+    fn dfs_rows(store: &RowGroupStore, start: NodeId) -> FxHashMap<NodeId, (i64, i64, i64)> {
+        use crate::plugins::Parameters;
+        use crate::plugins::algorithms::GraphAlgorithm;
+
+        let mut params = Parameters::new();
+        params.set_int("start", i64::try_from(start.as_u64()).unwrap());
+        let result = DfsAlgorithm
+            .execute(store, ReadView::latest(), &params)
+            .unwrap();
+        assert_eq!(result.columns, ["node_id", "depth", "discovery", "finish"]);
+        result
+            .rows
+            .iter()
+            .map(|row| match row.as_slice() {
+                [
+                    Value::Int64(node),
+                    Value::Int64(depth),
+                    Value::Int64(discovery),
+                    Value::Int64(finish),
+                ] => (
+                    NodeId::new(u64::try_from(*node).unwrap()),
+                    (*depth, *discovery, *finish),
+                ),
+                other => panic!("unexpected row {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dfs_algorithm_depth_is_the_tree_depth() {
+        // 0 -> 1 -> 2 -> 3, and 0 -> 4 (the graph of the report).
+        let store = RowGroupStore::new();
+        let n: Vec<NodeId> = (0..5).map(|_| store.create_node(&["Node"])).collect();
+        store.create_edge(n[0], n[1], "E");
+        store.create_edge(n[1], n[2], "E");
+        store.create_edge(n[2], n[3], "E");
+        store.create_edge(n[0], n[4], "E");
+
+        let rows = dfs_rows(&store, n[0]);
+        let depths: Vec<i64> = n.iter().map(|node| rows[node].0).collect();
+        assert_eq!(
+            depths,
+            [0, 1, 2, 3, 1],
+            "depth from the start, not finish order"
+        );
+        let discovery: Vec<i64> = n.iter().map(|node| rows[node].1).collect();
+        assert_eq!(discovery, [0, 1, 2, 3, 4]);
+        let finish: Vec<i64> = n.iter().map(|node| rows[node].2).collect();
+        assert_eq!(finish, [4, 2, 1, 0, 3]);
+    }
+
+    #[test]
+    fn dfs_algorithm_depth_follows_the_tree_not_the_shortest_path() {
+        // 0 -> 1 -> 2 and 0 -> 2: DFS reaches 2 through 1 (depth 2) while
+        // BFS reaches it directly (distance 1).
+        let store = RowGroupStore::new();
+        let n: Vec<NodeId> = (0..3).map(|_| store.create_node(&["Node"])).collect();
+        store.create_edge(n[0], n[1], "E");
+        store.create_edge(n[1], n[2], "E");
+        store.create_edge(n[0], n[2], "E");
+
+        let rows = dfs_rows(&store, n[0]);
+        assert_eq!(rows[&n[2]], (2, 2, 0));
+        assert_eq!(rows[&n[0]], (0, 0, 2));
+        assert_eq!(
+            bfs_layers(&store, ReadView::latest(), n[0]).unwrap()[1],
+            vec![n[1], n[2]]
+        );
+    }
+}

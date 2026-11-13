@@ -1,0 +1,331 @@
+//! Golden fixture tests for binary format stability.
+//!
+//! These tests deserialize a **committed** binary fixture (`snapshot_v5.bin`)
+//! and verify the current code can still read it correctly, and that the
+//! fixture of the previous version (`snapshot_v4.bin`, which 0.5.x and
+//! 0.6.0-beta.1 wrote) still imports. If a code change
+//! silently alters the binary layout (bincode bump, serde derive change, enum
+//! variant reorder), these tests fail immediately.
+//!
+//! Three layers of protection:
+//! 1. **Backward-read**: load committed bytes, assert correct data
+//! 2. **Round-trip**: import golden -> export -> re-import, verify no data loss
+//! 3. **Byte-equality**: export from identical graph, assert exact byte match
+//!
+//! ## When these tests fail
+//!
+//! - **Accidental breakage** (no `SNAPSHOT_VERSION` bump): fix the regression.
+//! - **Intentional format change** (version bumped):
+//!   1. Archive the old fixture: `cp fixtures/snapshot_v5.bin fixtures/archive/`
+//!   2. Regenerate:
+//!      ```
+//!      cargo test --all-features -p grafeo-engine --test main -- generate_fixture::regenerate_snapshot_fixture --ignored
+//!      ```
+//!   3. Rename the new fixture to match the new version (e.g. `snapshot_v6.bin`)
+//!   4. Update `EXPECTED_SNAPSHOT_VERSION` and `golden_bytes()` below
+//!   5. Commit both the archived and new fixture files
+
+use crate::generate_fixture;
+
+use grafeo_common::types::Value;
+use grafeo_engine::GrafeoDB;
+
+/// Must match `SNAPSHOT_VERSION` in `persistence.rs`.
+const EXPECTED_SNAPSHOT_VERSION: u8 = 5;
+
+/// A snapshot's bytes without its epoch, the last field: a varint, one byte
+/// for an epoch below 251, as in these small graphs. The fixture holds 0
+/// (written before snapshots held the database's epoch); an export holds
+/// the epoch of the database, which an import continues at.
+fn without_epoch(bytes: &[u8]) -> (&[u8], u8) {
+    let (epoch, rest) = bytes.split_last().expect("a snapshot");
+    assert!(*epoch < 251, "a one-byte epoch");
+    (rest, *epoch)
+}
+
+/// Load the committed golden fixture bytes.
+fn golden_bytes() -> &'static [u8] {
+    include_bytes!("fixtures/snapshot_v5.bin")
+}
+
+/// The fixture of the same graph in version 4, which 0.5.x and
+/// 0.6.0-beta.1 wrote.
+fn v4_bytes() -> &'static [u8] {
+    include_bytes!("fixtures/snapshot_v4.bin")
+}
+
+/// A version 4 snapshot still imports, with all its data, and exports as
+/// version 5.
+#[test]
+fn a_v4_snapshot_still_imports() {
+    assert_eq!(v4_bytes()[0], 4);
+    let db = GrafeoDB::import_snapshot(v4_bytes()).unwrap();
+    assert_eq!((db.node_count().unwrap(), db.edge_count().unwrap()), (3, 2));
+    let names = db
+        .execute("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+        .unwrap()
+        .rows()
+        .to_vec();
+    assert_eq!(
+        names,
+        vec![vec![Value::from("Alix")], vec![Value::from("Gus")]]
+    );
+    let exported = db.export_snapshot().unwrap();
+    assert_eq!(exported[0], EXPECTED_SNAPSHOT_VERSION);
+    assert_eq!(
+        without_epoch(&exported).0,
+        without_epoch(golden_bytes()).0,
+        "the v4 graph exports as the v5 fixture"
+    );
+    assert_eq!(
+        u64::from(without_epoch(&exported).1),
+        db.current_epoch().as_u64(),
+        "the export holds the database's epoch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Backward-read tests: can today's code deserialize yesterday's bytes?
+// ---------------------------------------------------------------------------
+
+#[test]
+fn golden_snapshot_version_byte() {
+    let bytes = golden_bytes();
+    assert_eq!(
+        bytes[0], EXPECTED_SNAPSHOT_VERSION,
+        "fixture version byte ({}) does not match EXPECTED_SNAPSHOT_VERSION ({}), regenerate the fixture",
+        bytes[0], EXPECTED_SNAPSHOT_VERSION,
+    );
+}
+
+#[test]
+fn golden_import_succeeds() {
+    let bytes = golden_bytes();
+    if let Err(e) = GrafeoDB::import_snapshot(bytes) {
+        panic!("failed to import golden fixture: {e}");
+    }
+}
+
+#[test]
+fn golden_node_count() {
+    let db = GrafeoDB::import_snapshot(golden_bytes()).unwrap();
+    assert_eq!(db.node_count().unwrap(), 3);
+}
+
+#[test]
+fn golden_edge_count() {
+    let db = GrafeoDB::import_snapshot(golden_bytes()).unwrap();
+    assert_eq!(db.edge_count().unwrap(), 2);
+}
+
+#[test]
+fn golden_node_labels() {
+    let db = GrafeoDB::import_snapshot(golden_bytes()).unwrap();
+    let session = db.session();
+
+    let persons = session
+        .execute("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+        .unwrap();
+    assert_eq!(persons.rows().len(), 2);
+    assert_eq!(persons.rows()[0][0], Value::String("Alix".into()));
+    assert_eq!(persons.rows()[1][0], Value::String("Gus".into()));
+
+    let companies = session.execute("MATCH (c:Company) RETURN c.name").unwrap();
+    assert_eq!(companies.rows().len(), 1);
+    assert_eq!(companies.rows()[0][0], Value::String("Acme Corp".into()));
+}
+
+#[test]
+fn golden_node_properties() {
+    let db = GrafeoDB::import_snapshot(golden_bytes()).unwrap();
+    let session = db.session();
+
+    let result = session
+        .execute("MATCH (p:Person) WHERE p.name = 'Alix' RETURN p.age")
+        .unwrap();
+    assert_eq!(result.rows()[0][0], Value::Int64(30));
+
+    let result = session
+        .execute("MATCH (p:Person) WHERE p.name = 'Gus' RETURN p.age")
+        .unwrap();
+    assert_eq!(result.rows()[0][0], Value::Int64(25));
+}
+
+#[test]
+fn golden_multi_labels() {
+    let db = GrafeoDB::import_snapshot(golden_bytes()).unwrap();
+    let session = db.session();
+
+    let employees = session.execute("MATCH (e:Employee) RETURN e.name").unwrap();
+    assert_eq!(employees.rows().len(), 1);
+    assert_eq!(employees.rows()[0][0], Value::String("Gus".into()));
+}
+
+#[test]
+fn golden_edge_types_and_properties() {
+    let db = GrafeoDB::import_snapshot(golden_bytes()).unwrap();
+    let session = db.session();
+
+    let knows = session
+        .execute("MATCH ()-[e:KNOWS]->() RETURN e.since")
+        .unwrap();
+    assert_eq!(knows.rows().len(), 1);
+    assert_eq!(knows.rows()[0][0], Value::Int64(2020));
+
+    let works = session
+        .execute("MATCH ()-[e:WORKS_AT]->() RETURN e.role")
+        .unwrap();
+    assert_eq!(works.rows().len(), 1);
+    assert_eq!(works.rows()[0][0], Value::String("Engineer".into()));
+}
+
+#[test]
+fn golden_edge_connectivity() {
+    let db = GrafeoDB::import_snapshot(golden_bytes()).unwrap();
+    let session = db.session();
+
+    // Alix -[:KNOWS]-> Gus
+    let result = session
+        .execute("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name")
+        .unwrap();
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::String("Alix".into()));
+    assert_eq!(result.rows()[0][1], Value::String("Gus".into()));
+
+    // Gus -[:WORKS_AT]-> Acme Corp
+    let result = session
+        .execute("MATCH (p:Person)-[:WORKS_AT]->(c:Company) RETURN p.name, c.name")
+        .unwrap();
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::String("Gus".into()));
+    assert_eq!(result.rows()[0][1], Value::String("Acme Corp".into()));
+}
+
+// ---------------------------------------------------------------------------
+// Round-trip through golden fixture: import -> re-export -> re-import
+// ---------------------------------------------------------------------------
+
+#[test]
+fn golden_round_trip_preserves_data() {
+    // Import the golden fixture, re-export, re-import, verify data survives.
+    // This catches format drift that is not backward-compatible (e.g. a field
+    // type change that serializes but produces different logical data).
+    let db1 = GrafeoDB::import_snapshot(golden_bytes()).unwrap();
+    let re_exported = db1.export_snapshot().unwrap();
+    let db2 = GrafeoDB::import_snapshot(&re_exported).unwrap();
+
+    assert_eq!(db2.node_count().unwrap(), 3);
+    assert_eq!(db2.edge_count().unwrap(), 2);
+
+    let session = db2.session();
+
+    let result = session
+        .execute("MATCH (p:Person) WHERE p.name = 'Alix' RETURN p.age")
+        .unwrap();
+    assert_eq!(result.rows()[0][0], Value::Int64(30));
+
+    let result = session
+        .execute("MATCH ()-[e:KNOWS]->() RETURN e.since")
+        .unwrap();
+    assert_eq!(result.rows()[0][0], Value::Int64(2020));
+
+    let result = session
+        .execute("MATCH (p:Person)-[:WORKS_AT]->(c:Company) RETURN p.name, c.name")
+        .unwrap();
+    assert_eq!(result.rows()[0][0], Value::String("Gus".into()));
+    assert_eq!(result.rows()[0][1], Value::String("Acme Corp".into()));
+}
+
+// ---------------------------------------------------------------------------
+// Byte-equality stability: deterministic export enables exact comparison
+// ---------------------------------------------------------------------------
+
+#[test]
+fn golden_byte_equality() {
+    // Re-create the same graph and check the export is byte-for-byte identical.
+    // Export ordering is deterministic (nodes/edges sorted by ID, properties by
+    // key, labels alphabetically), so any difference means the format drifted.
+    let db = generate_fixture::build_fixture_db();
+    let fresh_bytes = db.export_snapshot().unwrap();
+    let golden = golden_bytes();
+
+    assert_eq!(
+        fresh_bytes.len(),
+        golden.len(),
+        "snapshot byte length changed: golden={}, fresh={}, format may have drifted",
+        golden.len(),
+        fresh_bytes.len(),
+    );
+
+    assert_eq!(
+        without_epoch(&fresh_bytes).0,
+        without_epoch(golden).0,
+        "snapshot bytes differ despite same graph data, export may not be deterministic",
+    );
+    // The fixture is built through the store's direct writes, each at an
+    // epoch of its own: the export holds the store's epoch, at or above the
+    // database's.
+    assert!(
+        u64::from(without_epoch(&fresh_bytes).1) >= db.current_epoch().as_u64(),
+        "the export holds the database's epoch or a later one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Every kind of value (`snapshot_v5_values.bin`)
+// ---------------------------------------------------------------------------
+
+/// The committed snapshot of [`generate_fixture::build_every_value_db`]: a
+/// property of every kind of value, an edge with a decimal and RDF triples.
+/// `Value` is encoded by its serde variant index, so this pins the order of
+/// its variants as well as each kind's fields.
+fn every_value_bytes() -> &'static [u8] {
+    include_bytes!("fixtures/snapshot_v5_values.bin")
+}
+
+/// Every kind of value comes back from the committed snapshot as it was
+/// written, with the edge and the triples.
+#[test]
+fn every_value_kind_imports_from_the_v5_fixture() {
+    assert_eq!(every_value_bytes()[0], EXPECTED_SNAPSHOT_VERSION);
+    let db = GrafeoDB::import_snapshot(every_value_bytes()).unwrap();
+    for (key, expected) in generate_fixture::every_value_kind() {
+        let value = db
+            .execute(&format!("MATCH (k:Kinds) WHERE NOT k:Other RETURN k.{key}"))
+            .unwrap()
+            .rows()[0][0]
+            .clone();
+        assert_eq!(value, expected, "{key}");
+        if let (Value::Float64(read), Value::Float64(written)) = (&value, &expected) {
+            assert_eq!(read.to_bits(), written.to_bits(), "{key}: the bits");
+        }
+    }
+    assert_eq!(
+        db.execute("MATCH (:Kinds)-[n:NEXT]->(:Other) RETURN n.weight")
+            .unwrap()
+            .rows()[0][0],
+        Value::Decimal(grafeo_common::types::Decimal::parse("0.10").unwrap()),
+        "the edge's decimal keeps its scale"
+    );
+    #[cfg(feature = "sparql")]
+    {
+        let triples = db
+            .execute_sparql(
+                "SELECT ?g ?s ?p ?o WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }",
+            )
+            .unwrap();
+        assert_eq!(triples.rows().len(), 4, "three triples and one in trips");
+    }
+}
+
+/// The same steps export the same bytes, but for the epoch at the end.
+#[test]
+fn every_value_kind_exports_the_fixtures_bytes() {
+    let exported = generate_fixture::build_every_value_db()
+        .export_snapshot()
+        .unwrap();
+    assert!(
+        without_epoch(&exported).0 == without_epoch(every_value_bytes()).0,
+        "the export of the every-kind graph differs from snapshot_v5_values.bin"
+    );
+}

@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>siafudb browser probe</title>
+<script type="module">
+import init, * as w from './pkg/browserprobe.js';
+const worker = new Worker('./worker.js', { type: 'module' });
+let n = 0; const pend = new Map();
+worker.onmessage = (e) => { const p = pend.get(e.data.id); pend.delete(e.data.id); e.data.ok ? p.res(e.data.r) : p.rej(new Error(e.data.err)); };
+window.rpc = (op, args) => new Promise((res, rej) => { const id = ++n; pend.set(id, { res, rej }); worker.postMessage({ id, op, args }); });
+window.mainSmoke = async () => {
+  await init(); w.init();
+  const aff = w.exec("CREATE (:Person {name:'Amara', city:'Accra'})");
+  w.exec("CREATE (:Person {name:'Tatenda', city:'Harare'})");
+  return { aff, q: JSON.parse(w.query('MATCH (p:Person) RETURN p.name ORDER BY p.name')) };
+};
+window.storageInfo = async () => ({
+  persisted_before: await navigator.storage.persisted(),
+  persist: await navigator.storage.persist(),
+  persisted_after: await navigator.storage.persisted(),
+  estimate: await navigator.storage.estimate(),
+  isSecureContext, hasOPFS: !!navigator.storage.getDirectory,
+});
+window.ready = true;
+</script>

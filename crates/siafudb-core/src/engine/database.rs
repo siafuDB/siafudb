@@ -16,6 +16,7 @@ use crate::changelog::{ChangeLog, SharedChangeLog};
 use crate::error::SiafuError;
 use crate::fragment::Fragment;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -81,7 +82,7 @@ pub struct SiafuDB {
     /// When true, every write is captured in the mutation log
     /// for the sync protocol to pick up. Enabled by default;
     /// can be disabled for bulk import performance.
-    mutation_tracking: bool,
+    mutation_tracking: AtomicBool,
 
     /// Path to the database file, if persistent.
     /// None for in-memory databases.
@@ -100,6 +101,7 @@ impl SiafuDB {
     /// it opens the existing database. If it doesn't, it creates a new one.
     /// The file is a single file — the entire graph, indexes, and metadata
     /// in one place. Easy to backup, easy to encrypt, easy to sync.
+    #[cfg(feature = "native")]
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SiafuError> {
         let path = path.as_ref();
         let engine = grafeo::GrafeoDB::open(path.to_str().unwrap_or_default())
@@ -111,7 +113,7 @@ impl SiafuDB {
             engine,
             fragment: Fragment::new_local(),
             instance_id,
-            mutation_tracking: true,
+            mutation_tracking: AtomicBool::new(true),
             path: Some(path.to_path_buf()),
             change_log: Arc::new(Mutex::new(ChangeLog::new())),
         })
@@ -129,7 +131,33 @@ impl SiafuDB {
             engine,
             fragment: Fragment::new_local(),
             instance_id: Uuid::new_v4(),
-            mutation_tracking: true,
+            mutation_tracking: AtomicBool::new(true),
+            path: None,
+            change_log: Arc::new(Mutex::new(ChangeLog::new())),
+        })
+    }
+
+    /// Serialize the whole graph to a binary snapshot (Grafeo snapshot format).
+    ///
+    /// This is the persistence primitive for targets without a file system
+    /// (browser): the caller encrypts the bytes and stores them in OPFS or
+    /// IndexedDB.
+    pub fn export_snapshot(&self) -> Result<Vec<u8>, SiafuError> {
+        self.engine
+            .export_snapshot()
+            .map_err(|e| SiafuError::EngineError(e.to_string()))
+    }
+
+    /// Create an in-memory database from a snapshot produced by
+    /// [`export_snapshot`](Self::export_snapshot).
+    pub fn from_snapshot(data: &[u8]) -> Result<Self, SiafuError> {
+        let engine = grafeo::GrafeoDB::import_snapshot(data)
+            .map_err(|e| SiafuError::EngineError(e.to_string()))?;
+        Ok(Self {
+            engine,
+            fragment: Fragment::new_local(),
+            instance_id: Uuid::new_v4(),
+            mutation_tracking: AtomicBool::new(true),
             path: None,
             change_log: Arc::new(Mutex::new(ChangeLog::new())),
         })
@@ -144,17 +172,32 @@ impl SiafuDB {
     ///
     /// Returns the number of nodes/edges affected.
     pub fn execute(&self, query: &str) -> Result<ExecuteResult, SiafuError> {
+        self.execute_with_params(query, serde_json::Map::new())
+    }
+
+    /// Execute a write query with bound parameters (`$name` in the query).
+    ///
+    /// Always prefer this over formatting values into the query string:
+    /// bound values can never be parsed as query syntax. Supported parameter
+    /// types: string, bool, number, null (arrays/objects are bound as their
+    /// JSON text).
+    pub fn execute_with_params(
+        &self,
+        query: &str,
+        params: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<ExecuteResult, SiafuError> {
+        let bound = to_engine_params(&params)?;
         let result = self
             .engine
-            .execute(query)
+            .execute_with_params(query, bound)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
 
         let rows_affected = result.rows().len();
 
-        if self.mutation_tracking
+        if self.mutation_tracking.load(Ordering::Relaxed)
             && let Ok(mut log) = self.change_log.lock()
         {
-            log.append(query.to_string(), rows_affected);
+            log.append(query.to_string(), rows_affected, params);
         }
 
         Ok(ExecuteResult { rows_affected })
@@ -165,24 +208,47 @@ impl SiafuDB {
     /// This is the read path. No mutation tracking, no sync implications.
     /// Just query the local fragment and return results.
     pub fn query(&self, query: &str) -> Result<QueryResult, SiafuError> {
+        self.query_with_params(query, serde_json::Map::new())
+    }
+
+    /// Read query with bound parameters. See [`Self::execute_with_params`].
+    pub fn query_with_params(
+        &self,
+        query: &str,
+        params: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<QueryResult, SiafuError> {
         let result = self
             .engine
-            .execute(query)
+            .execute_with_params(query, to_engine_params(&params)?)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
 
         let rows: Vec<Vec<serde_json::Value>> = result
             .rows()
             .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|val| serde_json::Value::String(format!("{:?}", val)))
-                    .collect()
-            })
+            .map(|row| row.iter().map(from_engine_value).collect())
             .collect();
 
         Ok(QueryResult {
             columns: result.columns.clone(),
             rows,
+        })
+    }
+
+    /// Read query with bound parameters returning engine-typed cells
+    /// (bytes, temporal values, etc. are preserved instead of being
+    /// flattened to JSON). Used by the FFI layer.
+    pub fn query_typed_with_params(
+        &self,
+        query: &str,
+        params: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<TypedQueryResult, SiafuError> {
+        let result = self
+            .engine
+            .execute_with_params(query, to_engine_params(&params)?)
+            .map_err(|e| SiafuError::QueryError(e.to_string()))?;
+        Ok(TypedQueryResult {
+            columns: result.columns.clone(),
+            rows: result.rows().iter().map(|r| r.to_vec()).collect(),
         })
     }
 
@@ -219,8 +285,11 @@ impl SiafuDB {
     /// Disabling tracking is useful during bulk imports where you don't
     /// want every individual INSERT to be logged for sync. Re-enable
     /// after the import completes.
-    pub fn set_mutation_tracking(&mut self, enabled: bool) {
-        self.mutation_tracking = enabled;
+    ///
+    /// Takes `&self` (an atomic flag) so shared handles, such as the
+    /// UniFFI object wrapper, can toggle it.
+    pub fn set_mutation_tracking(&self, enabled: bool) {
+        self.mutation_tracking.store(enabled, Ordering::Relaxed);
     }
 
     /// Borrow the engine-level change log.
@@ -246,22 +315,19 @@ impl SiafuDB {
     /// it participates in relationships if you want it to.
     pub fn kv_set(&self, key: &str, value: &str) -> Result<(), SiafuError> {
         // MERGE ensures we update if exists, create if not.
-        let query = format!(
-            "MERGE (n:_KV {{key: '{}'}}) SET n.value = '{}'",
-            key.replace('\'', "\\'"),
-            value.replace('\'', "\\'")
-        );
-        self.execute(&query)?;
+        self.execute_with_params(
+            "MERGE (n:_KV {key: $key}) SET n.value = $value",
+            params([("key", key.into()), ("value", value.into())]),
+        )?;
         Ok(())
     }
 
     /// Retrieve a value by key.
     pub fn kv_get(&self, key: &str) -> Result<Option<String>, SiafuError> {
-        let query = format!(
-            "MATCH (n:_KV {{key: '{}'}}) RETURN n.value",
-            key.replace('\'', "\\'")
-        );
-        let result = self.query(&query)?;
+        let result = self.query_with_params(
+            "MATCH (n:_KV {key: $key}) RETURN n.value",
+            params([("key", key.into())]),
+        )?;
         Ok(result.rows.first().and_then(|row| {
             row.first().and_then(|v| {
                 if let serde_json::Value::String(s) = v {
@@ -275,11 +341,10 @@ impl SiafuDB {
 
     /// Delete a key-value pair.
     pub fn kv_delete(&self, key: &str) -> Result<(), SiafuError> {
-        let query = format!(
-            "MATCH (n:_KV {{key: '{}'}}) DELETE n",
-            key.replace('\'', "\\'")
-        );
-        self.execute(&query)?;
+        self.execute_with_params(
+            "MATCH (n:_KV {key: $key}) DELETE n",
+            params([("key", key.into())]),
+        )?;
         Ok(())
     }
 
@@ -297,35 +362,134 @@ impl SiafuDB {
         collection: &str,
         document: serde_json::Value,
     ) -> Result<Uuid, SiafuError> {
+        let label = ident(collection)?;
         let doc_id = Uuid::new_v4();
 
         if let serde_json::Value::Object(map) = &document {
-            let props: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{}: {}", k, value_to_cypher(v)))
-                .collect();
-
-            let query = format!(
-                "CREATE (:_{} {{_id: '{}', {}}})",
-                collection,
-                doc_id,
-                props.join(", ")
-            );
-            self.execute(&query)?;
+            let mut bound = serde_json::Map::new();
+            let mut props = vec!["_id: $_id".to_string()];
+            bound.insert("_id".into(), doc_id.to_string().into());
+            for (i, (k, v)) in map.iter().enumerate() {
+                let k = ident(k)?;
+                if k.starts_with('_') {
+                    return Err(SiafuError::QueryError(format!(
+                        "document keys starting with '_' are reserved: {k:?}"
+                    )));
+                }
+                let p = format!("p{i}");
+                props.push(format!("{k}: ${p}"));
+                // Nested arrays/objects are stored as JSON text until nested
+                // documents are decomposed into subgraphs.
+                let v = match v {
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                        serde_json::Value::String(v.to_string())
+                    }
+                    other => other.clone(),
+                };
+                bound.insert(p, v);
+            }
+            let query = format!("CREATE (:_doc_{label} {{{}}})", props.join(", "));
+            self.execute_with_params(&query, bound)?;
         }
 
         Ok(doc_id)
     }
 
-    /// Find documents in a collection matching a filter.
-    pub fn doc_find(&self, collection: &str, filter: &str) -> Result<QueryResult, SiafuError> {
-        let query = if filter.is_empty() {
-            format!("MATCH (d:_{}) RETURN d", collection)
+    /// Find documents in a collection whose top-level properties equal every
+    /// entry of `filter` (an empty map matches all). Keys must be plain
+    /// identifiers; values are bound parameters.
+    pub fn doc_find(
+        &self,
+        collection: &str,
+        filter: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<QueryResult, SiafuError> {
+        let label = ident(collection)?;
+        let mut bound = serde_json::Map::new();
+        let mut conds = Vec::new();
+        for (i, (k, v)) in filter.iter().enumerate() {
+            let k = ident(k)?;
+            let p = format!("f{i}");
+            conds.push(format!("{k}: ${p}"));
+            bound.insert(p, v.clone());
+        }
+        let query = if conds.is_empty() {
+            format!("MATCH (d:_doc_{label}) RETURN d")
         } else {
-            format!("MATCH (d:_{} {{{}}}) RETURN d", collection, filter)
+            format!("MATCH (d:_doc_{label} {{{}}}) RETURN d", conds.join(", "))
         };
-        self.query(&query)
+        self.query_with_params(&query, bound)
     }
+}
+
+/// Accept only `[A-Za-z_][A-Za-z0-9_]*` (max 64) wherever a name is spliced
+/// into query text. Values never go through here; they are bound parameters.
+fn ident(s: &str) -> Result<&str, SiafuError> {
+    let mut chars = s.chars();
+    let ok = s.len() <= 64
+        && matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(s)
+    } else {
+        Err(SiafuError::QueryError(format!("invalid identifier: {s:?}")))
+    }
+}
+
+/// Engine value -> JSON. Types JSON cannot express natively (bytes, temporal,
+/// vectors) fall back to their debug text until a typed result API exists.
+fn from_engine_value(v: &grafeo::Value) -> serde_json::Value {
+    use grafeo::Value as V;
+    match v {
+        V::Null => serde_json::Value::Null,
+        V::Bool(b) => (*b).into(),
+        V::Int64(i) => (*i).into(),
+        V::Float64(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        V::String(s) => s.as_str().into(),
+        V::List(items) => items.iter().map(from_engine_value).collect(),
+        other => serde_json::Value::String(format!("{other:?}")),
+    }
+}
+
+fn params<const N: usize>(
+    pairs: [(&str, serde_json::Value); N],
+) -> serde_json::Map<String, serde_json::Value> {
+    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+}
+
+fn to_engine_params(
+    p: &serde_json::Map<String, serde_json::Value>,
+) -> Result<std::collections::HashMap<String, grafeo::Value>, SiafuError> {
+    use serde_json::Value as J;
+    p.iter()
+        .map(|(k, v)| {
+            let v = match v {
+                J::Null => grafeo::Value::Null,
+                J::Bool(b) => grafeo::Value::from(*b),
+                J::String(s) => grafeo::Value::from(s.as_str()),
+                J::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+                    (Some(i), _, _) => grafeo::Value::from(i),
+                    // u64 above i64::MAX would silently lose precision as f64.
+                    (None, Some(_), _) => {
+                        return Err(SiafuError::QueryError(format!(
+                            "parameter {k:?}: integer out of range (> i64::MAX)"
+                        )));
+                    }
+                    (None, None, Some(f)) => grafeo::Value::from(f),
+                    _ => unreachable!("serde_json numbers are i64, u64 or f64"),
+                },
+                // No silent coercion: a list/object would otherwise be bound
+                // as text and match a different value than the caller meant.
+                J::Array(_) | J::Object(_) => {
+                    return Err(SiafuError::QueryError(format!(
+                        "parameter {k:?}: arrays and objects are not supported as bound values"
+                    )));
+                }
+            };
+            Ok((k.clone(), v))
+        })
+        .collect()
 }
 
 /// Result of a write operation.
@@ -341,15 +505,9 @@ pub struct QueryResult {
     pub rows: Vec<Vec<serde_json::Value>>,
 }
 
-/// Convert a serde_json::Value to a Cypher literal.
-fn value_to_cypher(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => "null".to_string(),
-        // For nested objects and arrays, store as JSON string for now.
-        // Phase 2 will decompose nested objects into subgraph nodes.
-        other => format!("'{}'", other.to_string().replace('\'', "\\'")),
-    }
+/// Result of a read query with engine-typed cells.
+#[derive(Debug)]
+pub struct TypedQueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<grafeo::Value>>,
 }

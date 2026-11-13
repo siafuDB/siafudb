@@ -1,0 +1,651 @@
+//! Unified flush: one code path for every checkpoint.
+//!
+//! Periodic checkpoints, `wal_checkpoint()`, `close()` and the async snapshot
+//! all write every section. A checkpoint writes a complete new image that
+//! holds only the sections it was given, so leaving an unchanged section out
+//! would drop it from the file. Within the LPG section the image shares the
+//! chunks that did not change with the image before it (incremental
+//! checkpoints, #430): only the changed ones are written.
+//!
+//! A checkpoint holds commits off only while it takes its snapshot (H3): the
+//! epoch E, a read pinned at it and what changed since the last image, and
+//! while it writes the sections without versions (the catalog, the RDF
+//! sections, the time index). Commits go on while it writes the LPG section,
+//! which holds the committed state at E.
+
+use grafeo_common::storage::Section;
+use grafeo_common::types::EpochId;
+use grafeo_common::utils::error::Result;
+
+#[cfg(feature = "grafeo-file")]
+use grafeo_storage::file::{CheckpointHeader, GrafeoFileManager};
+
+#[cfg(all(feature = "wal", feature = "grafeo-file"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "grafeo-file")]
+use super::sections::CheckpointImage;
+use super::sections::CheckpointSources;
+#[cfg(feature = "grafeo-file")]
+use crate::transaction::CommitsHeld;
+
+/// Context needed by each section during serialization.
+pub(super) struct FlushContext {
+    pub epoch: u64,
+    pub transaction_id: u64,
+    pub node_count: u64,
+    pub edge_count: u64,
+}
+
+#[cfg(feature = "grafeo-file")]
+impl FlushContext {
+    /// The values the checkpoint records in its database header, with
+    /// `checkpoint_lsn`, the log position the image covers: a reopen
+    /// replays the WAL from there.
+    pub fn checkpoint_header(&self, checkpoint_lsn: u64) -> CheckpointHeader {
+        CheckpointHeader {
+            checkpoint_lsn,
+            epoch: self.epoch,
+            last_transaction_id: self.transaction_id,
+            node_count: self.node_count,
+            edge_count: self.edge_count,
+        }
+    }
+}
+
+/// Result of a flush operation.
+#[derive(Debug, Default)]
+pub(super) struct FlushResult {
+    /// Number of sections written to the container.
+    pub sections_written: usize,
+}
+
+/// Executes the unified flush of `sources`: write every section as a new
+/// image, then truncate the WAL.
+///
+/// This is the single write path for all persistence operations. Commits are
+/// held off (see
+/// [`TransactionManager::hold_commits`](crate::transaction::TransactionManager))
+/// while the checkpoint takes its snapshot
+/// ([`CheckpointSources::snapshot`]), starts a new WAL segment and writes the
+/// sections without versions: no commit is between its epoch and its
+/// completion, so the snapshot's epoch E holds every commit whole or not at
+/// all, never one that did not complete, and the header's epoch and counts
+/// are E's. Commits then go on while the LPG section is written, read at E
+/// (a read pinned at E keeps what it reads). With a WAL, the order of the
+/// steps is what makes a crash at any point safe (#417):
+///
+/// 1. start a new WAL segment: every group logged so far is in the sealed,
+///    synced segments before its first log position, the checkpoint LSN,
+///    and is at or before E; every group logged later is after E,
+/// 2. write the sections as a new image (it holds all those groups and none
+///    after them), whose database header records the checkpoint LSN; the
+///    file manager syncs the image, then switches the database header to
+///    it, and from then on a reopen replays the WAL from that LSN onto it,
+/// 3. only then delete the segments before it, except those an incremental
+///    backup still needs.
+///
+/// A crash before the header switch leaves the previous header, whose
+/// checkpoint LSN is older, and the segments after it: a reopen replays them
+/// onto the previous image. A failed image write keeps every segment for the
+/// same reason: the new header may have reached the disk, or not.
+///
+/// Lock order: the file's checkpoint guard, then the commit lock.
+///
+/// # Errors
+///
+/// Returns an error if serialization or I/O fails, or after a commit that
+/// did not complete.
+#[cfg(feature = "grafeo-file")]
+pub(super) fn flush(fm: &GrafeoFileManager, sources: &CheckpointSources) -> Result<FlushResult> {
+    flush_covering(fm, sources, None)
+}
+
+/// [`flush`], recording `covered_lsn` as the image's checkpoint LSN when the
+/// database has no WAL: the end of a log the open replayed and retires, so
+/// a crash before it is removed does not replay it onto the image again.
+/// Without it a WAL-less checkpoint keeps the previous image's.
+///
+/// # Errors
+///
+/// As [`flush`].
+#[cfg(feature = "grafeo-file")]
+pub(super) fn flush_covering(
+    fm: &GrafeoFileManager,
+    sources: &CheckpointSources,
+    covered_lsn: Option<u64>,
+) -> Result<FlushResult> {
+    #[cfg(feature = "testing-statement-injection")]
+    grafeo_common::testing::commit_hook::count_checkpoint(fm.path());
+    // One checkpoint at a time: another one interleaving these steps could
+    // delete WAL files this one relies on.
+    let _checkpoint = fm.checkpoint_guard();
+    let commits = sources.transaction_manager.hold_commits()?;
+    flush_held(fm, sources, covered_lsn, commits)
+}
+
+/// [`flush_covering`] for a caller that holds the file's checkpoint guard
+/// and `commits` already, as a restore does to make what it replaced
+/// durable before any commit or checkpoint comes between.
+///
+/// # Errors
+///
+/// As [`flush`].
+#[cfg(feature = "grafeo-file")]
+pub(super) fn flush_held(
+    fm: &GrafeoFileManager,
+    sources: &CheckpointSources,
+    covered_lsn: Option<u64>,
+    commits: CommitsHeld<'_>,
+) -> Result<FlushResult> {
+    let image = sources.snapshot(&commits)?;
+    let section_refs: Vec<&dyn Section> = image.sections.iter().map(AsRef::as_ref).collect();
+    let held = image.held;
+    // The changes the image holds: commits are held off, so none comes
+    // between the image and this count.
+    let covered = sources.transaction_manager.change_count();
+
+    #[cfg(feature = "testing-statement-injection")]
+    grafeo_common::testing::commit_hook::run_during_checkpoint();
+
+    let result = write_sections(
+        fm,
+        (&section_refs, held),
+        &image.context,
+        Some(&image),
+        #[cfg(feature = "wal")]
+        sources.wal.as_deref().map(|wal| {
+            (
+                wal,
+                &*sources.wal_records_at_checkpoint,
+                &*sources.wal_retention,
+            )
+        }),
+        covered_lsn,
+        commits,
+    )?;
+    // Only a checkpoint that succeeded covers the changes: after a failed
+    // one the database stays changed, and the next tick tries again.
+    sources.transaction_manager.checkpointed(covered);
+    Ok(result)
+}
+
+/// Steps 1 to 3 of [`flush`] for `sections`, the sections of `image` when
+/// there is one: the caller holds the file's checkpoint guard, and `commits`
+/// until the first `held` sections are written (after the new WAL segment
+/// is started), when this releases them. `log` is the WAL, with the count
+/// of its records the checkpoint covers, which this sets. Once the image is
+/// active, `image`'s graphs follow it (their next checkpoint writes what
+/// changed since); after a failure their next one writes every chunk.
+#[cfg(feature = "grafeo-file")]
+fn write_sections(
+    fm: &GrafeoFileManager,
+    (sections, held): (&[&dyn Section], usize),
+    context: &FlushContext,
+    image: Option<&CheckpointImage>,
+    #[cfg(feature = "wal")] log: Option<(
+        &grafeo_storage::wal::Wal,
+        &AtomicU64,
+        &super::wal_retention::WalRetention,
+    )>,
+    covered_lsn: Option<u64>,
+    commits: CommitsHeld<'_>,
+) -> Result<FlushResult> {
+    use grafeo_common::testing::crash::maybe_crash;
+
+    maybe_crash("flush:before_serialize");
+
+    if sections.is_empty() {
+        return Ok(FlushResult {
+            sections_written: 0,
+        });
+    }
+
+    // Too little disk space refuses the checkpoint before it starts a new
+    // WAL segment, so the refusal changes nothing (#726).
+    fm.check_checkpoint_space()?;
+
+    // Step 1: the groups logged before the checkpoint LSN are in sealed
+    // segments, and their effects are in the snapshot below (commits are
+    // held, so no group follows them until the image is written).
+    #[cfg(feature = "wal")]
+    let covered = match log {
+        Some((wal, _, _)) => Some((wal.rotate()?, wal.records_written())),
+        None => None,
+    };
+    // Without a WAL the image covers the log the previous one did, or the
+    // one the caller names.
+    let without_log = covered_lsn.unwrap_or_else(|| fm.active_header().checkpoint_lsn);
+    #[cfg(feature = "wal")]
+    let checkpoint_lsn = covered.map_or(without_log, |(lsn, _)| lsn);
+    #[cfg(not(feature = "wal"))]
+    let checkpoint_lsn = without_log;
+
+    maybe_crash("flush:after_rotate");
+
+    // Step 2: write each section into the new image. Once the sections
+    // without versions are written, commits go on while the LPG section is
+    // written as of the snapshot (the log is cut at it).
+    let release = move || {
+        drop(commits);
+        maybe_crash("flush:after_snapshot");
+    };
+    match fm.write_checkpoint_releasing(
+        sections,
+        held,
+        release,
+        &context.checkpoint_header(checkpoint_lsn),
+    ) {
+        Ok(_) => {
+            if let Some(image) = image {
+                image.written_as(fm.active_image());
+            }
+        }
+        Err(error) => {
+            if let Some(image) = image {
+                image.failed();
+            }
+            return Err(error);
+        }
+    }
+    let sections_written = sections.len();
+
+    for section in sections {
+        section.mark_clean();
+    }
+
+    maybe_crash("flush:after_write");
+
+    // Step 3: the image is durable and active (`write_checkpoint` synced the
+    // image and its header).
+    #[cfg(feature = "wal")]
+    if let (Some((wal, records, retention)), Some((lsn, written))) = (log, covered) {
+        use super::wal_retention::CursorPosition;
+
+        records.store(written, Ordering::Release);
+
+        maybe_crash("flush:before_remove_segments");
+
+        // An incremental backup reads the segments after its cursor: keep
+        // those, up to the retention limit (#673).
+        let cursor = match super::backup::read_backup_cursor(wal.dir()) {
+            Ok(cursor) => cursor
+                .and_then(|cursor| cursor.wal_lsn)
+                .map(CursorPosition::At),
+            Err(error) => {
+                if retention.first_unreadable() {
+                    grafeo_common::grafeo_warn!(
+                        "cannot read the backup cursor of {} ({error}): checkpoints keep the WAL \
+                         for it up to the retention limit of {} bytes",
+                        wal.dir().display(),
+                        retention.limit
+                    );
+                }
+                Some(CursorPosition::Unreadable)
+            }
+        };
+        // A running backup's pin keeps the log it has not copied yet. Only
+        // checkpoints remove segments, one at a time, so the starts listed
+        // here are still there when the floor is decided.
+        let segment_starts: Vec<u64> = grafeo_storage::wal::list_wal_directory(wal.dir())?
+            .segments
+            .iter()
+            .map(|(first_lsn, _)| *first_lsn)
+            .collect();
+        let floor = retention.release_below_floor(lsn, cursor, &segment_starts, |floor| {
+            wal.remove_segments_before(floor).map(|_| ())
+        })?;
+        maybe_crash("flush:after_retention_release");
+        if floor.limited && retention.first_limited() {
+            grafeo_common::grafeo_warn!(
+                "the WAL kept for the next incremental backup of {} passed the retention limit \
+                 of {} bytes, so a checkpoint removed its oldest part: the next incremental \
+                 backup fails, and a full backup starts a new chain (raise the limit with \
+                 Config::with_wal_retention_limit)",
+                wal.dir().display(),
+                retention.limit
+            );
+        }
+    }
+
+    Ok(FlushResult { sections_written })
+}
+
+/// What [`write_copy`] wrote: the epoch the copy holds, which every commit
+/// up to it is in whole and none after it, and the log position its header
+/// records.
+#[cfg(feature = "grafeo-file")]
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(feature = "wal"),
+    expect(
+        dead_code,
+        reason = "a full backup reads them, and backups need the `wal` feature"
+    )
+)]
+pub(super) struct CopyWritten {
+    /// The epoch E of the copy.
+    pub epoch: u64,
+    /// The log position the copy covers, as `log_position` gave it.
+    pub checkpoint_lsn: u64,
+}
+
+/// Writes a complete image of the database at an epoch E to a new file at
+/// `path`, with commits going on while it writes (#362): it holds commits
+/// off only while it takes the snapshot (E, a read pinned at it, the next
+/// ids) and writes the sections without versions, as a checkpoint does, and
+/// lets them go on while it writes the LPG section as a reader at E sees it.
+/// The database's own file, marks and baselines are left as they are.
+///
+/// The file is a database with the id `database_id`, encrypted with the
+/// keys `keys` derive for it. `log_position` runs while commits are held,
+/// after the snapshot, and gives the log position the copy records: every
+/// WAL group before it is in the copy and none after it, so the groups from
+/// there on replay onto it. A full backup starts a new WAL segment there
+/// (its incrementals follow), a read-only database gives the end of the WAL
+/// it replayed, and a database of its own records 0.
+///
+/// The image is written to `<path>.partial` and renamed to `path` once it is
+/// complete and synced: `path` is never a file that opens as less than E (a
+/// crash leaves the partial file, which nothing opens; the next copy to
+/// `path` replaces it).
+///
+/// # Errors
+///
+/// Returns an error if `path` exists, commits cannot be held, a section
+/// fails to write, or the file cannot be written, synced or renamed; the
+/// partial file is removed then.
+#[cfg(feature = "grafeo-file")]
+pub(super) fn write_copy(
+    sources: &CheckpointSources,
+    path: &std::path::Path,
+    database_id: u128,
+    keys: &super::encryption::DatabaseKeys,
+    log_position: impl FnOnce() -> Result<u64>,
+) -> Result<CopyWritten> {
+    use grafeo_common::testing::crash::maybe_crash;
+    use grafeo_common::utils::error::Error;
+
+    // The check `create_with_id` makes of a new file, for `path` (the file
+    // is created at the partial path).
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(Error::Internal(format!(
+                "file already exists: {}",
+                path.display()
+            )));
+        }
+        Err(error) => {
+            return Err(Error::Internal(format!(
+                "cannot create {}: the path cannot be inspected, so it may exist: {error}",
+                path.display()
+            )));
+        }
+    }
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    // A copy cut off before its rename left this: it never opened as `path`.
+    if partial.exists() {
+        std::fs::remove_file(&partial)?;
+    }
+    // The file is created before commits are held: only the snapshot and the
+    // sections without versions are written under the hold.
+    let fm = GrafeoFileManager::create_with_id(
+        &partial,
+        database_id,
+        keys.container_cipher(database_id),
+    )?;
+    let written = write_copy_into(&fm, sources, log_position).and_then(|written| {
+        fm.close()?;
+        Ok(written)
+    });
+    drop(fm);
+    let renamed = written.and_then(|written| {
+        maybe_crash("copy:before_rename");
+        std::fs::rename(&partial, path)?;
+        sync_parent_dir(path)?;
+        Ok(written)
+    });
+    if renamed.is_err()
+        && let Err(error) = std::fs::remove_file(&partial)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        grafeo_common::grafeo_warn!(
+            "cannot remove the incomplete copy {}: {error}",
+            partial.display()
+        );
+    }
+    renamed
+}
+
+/// The image of [`write_copy`] into `fm`, a new file.
+#[cfg(feature = "grafeo-file")]
+fn write_copy_into(
+    fm: &GrafeoFileManager,
+    sources: &CheckpointSources,
+    log_position: impl FnOnce() -> Result<u64>,
+) -> Result<CopyWritten> {
+    use grafeo_common::testing::crash::maybe_crash;
+
+    let commits = sources.transaction_manager.hold_commits()?;
+    // The read pinned at E lives with `image` until the copy is written.
+    let image = sources.copy_snapshot(&commits)?;
+    let checkpoint_lsn = log_position()?;
+    maybe_crash("copy:after_snapshot");
+    let section_refs: Vec<&dyn Section> = image.sections.iter().map(AsRef::as_ref).collect();
+    let release = move || {
+        drop(commits);
+        maybe_crash("copy:after_release");
+    };
+    fm.write_checkpoint_releasing(
+        &section_refs,
+        image.held,
+        release,
+        &image.context.checkpoint_header(checkpoint_lsn),
+    )?;
+    maybe_crash("copy:after_write");
+    Ok(CopyWritten {
+        epoch: image.context.epoch,
+        checkpoint_lsn,
+    })
+}
+
+/// Makes a rename in the directory holding `path` durable. Windows has no
+/// directory handles to sync; its directory changes are metadata-journaled.
+#[cfg(feature = "grafeo-file")]
+pub(super) fn sync_parent_dir(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+impl CheckpointSources {
+    /// The header values of the checkpoint taken at `epoch`.
+    pub fn context(&self, epoch: EpochId) -> FlushContext {
+        let transaction_id = self
+            .transaction_manager
+            .last_assigned_transaction_id()
+            .map_or(0, |t| t.0);
+        let (nodes, edges) = self.counts();
+        FlushContext {
+            epoch: epoch.as_u64(),
+            transaction_id,
+            node_count: nodes as u64,
+            edge_count: edges as u64,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "grafeo-file"))]
+mod tests {
+    use super::*;
+    use grafeo_common::storage::{
+        SectionSink, SectionSource, SectionType, legacy_bytes, read_raw, write_raw,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A section holding fixed bytes, with its own dirty flag.
+    struct FixedSection {
+        section_type: SectionType,
+        data: Vec<u8>,
+        dirty: AtomicBool,
+    }
+
+    impl FixedSection {
+        fn new(section_type: SectionType, data: &[u8], dirty: bool) -> Self {
+            Self {
+                section_type,
+                data: data.to_vec(),
+                dirty: AtomicBool::new(dirty),
+            }
+        }
+    }
+
+    impl Section for FixedSection {
+        fn section_type(&self) -> SectionType {
+            self.section_type
+        }
+
+        fn serialize(&self) -> Result<Vec<u8>> {
+            Ok(self.data.clone())
+        }
+
+        fn deserialize(&mut self, data: &[u8]) -> Result<()> {
+            self.data = data.to_vec();
+            Ok(())
+        }
+
+        fn write_to(&self, sink: &mut dyn SectionSink) -> Result<()> {
+            write_raw(self, sink)
+        }
+
+        fn read_from(&mut self, source: &dyn SectionSource) -> Result<()> {
+            read_raw(self, source)
+        }
+
+        fn is_dirty(&self) -> bool {
+            self.dirty.load(Ordering::Acquire)
+        }
+
+        fn mark_clean(&self) {
+            self.dirty.store(false, Ordering::Release);
+        }
+
+        fn memory_usage(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    fn run_with(
+        fm: &GrafeoFileManager,
+        sections: &[&dyn Section],
+        context: &FlushContext,
+    ) -> usize {
+        let manager = crate::transaction::TransactionManager::new();
+        let _checkpoint = fm.checkpoint_guard();
+        let commits = manager.hold_commits().unwrap();
+        let sections = (sections, sections.len());
+        #[cfg(feature = "wal")]
+        let result = write_sections(fm, sections, context, None, None, None, commits);
+        #[cfg(not(feature = "wal"))]
+        let result = write_sections(fm, sections, context, None, None, commits);
+        result.unwrap().sections_written
+    }
+
+    fn run(fm: &GrafeoFileManager, sections: &[&dyn Section]) -> usize {
+        let context = FlushContext {
+            epoch: 1,
+            transaction_id: 1,
+            node_count: 0,
+            edge_count: 0,
+        };
+        run_with(fm, sections, &context)
+    }
+
+    /// The bytes of a section of the active image, stored as one raw chunk.
+    fn stored(fm: &GrafeoFileManager, section_type: SectionType) -> Option<Vec<u8>> {
+        fm.read_image(|image| match image.section_source(section_type) {
+            Some(section) => Ok(legacy_bytes(&*section)?.map(Vec::from)),
+            None => Ok(None),
+        })
+        .unwrap()
+    }
+
+    /// The new image's database header records the flush context; without
+    /// a WAL it keeps the previous image's log position (0 for the first).
+    #[test]
+    fn the_checkpoint_header_carries_the_flush_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let fm = GrafeoFileManager::create(dir.path().join("db.grafeo"), None).unwrap();
+        let catalog = FixedSection::new(SectionType::Catalog, b"Amsterdam", true);
+        let context = FlushContext {
+            epoch: 19,
+            transaction_id: 88,
+            node_count: 3,
+            edge_count: 319,
+        };
+        assert_eq!(run_with(&fm, &[&catalog], &context), 1);
+
+        let header = fm.active_header();
+        assert_eq!(
+            (
+                header.iteration,
+                header.checkpoint_lsn,
+                header.epoch,
+                header.last_transaction_id,
+                header.node_count,
+                header.edge_count
+            ),
+            (1, 0, 19, 88, 3, 319)
+        );
+        assert!(!catalog.is_dirty(), "a written section is clean");
+    }
+
+    /// Each checkpoint writes a complete file holding only the sections it
+    /// was given. The async snapshot used to write only the changed sections:
+    /// that dropped the others from the file (and then deleted the WAL files
+    /// that held them), and with nothing marked changed it wrote nothing.
+    #[test]
+    fn a_checkpoint_keeps_every_section_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fm = GrafeoFileManager::create(dir.path().join("db.grafeo"), None).unwrap();
+        let catalog = FixedSection::new(SectionType::Catalog, b"catalog", false);
+        let store = FixedSection::new(SectionType::LpgStore, b"store", false);
+
+        // Twice: the second checkpoint has nothing marked changed.
+        for checkpoint in 0..2 {
+            assert_eq!(run(&fm, &[&catalog, &store]), 2, "checkpoint {checkpoint}");
+            assert_eq!(
+                stored(&fm, SectionType::Catalog).as_deref(),
+                Some(&b"catalog"[..])
+            );
+            assert_eq!(
+                stored(&fm, SectionType::LpgStore).as_deref(),
+                Some(&b"store"[..])
+            );
+        }
+
+        let changed = FixedSection::new(SectionType::LpgStore, b"changed", true);
+        assert_eq!(run(&fm, &[&catalog, &changed]), 2);
+        assert_eq!(
+            stored(&fm, SectionType::Catalog).as_deref(),
+            Some(&b"catalog"[..]),
+            "the unchanged section is still in the file"
+        );
+        assert_eq!(
+            stored(&fm, SectionType::LpgStore).as_deref(),
+            Some(&b"changed"[..])
+        );
+    }
+}
