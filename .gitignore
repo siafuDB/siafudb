@@ -27,5 +27,8 @@ target
 # probes are standalone; lockfiles are intentionally not committed
 **/docs/spike/probes/*/Cargo.lock
 
+# JS dependencies
+node_modules
+
 # agent worktrees
 .claude/worktrees/
