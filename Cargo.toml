@@ -25,6 +25,7 @@ members = [
   "crates/siafudb-server",
   "crates/siafudb-wasm",
   "crates/siafudb-ffi",
+  "crates/siafudb-store",
 ]
 
 [workspace.package]
