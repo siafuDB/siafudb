@@ -136,6 +136,32 @@ impl SiafuDB {
         })
     }
 
+    /// Serialize the whole graph to a binary snapshot (Grafeo snapshot format).
+    ///
+    /// This is the persistence primitive for targets without a file system
+    /// (browser): the caller encrypts the bytes and stores them in OPFS or
+    /// IndexedDB.
+    pub fn export_snapshot(&self) -> Result<Vec<u8>, SiafuError> {
+        self.engine
+            .export_snapshot()
+            .map_err(|e| SiafuError::EngineError(e.to_string()))
+    }
+
+    /// Create an in-memory database from a snapshot produced by
+    /// [`export_snapshot`](Self::export_snapshot).
+    pub fn from_snapshot(data: &[u8]) -> Result<Self, SiafuError> {
+        let engine = grafeo::GrafeoDB::import_snapshot(data)
+            .map_err(|e| SiafuError::EngineError(e.to_string()))?;
+        Ok(Self {
+            engine,
+            fragment: Fragment::new_local(),
+            instance_id: Uuid::new_v4(),
+            mutation_tracking: true,
+            path: None,
+            change_log: Arc::new(Mutex::new(ChangeLog::new())),
+        })
+    }
+
     /// Execute a graph query (Cypher or GQL) that modifies data.
     ///
     /// This is the write path. Every mutation is:
