@@ -25,7 +25,7 @@
  * number of writes per key stays far below the 2^32 bound NIST SP 800-38D
  * allows for random-nonce AES-GCM.
  */
-import { FormatError, TamperError, UnsupportedCipherError } from './errors.js';
+import { FormatError, TamperError, UnsupportedCipherError } from "./errors.js";
 
 /**
  * Numeric cipher-suite ids stored in the header. Ids are append-only; never
@@ -70,16 +70,22 @@ function nonceLengthFor(suite: number): number {
 }
 
 function u64be(n: number): Uint8Array {
-  if (!Number.isSafeInteger(n) || n < 0) throw new RangeError('counter must be a non-negative safe integer');
+  if (!Number.isSafeInteger(n) || n < 0)
+    throw new RangeError("counter must be a non-negative safe integer");
   const b = new Uint8Array(8);
   new DataView(b.buffer).setBigUint64(0, BigInt(n));
   return b;
 }
 
 /** AAD binding database name, format version, suite and write counter. */
-export function buildAad(name: string, version: number, suite: number, counter: number): Uint8Array {
+export function buildAad(
+  name: string,
+  version: number,
+  suite: number,
+  counter: number,
+): Uint8Array {
   const nameBytes = te.encode(name);
-  if (nameBytes.length > 0xffff) throw new RangeError('database name too long');
+  if (nameBytes.length > 0xffff) throw new RangeError("database name too long");
   const aad = new Uint8Array(2 + nameBytes.length + 2 + 8);
   new DataView(aad.buffer).setUint16(0, nameBytes.length);
   aad.set(nameBytes, 2);
@@ -91,20 +97,37 @@ export function buildAad(name: string, version: number, suite: number, counter: 
 
 /** Parse the header without authenticating it. Throws {@link FormatError} if malformed. */
 export function parseHeader(blob: Uint8Array): SnapshotHeader {
-  if (blob.length < FIXED_HEADER) throw new FormatError('blob too short to be a SiafuDB snapshot');
-  for (let i = 0; i < 4; i++) if (blob[i] !== MAGIC[i]) throw new FormatError('bad magic: not a SiafuDB snapshot');
+  if (blob.length < FIXED_HEADER)
+    throw new FormatError("blob too short to be a SiafuDB snapshot");
+  for (let i = 0; i < 4; i++)
+    if (blob[i] !== MAGIC[i])
+      throw new FormatError("bad magic: not a SiafuDB snapshot");
   const version = blob[4]!;
-  if (version !== FORMAT_VERSION) throw new FormatError(`unsupported format version ${version}`);
+  if (version !== FORMAT_VERSION)
+    throw new FormatError(`unsupported format version ${version}`);
   const suite = blob[5]!;
   const nonceLen = blob[6]!;
-  if (blob[7] !== 0) throw new FormatError('unknown header flags');
-  if (suite === 0) throw new FormatError('cipher suite 0 is reserved');
-  if (nonceLen !== nonceLengthFor(suite)) throw new FormatError('nonce length does not match cipher suite');
-  const big = new DataView(blob.buffer, blob.byteOffset, blob.byteLength).getBigUint64(8);
-  if (big > BigInt(Number.MAX_SAFE_INTEGER)) throw new FormatError('write counter out of range');
+  if (blob[7] !== 0) throw new FormatError("unknown header flags");
+  if (suite === 0) throw new FormatError("cipher suite 0 is reserved");
+  if (nonceLen !== nonceLengthFor(suite))
+    throw new FormatError("nonce length does not match cipher suite");
+  const big = new DataView(
+    blob.buffer,
+    blob.byteOffset,
+    blob.byteLength,
+  ).getBigUint64(8);
+  if (big > BigInt(Number.MAX_SAFE_INTEGER))
+    throw new FormatError("write counter out of range");
   const bodyOffset = FIXED_HEADER + nonceLen;
-  if (blob.length < bodyOffset + TAG_BYTES) throw new FormatError('blob truncated');
-  return { version, suite, counter: Number(big), nonce: blob.slice(FIXED_HEADER, bodyOffset), bodyOffset };
+  if (blob.length < bodyOffset + TAG_BYTES)
+    throw new FormatError("blob truncated");
+  return {
+    version,
+    suite,
+    counter: Number(big),
+    nonce: blob.slice(FIXED_HEADER, bodyOffset),
+    bodyOffset,
+  };
 }
 
 /** Best-effort counter peek used only to order candidate blobs; never trust it for security. */
@@ -128,12 +151,18 @@ export interface EncodeOptions {
 /** Encrypt `plaintext` into a self-describing container. */
 export async function encodeSnapshot(o: EncodeOptions): Promise<Uint8Array> {
   const suite = o.suite ?? CipherSuite.AES_256_GCM;
-  if (suite !== CipherSuite.AES_256_GCM) throw new UnsupportedCipherError(suite);
+  if (suite !== CipherSuite.AES_256_GCM)
+    throw new UnsupportedCipherError(suite);
   const nonce = crypto.getRandomValues(new Uint8Array(AES_GCM_NONCE));
   const aad = buildAad(o.name, FORMAT_VERSION, suite, o.counter);
   const ct = new Uint8Array(
     await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: nonce as BufferSource, additionalData: aad as BufferSource, tagLength: TAG_BITS },
+      {
+        name: "AES-GCM",
+        iv: nonce as BufferSource,
+        additionalData: aad as BufferSource,
+        tagLength: TAG_BITS,
+      },
       o.key,
       o.plaintext as BufferSource,
     ),
@@ -162,17 +191,29 @@ export interface DecodeOptions {
  * @throws {UnsupportedCipherError} header names a suite this build cannot run
  * @throws {TamperError} authentication failed
  */
-export async function decodeSnapshot(o: DecodeOptions): Promise<{ plaintext: Uint8Array; counter: number; suite: number }> {
+export async function decodeSnapshot(
+  o: DecodeOptions,
+): Promise<{ plaintext: Uint8Array; counter: number; suite: number }> {
   const h = parseHeader(o.blob);
-  if (h.suite !== CipherSuite.AES_256_GCM) throw new UnsupportedCipherError(h.suite);
+  if (h.suite !== CipherSuite.AES_256_GCM)
+    throw new UnsupportedCipherError(h.suite);
   const aad = buildAad(o.name, h.version, h.suite, h.counter);
   try {
     const pt = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: h.nonce as BufferSource, additionalData: aad as BufferSource, tagLength: TAG_BITS },
+      {
+        name: "AES-GCM",
+        iv: h.nonce as BufferSource,
+        additionalData: aad as BufferSource,
+        tagLength: TAG_BITS,
+      },
       o.key,
       o.blob.subarray(h.bodyOffset) as BufferSource,
     );
-    return { plaintext: new Uint8Array(pt), counter: h.counter, suite: h.suite };
+    return {
+      plaintext: new Uint8Array(pt),
+      counter: h.counter,
+      suite: h.suite,
+    };
   } catch (cause) {
     throw Object.assign(new TamperError(), { cause });
   }

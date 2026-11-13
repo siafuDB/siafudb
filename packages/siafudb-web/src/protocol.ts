@@ -1,7 +1,13 @@
 /** Wire types shared by the client and the worker. Not part of the public API. */
 
 /** A JSON-representable value, as bound to `$name` query parameters and returned in result cells. */
-export type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]: JsonValue };
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [k: string]: JsonValue };
 
 /** Named query parameters (`$name` in the query text). */
 export type Params = Record<string, JsonValue>;
@@ -28,14 +34,14 @@ export interface ChangeLogEntry {
   params: Params;
 }
 
-export type Backend = 'opfs' | 'idb';
+export type Backend = "opfs" | "idb";
 
 export interface InitArgs {
   name: string;
-  backend: 'auto' | Backend;
+  backend: "auto" | Backend;
   /** Debounce in ms; 0 disables autosave (use `flush()`). */
   autosaveMs: number;
-  lock: 'wait' | 'fail';
+  lock: "wait" | "fail";
   lockTimeoutMs: number | null;
   wasmUrl?: string;
 }
@@ -50,14 +56,31 @@ export interface InitResult {
 }
 
 export type Request =
-  | { id: number; op: 'init'; args: InitArgs }
-  | { id: number; op: 'execute' | 'query'; args: { query: string; params: string | null } }
-  | { id: number; op: 'changesSince'; args: { seq: number } }
-  | { id: number; op: 'flush' | 'close' }
-  | { id: number; op: 'destroy'; args: { name: string } };
+  | { id: number; op: "init"; args: InitArgs }
+  | {
+      id: number;
+      op: "execute" | "query";
+      args: { query: string; params: string | null };
+    }
+  | { id: number; op: "changesSince"; args: { seq: number } }
+  | { id: number; op: "flush" | "close" }
+  | { id: number; op: "destroy"; args: { name: string } };
 
 export type Response =
   | { id: number; ok: true; result: unknown }
-  | { id: number; ok: false; error: { code: string; message: string; suite?: number; found?: number; expected?: number } };
+  | {
+      id: number;
+      ok: false;
+      error: {
+        code: string;
+        message: string;
+        suite?: number;
+        found?: number;
+        expected?: number;
+      };
+    };
 
-export type WorkerEvent = { type: 'ready' } | { type: 'autosave-error'; message: string } | { type: 'saved'; counter: number };
+export type WorkerEvent =
+  | { type: "ready" }
+  | { type: "autosave-error"; message: string }
+  | { type: "saved"; counter: number };

@@ -17,7 +17,7 @@
  * (it can call the KEK) or an attacker who can erase both the key vault and
  * the snapshot store.
  */
-import { KeyMissingError } from './errors.js';
+import { KeyMissingError } from "./errors.js";
 
 /** Where data keys and counters live. Implemented by {@link IdbKeyVault} (browser) and {@link MemoryKeyVault} (tests). */
 export interface KeyVault {
@@ -34,10 +34,18 @@ export interface KeyVault {
 const te = new TextEncoder();
 const dekAad = (name: string) => te.encode(`siafudb:dek:v1:${name}`);
 
-async function wrapDek(kek: CryptoKey, raw: Uint8Array, name: string): Promise<Uint8Array> {
+async function wrapDek(
+  kek: CryptoKey,
+  raw: Uint8Array,
+  name: string,
+): Promise<Uint8Array> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = new Uint8Array(
-    await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: dekAad(name) as BufferSource }, kek, raw as BufferSource),
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, additionalData: dekAad(name) as BufferSource },
+      kek,
+      raw as BufferSource,
+    ),
   );
   const out = new Uint8Array(12 + ct.length);
   out.set(iv);
@@ -45,30 +53,51 @@ async function wrapDek(kek: CryptoKey, raw: Uint8Array, name: string): Promise<U
   return out;
 }
 
-async function unwrapDek(kek: CryptoKey, wrapped: Uint8Array, name: string): Promise<CryptoKey> {
+async function unwrapDek(
+  kek: CryptoKey,
+  wrapped: Uint8Array,
+  name: string,
+): Promise<CryptoKey> {
   const raw = new Uint8Array(
     await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: wrapped.slice(0, 12), additionalData: dekAad(name) as BufferSource },
+      {
+        name: "AES-GCM",
+        iv: wrapped.slice(0, 12),
+        additionalData: dekAad(name) as BufferSource,
+      },
       kek,
       wrapped.slice(12),
     ),
   );
   try {
-    return await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+    return await crypto.subtle.importKey("raw", raw, "AES-GCM", false, [
+      "encrypt",
+      "decrypt",
+    ]);
   } finally {
     raw.fill(0);
   }
 }
 
-async function newDek(kek: CryptoKey, name: string): Promise<{ wrapped: Uint8Array; key: CryptoKey }> {
+async function newDek(
+  kek: CryptoKey,
+  name: string,
+): Promise<{ wrapped: Uint8Array; key: CryptoKey }> {
   const raw = crypto.getRandomValues(new Uint8Array(32));
   const wrapped = await wrapDek(kek, raw, name);
-  const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  const key = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, [
+    "encrypt",
+    "decrypt",
+  ]);
   raw.fill(0);
   return { wrapped, key };
 }
 
-const newKek = () => crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+const newKek = () =>
+  crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
 
 /** In-memory vault for tests and non-browser hosts. Nothing survives the process. */
 export class MemoryKeyVault implements KeyVault {
@@ -76,7 +105,10 @@ export class MemoryKeyVault implements KeyVault {
   private readonly wrapped = new Map<string, Uint8Array>();
   private readonly counters = new Map<string, number>();
 
-  async getDataKey(name: string, opts: { create: boolean }): Promise<CryptoKey> {
+  async getDataKey(
+    name: string,
+    opts: { create: boolean },
+  ): Promise<CryptoKey> {
     this.kek ??= await newKek();
     const w = this.wrapped.get(name);
     if (w) return unwrapDek(this.kek, w, name);
@@ -100,29 +132,43 @@ export class MemoryKeyVault implements KeyVault {
 // ---- IndexedDB plumbing (shared with the IDB blob backend) ----
 
 /** Open (and create on first use) an IndexedDB database with the given object stores. */
-export function openIdb(dbName: string, stores: string[]): Promise<IDBDatabase> {
+export function openIdb(
+  dbName: string,
+  stores: string[],
+): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(dbName, 1);
     req.onupgradeneeded = () => {
-      for (const s of stores) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s);
+      for (const s of stores)
+        if (!req.result.objectStoreNames.contains(s))
+          req.result.createObjectStore(s);
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
-    req.onblocked = () => reject(new Error('indexedDB open blocked'));
+    req.onblocked = () => reject(new Error("indexedDB open blocked"));
   });
 }
 
-export function idbGet<T>(db: IDBDatabase, store: string, key: string): Promise<T | undefined> {
+export function idbGet<T>(
+  db: IDBDatabase,
+  store: string,
+  key: string,
+): Promise<T | undefined> {
   return new Promise((resolve, reject) => {
-    const r = db.transaction(store, 'readonly').objectStore(store).get(key);
+    const r = db.transaction(store, "readonly").objectStore(store).get(key);
     r.onsuccess = () => resolve(r.result as T | undefined);
     r.onerror = () => reject(r.error);
   });
 }
 
-export function idbPut(db: IDBDatabase, store: string, key: string, value: unknown): Promise<void> {
+export function idbPut(
+  db: IDBDatabase,
+  store: string,
+  key: string,
+  value: unknown,
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const t = db.transaction(store, 'readwrite');
+    const t = db.transaction(store, "readwrite");
     t.objectStore(store).put(value, key);
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
@@ -130,9 +176,13 @@ export function idbPut(db: IDBDatabase, store: string, key: string, value: unkno
   });
 }
 
-export function idbDelete(db: IDBDatabase, store: string, key: string): Promise<void> {
+export function idbDelete(
+  db: IDBDatabase,
+  store: string,
+  key: string,
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const t = db.transaction(store, 'readwrite');
+    const t = db.transaction(store, "readwrite");
     t.objectStore(store).delete(key);
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
@@ -141,17 +191,20 @@ export function idbDelete(db: IDBDatabase, store: string, key: string): Promise<
 
 /** Browser vault: non-extractable KEK + wrapped DEKs + counters, all in IndexedDB. */
 export class IdbKeyVault implements KeyVault {
-  constructor(private readonly dbName = 'siafudb-keys') {}
+  constructor(private readonly dbName = "siafudb-keys") {}
 
   private open() {
-    return openIdb(this.dbName, ['keys', 'counters']);
+    return openIdb(this.dbName, ["keys", "counters"]);
   }
 
-  async getDataKey(name: string, opts: { create: boolean }): Promise<CryptoKey> {
+  async getDataKey(
+    name: string,
+    opts: { create: boolean },
+  ): Promise<CryptoKey> {
     const db = await this.open();
     try {
-      let kek = await idbGet<CryptoKey>(db, 'keys', 'kek');
-      const wrapped = await idbGet<Uint8Array>(db, 'keys', `dek:${name}`);
+      let kek = await idbGet<CryptoKey>(db, "keys", "kek");
+      const wrapped = await idbGet<Uint8Array>(db, "keys", `dek:${name}`);
       if (wrapped) {
         if (!kek) throw new KeyMissingError(name);
         return await unwrapDek(kek, wrapped, name);
@@ -159,10 +212,10 @@ export class IdbKeyVault implements KeyVault {
       if (!opts.create) throw new KeyMissingError(name);
       if (!kek) {
         kek = await newKek();
-        await idbPut(db, 'keys', 'kek', kek);
+        await idbPut(db, "keys", "kek", kek);
       }
       const fresh = await newDek(kek, name);
-      await idbPut(db, 'keys', `dek:${name}`, fresh.wrapped);
+      await idbPut(db, "keys", `dek:${name}`, fresh.wrapped);
       return fresh.key;
     } finally {
       db.close();
@@ -172,7 +225,7 @@ export class IdbKeyVault implements KeyVault {
   async getCounter(name: string): Promise<number> {
     const db = await this.open();
     try {
-      return (await idbGet<number>(db, 'counters', name)) ?? 0;
+      return (await idbGet<number>(db, "counters", name)) ?? 0;
     } finally {
       db.close();
     }
@@ -181,8 +234,8 @@ export class IdbKeyVault implements KeyVault {
   async setCounter(name: string, n: number): Promise<void> {
     const db = await this.open();
     try {
-      const cur = (await idbGet<number>(db, 'counters', name)) ?? 0;
-      if (n > cur) await idbPut(db, 'counters', name, n);
+      const cur = (await idbGet<number>(db, "counters", name)) ?? 0;
+      if (n > cur) await idbPut(db, "counters", name, n);
     } finally {
       db.close();
     }
@@ -191,8 +244,8 @@ export class IdbKeyVault implements KeyVault {
   async delete(name: string): Promise<void> {
     const db = await this.open();
     try {
-      await idbDelete(db, 'keys', `dek:${name}`);
-      await idbDelete(db, 'counters', name);
+      await idbDelete(db, "keys", `dek:${name}`);
+      await idbDelete(db, "counters", name);
     } finally {
       db.close();
     }

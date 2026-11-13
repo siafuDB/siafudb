@@ -1,3 +1,4 @@
+#![allow(warnings)] // SiafuDB fork: upstream warning-cleanliness is not ours to gate (see engine/CHANGES.md)
 //! # grafeo-storage
 //!
 //! Persistence layer for Grafeo: WAL, container format, and section I/O.

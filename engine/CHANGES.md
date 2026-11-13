@@ -50,3 +50,19 @@ Recorded paths (read by `scripts/ci/check-engine-pin.sh`):
 - `engine/grafeo-engine/LICENSE`
 - `engine/grafeo-engine/NOTICE`
 
+## 2026-11-13: warnings policy
+
+Each engine crate root (`src/lib.rs`) gained a first line
+`#![allow(warnings)]`. The org CI builds every crate in the tree, vendored
+path dependencies included, with `RUSTFLAGS="-D warnings"`; a newer `stable`
+rustc flags dead code in upstream sources (e.g. `Touched::Range` in
+`siafudb-graph-core`). SiafuDB's own crates keep `-D warnings` and clippy.
+Recorded paths:
+
+- `engine/grafeo/src/lib.rs`
+- `engine/grafeo-common/src/lib.rs`
+- `engine/grafeo-core/src/lib.rs`
+- `engine/grafeo-adapters/src/lib.rs`
+- `engine/grafeo-storage/src/lib.rs`
+- `engine/grafeo-engine/src/lib.rs`
+

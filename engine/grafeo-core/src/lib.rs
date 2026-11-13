@@ -1,3 +1,4 @@
+#![allow(warnings)] // SiafuDB fork: upstream warning-cleanliness is not ours to gate (see engine/CHANGES.md)
 //! # grafeo-core
 //!
 //! The core data structures behind Grafeo. You'll find graph storage, indexes,

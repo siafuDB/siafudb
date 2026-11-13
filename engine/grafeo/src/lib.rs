@@ -1,3 +1,4 @@
+#![allow(warnings)] // SiafuDB fork: upstream warning-cleanliness is not ours to gate (see engine/CHANGES.md)
 //! # Grafeo
 //!
 //! A high-performance, embeddable graph database with a Rust core and no required

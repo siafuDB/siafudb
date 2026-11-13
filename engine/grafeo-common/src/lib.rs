@@ -1,3 +1,4 @@
+#![allow(warnings)] // SiafuDB fork: upstream warning-cleanliness is not ours to gate (see engine/CHANGES.md)
 //! # grafeo-common
 //!
 //! The foundation layer - types and utilities used everywhere in Grafeo.

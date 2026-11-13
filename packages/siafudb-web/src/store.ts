@@ -2,13 +2,13 @@
  * Encrypted snapshot store: a {@link BlobBackend} (where bytes live) plus a
  * {@link KeyVault} (keys and the rollback high-water mark).
  */
-import { RollbackError, SiafuError } from './errors.js';
-import { decodeSnapshot, encodeSnapshot, peekCounter } from './format.js';
-import type { KeyVault } from './vault.js';
+import { RollbackError, SiafuError } from "./errors.js";
+import { decodeSnapshot, encodeSnapshot, peekCounter } from "./format.js";
+import type { KeyVault } from "./vault.js";
 
 /** Byte storage for opaque (already encrypted) snapshot blobs. */
 export interface BlobBackend {
-  readonly kind: 'opfs' | 'idb' | 'memory';
+  readonly kind: "opfs" | "idb" | "memory";
   /** Every blob currently stored (OPFS keeps two slots; IndexedDB one). */
   readCandidates(): Promise<Uint8Array[]>;
   /** Durably store `blob`, which carries write counter `counter`. Must not destroy the previous good blob until the new one is complete. */
@@ -20,7 +20,7 @@ export interface BlobBackend {
 
 /** In-memory backend for unit tests. Exposes `slots` so tests can tamper or replay. */
 export class MemoryBackend implements BlobBackend {
-  readonly kind = 'memory' as const;
+  readonly kind = "memory" as const;
   slots: Uint8Array[] = [];
   async readCandidates() {
     return this.slots.map((s) => s.slice());
@@ -66,7 +66,9 @@ export class EncryptedSnapshotStore {
       return null;
     }
     const key = await this.vault.getDataKey(this.name, { create: false });
-    const ordered = blobs.map((b) => ({ b, c: peekCounter(b) })).sort((x, y) => y.c - x.c);
+    const ordered = blobs
+      .map((b) => ({ b, c: peekCounter(b) }))
+      .sort((x, y) => y.c - x.c);
     let firstError: unknown;
     let staleCounter = -1;
     for (const { b } of ordered) {
@@ -76,7 +78,8 @@ export class EncryptedSnapshotStore {
           staleCounter = Math.max(staleCounter, r.counter);
           continue;
         }
-        if (r.counter > highWater) await this.vault.setCounter(this.name, r.counter); // crash between blob and counter commit
+        if (r.counter > highWater)
+          await this.vault.setCounter(this.name, r.counter); // crash between blob and counter commit
         this.counter = r.counter;
         return r.plaintext;
       } catch (e) {
@@ -93,7 +96,12 @@ export class EncryptedSnapshotStore {
     const key = await this.vault.getDataKey(this.name, { create: true });
     const highWater = await this.vault.getCounter(this.name);
     const counter = Math.max(this.counter, highWater) + 1;
-    const blob = await encodeSnapshot({ name: this.name, key, counter, plaintext });
+    const blob = await encodeSnapshot({
+      name: this.name,
+      key,
+      counter,
+      plaintext,
+    });
     await this.backend.write(blob, counter); // blob first, counter second: a crash in between is recoverable
     await this.vault.setCounter(this.name, counter);
     this.counter = counter;

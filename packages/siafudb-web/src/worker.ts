@@ -3,12 +3,19 @@
  * Lock, the encrypted snapshot store and the debounced autosave. The main
  * thread talks to it through `client.ts`; do not import this file directly.
  */
-import init, { Database } from './wasm/siafudb_wasm.js';
-import { chooseBackend, IdbBackend, OpfsBackend } from './backends.js';
-import { DatabaseLockedError, SiafuError, serializeError } from './errors.js';
-import type { ChangeLogEntry, InitArgs, InitResult, Request, Response, WorkerEvent } from './protocol.js';
-import { EncryptedSnapshotStore } from './store.js';
-import { IdbKeyVault } from './vault.js';
+import init, { Database } from "./wasm/siafudb_wasm.js";
+import { chooseBackend, IdbBackend, OpfsBackend } from "./backends.js";
+import { DatabaseLockedError, SiafuError, serializeError } from "./errors.js";
+import type {
+  ChangeLogEntry,
+  InitArgs,
+  InitResult,
+  Request,
+  Response,
+  WorkerEvent,
+} from "./protocol.js";
+import { EncryptedSnapshotStore } from "./store.js";
+import { IdbKeyVault } from "./vault.js";
 
 interface Scope {
   postMessage(m: unknown): void;
@@ -18,14 +25,25 @@ const scope = self as unknown as Scope;
 const emit = (e: WorkerEvent) => scope.postMessage(e);
 
 /** Take the exclusive per-database Web Lock; resolves to a release function. */
-function acquireLock(name: string, mode: 'wait' | 'fail', timeoutMs: number | null): Promise<() => void> {
+function acquireLock(
+  name: string,
+  mode: "wait" | "fail",
+  timeoutMs: number | null,
+): Promise<() => void> {
   if (!navigator.locks) {
-    return Promise.reject(new SiafuError('storage', 'Web Locks API unavailable; refusing to open without a single-writer lock'));
+    return Promise.reject(
+      new SiafuError(
+        "storage",
+        "Web Locks API unavailable; refusing to open without a single-writer lock",
+      ),
+    );
   }
   return new Promise((resolve, reject) => {
-    const ac = mode === 'wait' && timeoutMs !== null ? new AbortController() : undefined;
+    const ac =
+      mode === "wait" && timeoutMs !== null ? new AbortController() : undefined;
     const timer = ac ? setTimeout(() => ac.abort(), timeoutMs!) : undefined;
-    const opts: LockOptions = mode === 'fail' ? { ifAvailable: true } : ac ? { signal: ac.signal } : {};
+    const opts: LockOptions =
+      mode === "fail" ? { ifAvailable: true } : ac ? { signal: ac.signal } : {};
     navigator.locks
       .request(`siafudb:${name}`, opts, (lock) => {
         clearTimeout(timer);
@@ -37,7 +55,11 @@ function acquireLock(name: string, mode: 'wait' | 'fail', timeoutMs: number | nu
       })
       .catch((e: unknown) => {
         clearTimeout(timer);
-        reject((e as Error).name === 'AbortError' ? new DatabaseLockedError(name) : e);
+        reject(
+          (e as Error).name === "AbortError"
+            ? new DatabaseLockedError(name)
+            : e,
+        );
       });
   });
 }
@@ -60,7 +82,9 @@ class Session {
     if (this.autosaveMs <= 0 || this.timer !== undefined) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      this.save().catch((e: unknown) => emit({ type: 'autosave-error', message: (e as Error).message }));
+      this.save().catch((e: unknown) =>
+        emit({ type: "autosave-error", message: (e as Error).message }),
+      );
     }, this.autosaveMs);
   }
 
@@ -72,7 +96,7 @@ class Session {
       try {
         const snap = this.db.exportSnapshot(); // synchronous: a consistent point-in-time image
         const counter = await this.store.save(snap);
-        emit({ type: 'saved', counter });
+        emit({ type: "saved", counter });
       } catch (e) {
         this.dirty = true;
         throw e;
@@ -107,13 +131,17 @@ let session: Session | null = null;
 let wasmReady: Promise<unknown> | null = null;
 
 async function doInit(a: InitArgs): Promise<InitResult> {
-  if (session) throw new SiafuError('internal', 'worker already initialised');
+  if (session) throw new SiafuError("internal", "worker already initialised");
   wasmReady ??= init(a.wasmUrl ? { module_or_path: a.wasmUrl } : undefined);
   await wasmReady;
   const release = await acquireLock(a.name, a.lock, a.lockTimeoutMs);
   try {
     const backend = chooseBackend(a.name, a.backend);
-    const store = new EncryptedSnapshotStore(a.name, backend, new IdbKeyVault());
+    const store = new EncryptedSnapshotStore(
+      a.name,
+      backend,
+      new IdbKeyVault(),
+    );
     const snap = await store.load();
     const db = snap ? Database.fromSnapshot(snap) : new Database();
     snap?.fill(0);
@@ -129,7 +157,12 @@ async function doInit(a: InitArgs): Promise<InitResult> {
       session.markDirty();
       await session.flush();
     }
-    return { backend: backend.kind === 'opfs' ? 'opfs' : 'idb', restored: snap !== null, persisted, writeCounter: store.writeCounter };
+    return {
+      backend: backend.kind === "opfs" ? "opfs" : "idb",
+      restored: snap !== null,
+      persisted,
+      writeCounter: store.writeCounter,
+    };
   } catch (e) {
     release();
     throw e;
@@ -137,7 +170,7 @@ async function doInit(a: InitArgs): Promise<InitResult> {
 }
 
 async function doDestroy(name: string): Promise<void> {
-  const release = await acquireLock(name, 'fail', null);
+  const release = await acquireLock(name, "fail", null);
   try {
     const vault = new IdbKeyVault();
     await new OpfsBackend(name).deleteAll().catch(() => undefined);
@@ -149,32 +182,38 @@ async function doDestroy(name: string): Promise<void> {
 }
 
 function need(): Session {
-  if (!session) throw new SiafuError('closed', 'database is closed');
+  if (!session) throw new SiafuError("closed", "database is closed");
   return session;
 }
 
 async function handle(req: Request): Promise<unknown> {
   switch (req.op) {
-    case 'init':
+    case "init":
       return doInit(req.args);
-    case 'execute': {
+    case "execute": {
       const s = need();
-      const r = JSON.parse(s.db.execute(req.args.query, req.args.params ?? undefined)) as unknown;
+      const r = JSON.parse(
+        s.db.execute(req.args.query, req.args.params ?? undefined),
+      ) as unknown;
       s.markDirty();
       return r;
     }
-    case 'query':
-      return JSON.parse(need().db.query(req.args.query, req.args.params ?? undefined)) as unknown;
-    case 'changesSince':
-      return JSON.parse(need().db.changesSince(req.args.seq)) as ChangeLogEntry[];
-    case 'flush':
+    case "query":
+      return JSON.parse(
+        need().db.query(req.args.query, req.args.params ?? undefined),
+      ) as unknown;
+    case "changesSince":
+      return JSON.parse(
+        need().db.changesSince(req.args.seq),
+      ) as ChangeLogEntry[];
+    case "flush":
       return need().flush();
-    case 'close': {
+    case "close": {
       const s = need();
       session = null;
       return s.close();
     }
-    case 'destroy':
+    case "destroy":
       return doDestroy(req.args.name);
   }
 }
@@ -182,18 +221,27 @@ async function handle(req: Request): Promise<unknown> {
 scope.onmessage = (e) => {
   const req = e.data;
   handle(req).then(
-    (result) => scope.postMessage({ id: req.id, ok: true, result } satisfies Response),
-    (err: unknown) => scope.postMessage({ id: req.id, ok: false, error: serializeError(wrapEngine(req.op, err)) } satisfies Response),
+    (result) =>
+      scope.postMessage({ id: req.id, ok: true, result } satisfies Response),
+    (err: unknown) =>
+      scope.postMessage({
+        id: req.id,
+        ok: false,
+        error: serializeError(wrapEngine(req.op, err)),
+      } satisfies Response),
   );
 };
 
 /** Engine (wasm) errors surface as plain Errors; tag them as query errors. */
-function wrapEngine(op: Request['op'], err: unknown): unknown {
+function wrapEngine(op: Request["op"], err: unknown): unknown {
   if (err instanceof SiafuError) return err;
-  if (op === 'execute' || op === 'query' || op === 'changesSince') {
-    return new SiafuError('query', err instanceof Error ? err.message : String(err));
+  if (op === "execute" || op === "query" || op === "changesSince") {
+    return new SiafuError(
+      "query",
+      err instanceof Error ? err.message : String(err),
+    );
   }
   return err;
 }
 
-emit({ type: 'ready' });
+emit({ type: "ready" });

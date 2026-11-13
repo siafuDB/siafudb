@@ -1,3 +1,4 @@
+#![allow(warnings)] // SiafuDB fork: upstream warning-cleanliness is not ours to gate (see engine/CHANGES.md)
 //! # grafeo-engine
 //!
 //! The engine behind Grafeo. You'll find everything here for creating databases,

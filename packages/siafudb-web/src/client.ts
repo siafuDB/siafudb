@@ -1,4 +1,4 @@
-import { ClosedError, SiafuError, reviveError } from './errors.js';
+import { ClosedError, SiafuError, reviveError } from "./errors.js";
 import type {
   Backend,
   ChangeLogEntry,
@@ -10,7 +10,7 @@ import type {
   Request,
   Response,
   WorkerEvent,
-} from './protocol.js';
+} from "./protocol.js";
 
 /** Options for {@link SiafuDB.open}. */
 export interface OpenOptions {
@@ -19,7 +19,7 @@ export interface OpenOptions {
    * `FileSystemSyncAccessHandle` and falls back to IndexedDB otherwise.
    * `'opfs'` fails instead of falling back; `'idb'` forces IndexedDB.
    */
-  backend?: 'auto' | Backend;
+  backend?: "auto" | Backend;
   /**
    * Debounce, in milliseconds, between the last write and an automatic
    * encrypted save. `0` disables autosave; call {@link SiafuDB.flush}.
@@ -31,7 +31,7 @@ export interface OpenOptions {
    * `'wait'` (default) queues behind the other tab (optionally bounded by
    * `lockTimeoutMs`); `'fail'` rejects immediately with `DatabaseLockedError`.
    */
-  lock?: 'wait' | 'fail';
+  lock?: "wait" | "fail";
   /** With `lock: 'wait'`, give up after this many ms with `DatabaseLockedError`. */
   lockTimeoutMs?: number;
   /** Override the worker script URL (bundler setups that cannot resolve the default). */
@@ -51,14 +51,22 @@ export interface StorageReport {
   estimate: StorageEstimate | null;
 }
 
-type RequestBody = Request extends infer R ? (R extends { id: number } ? Omit<R, 'id'> : never) : never;
-type Pending ={ resolve: (v: unknown) => void; reject: (e: Error) => void };
+type RequestBody = Request extends infer R
+  ? R extends { id: number }
+    ? Omit<R, "id">
+    : never
+  : never;
+type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 
 function spawnWorker(url: string | URL | undefined): Worker {
   // Keep the `new Worker(new URL(..., import.meta.url), ...)` form literal: Vite/webpack/Parcel
   // only bundle the worker (and its wasm) when they can see this exact pattern.
-  if (url !== undefined) return new Worker(url, { type: 'module', name: 'siafudb' });
-  return new Worker(new URL('./worker.js', import.meta.url), { type: 'module', name: 'siafudb' });
+  if (url !== undefined)
+    return new Worker(url, { type: "module", name: "siafudb" });
+  return new Worker(new URL("./worker.js", import.meta.url), {
+    type: "module",
+    name: "siafudb",
+  });
 }
 
 /** Minimal RPC channel to the worker. */
@@ -80,8 +88,8 @@ class Channel {
     });
     worker.onmessage = (m: MessageEvent<Response | WorkerEvent>) => {
       const d = m.data;
-      if ('type' in d) {
-        if (d.type === 'ready') markReady();
+      if ("type" in d) {
+        if (d.type === "ready") markReady();
         else this.onEvent(d);
         return;
       }
@@ -92,7 +100,10 @@ class Channel {
       else p.reject(reviveError(d.error));
     };
     worker.onerror = (ev) => {
-      const err = new SiafuError('internal', `worker error: ${ev.message || 'failed to load worker'}`);
+      const err = new SiafuError(
+        "internal",
+        `worker error: ${ev.message || "failed to load worker"}`,
+      );
       failReady(err);
       this.failAll(err);
     };
@@ -108,7 +119,10 @@ class Channel {
     await this.ready;
     const id = ++this.seq;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      this.pending.set(id, {
+        resolve: resolve as (v: unknown) => void,
+        reject,
+      });
       this.worker.postMessage({ ...req, id });
     });
   }
@@ -120,7 +134,8 @@ class Channel {
   }
 }
 
-const toWasmUrl = (u: string | URL | undefined) => (u === undefined ? undefined : String(u));
+const toWasmUrl = (u: string | URL | undefined) =>
+  u === undefined ? undefined : String(u);
 
 function encodeParams(params: Params | undefined): string | null {
   return params === undefined ? null : JSON.stringify(params);
@@ -172,21 +187,22 @@ export class SiafuDB {
    */
   static async open(name: string, options: OpenOptions = {}): Promise<SiafuDB> {
     const channel = new Channel(spawnWorker(options.workerUrl), (e) => {
-      if (e.type === 'autosave-error') options.onAutosaveError?.(new SiafuError('storage', e.message));
-      else if (e.type === 'saved') options.onSaved?.(e.counter);
+      if (e.type === "autosave-error")
+        options.onAutosaveError?.(new SiafuError("storage", e.message));
+      else if (e.type === "saved") options.onSaved?.(e.counter);
     });
     const args: InitArgs = {
       name,
-      backend: options.backend ?? 'auto',
+      backend: options.backend ?? "auto",
       autosaveMs: options.autosaveMs ?? 500,
-      lock: options.lock ?? 'wait',
+      lock: options.lock ?? "wait",
       lockTimeoutMs: options.lockTimeoutMs ?? null,
     };
     const wasmUrl = toWasmUrl(options.wasmUrl);
     if (wasmUrl !== undefined) args.wasmUrl = wasmUrl;
     let init: InitResult;
     try {
-      init = await channel.call<InitResult>({ op: 'init', args });
+      init = await channel.call<InitResult>({ op: "init", args });
     } catch (e) {
       channel.terminate();
       throw e;
@@ -194,11 +210,17 @@ export class SiafuDB {
     // Best-effort flush when the page is hidden/frozen: tab switches and mobile backgrounding are the usual last chance.
     let db: SiafuDB;
     const onHide = () => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') void db.flush().catch(() => undefined);
+      if (
+        typeof document !== "undefined" &&
+        document.visibilityState === "hidden"
+      )
+        void db.flush().catch(() => undefined);
     };
-    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onHide);
+    if (typeof document !== "undefined")
+      document.addEventListener("visibilitychange", onHide);
     db = new SiafuDB(channel, name, init, () => {
-      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onHide);
+      if (typeof document !== "undefined")
+        document.removeEventListener("visibilitychange", onHide);
     });
     return db;
   }
@@ -208,7 +230,10 @@ export class SiafuDB {
    * @param params values bound to `$name` placeholders (JSON-representable)
    */
   execute(query: string, params?: Params): Promise<ExecuteResult> {
-    return this.channel.call({ op: 'execute', args: { query, params: encodeParams(params) } });
+    return this.channel.call({
+      op: "execute",
+      args: { query, params: encodeParams(params) },
+    });
   }
 
   /**
@@ -216,7 +241,10 @@ export class SiafuDB {
    * @param params values bound to `$name` placeholders
    */
   query(query: string, params?: Params): Promise<QueryResult> {
-    return this.channel.call({ op: 'query', args: { query, params: encodeParams(params) } });
+    return this.channel.call({
+      op: "query",
+      args: { query, params: encodeParams(params) },
+    });
   }
 
   /**
@@ -224,12 +252,12 @@ export class SiafuDB {
    * The log lives in memory for this open session (it restarts at 1 after reopen).
    */
   changesSince(seq: number): Promise<ChangeLogEntry[]> {
-    return this.channel.call({ op: 'changesSince', args: { seq } });
+    return this.channel.call({ op: "changesSince", args: { seq } });
   }
 
   /** Encrypt and persist now if there are unsaved writes. Resolves when the data is durable. */
   flush(): Promise<void> {
-    return this.channel.call({ op: 'flush' });
+    return this.channel.call({ op: "flush" });
   }
 
   /** Flush, release the cross-tab lock and stop the worker. The handle is unusable afterwards. */
@@ -237,7 +265,7 @@ export class SiafuDB {
     if (this.channel.closed) return;
     this.detach();
     try {
-      await this.channel.call({ op: 'close' });
+      await this.channel.call({ op: "close" });
     } finally {
       this.channel.terminate();
     }
@@ -259,10 +287,16 @@ export class SiafuDB {
    * its data key and its rollback counter. Fails with `DatabaseLockedError`
    * if the database is open anywhere.
    */
-  static async destroy(name: string, options: Pick<OpenOptions, 'workerUrl'> = {}): Promise<void> {
-    const channel = new Channel(spawnWorker(options.workerUrl), () => undefined);
+  static async destroy(
+    name: string,
+    options: Pick<OpenOptions, "workerUrl"> = {},
+  ): Promise<void> {
+    const channel = new Channel(
+      spawnWorker(options.workerUrl),
+      () => undefined,
+    );
     try {
-      await channel.call({ op: 'destroy', args: { name } });
+      await channel.call({ op: "destroy", args: { name } });
     } finally {
       channel.terminate();
     }
