@@ -33,6 +33,29 @@ pub enum SiafuError {
     #[error("sync error: {0}")]
     SyncError(String),
 
+    /// `apply_changes` met an edge whose endpoint node is not known here.
+    /// Nothing of the batch was applied.
+    #[error(
+        "sync error: edge {} names unknown endpoint {}",
+        crate::sync::gid_to_hex(.edge),
+        crate::sync::gid_to_hex(.endpoint)
+    )]
+    UnknownEndpoint {
+        /// Gid of the edge.
+        edge: [u8; 16],
+        /// Gid of the missing node.
+        endpoint: [u8; 16],
+    },
+
+    /// A change given to `apply_changes` is malformed or contradicts the
+    /// graph (a reserved property, an edge re-pointed to other endpoints).
+    #[error("invalid change: {0}")]
+    InvalidChange(String),
+
+    /// A property value has no lossless form in a `GraphChange`.
+    #[error("unsupported value: {0}")]
+    UnsupportedValue(String),
+
     /// An I/O error occurred (file operations, etc).
     #[error("io error: {0}")]
     IoError(#[from] std::io::Error),
