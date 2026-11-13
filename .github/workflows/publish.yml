@@ -1,0 +1,67 @@
+name: Publish crates
+
+# Publishes the engine crates (siafudb-graph*) and siafudb-core to crates.io
+# with scripts/ci/publish-crates.sh. Publishing a version is permanent: a
+# crate version can be yanked but never replaced.
+#
+# Runs in two ways:
+#   - called by release.yml after a GitHub release is cut on main;
+#   - by hand from the Actions tab. A manual run is a dry run unless
+#     "dry_run" is unticked.
+#
+# The script skips versions that are already on crates.io, so re-running
+# after a partial failure is safe.
+#
+# Needs the CARGO_REGISTRY_TOKEN secret (a crates.io API token with the
+# publish-new and publish-update scopes).
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to publish from.
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Package and verify only; publish nothing.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+jobs:
+  crates:
+    name: crates.io${{ inputs.dry_run && ' (dry run)' || '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - run: rustc --version && cargo --version
+      - name: Dry run
+        if: ${{ inputs.dry_run }}
+        run: scripts/ci/publish-crates.sh --dry-run
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: scripts/ci/publish-crates.sh

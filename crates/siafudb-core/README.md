@@ -3,7 +3,7 @@
 The core of [SiafuDB](https://siafudb.org), an embedded graph database for
 device, edge and web. A Bundu Foundation open project, Apache-2.0.
 
-**Pre-release (0.1.x).** The API will change. Features:
+**Pre-release (0.x).** The API will change. Features:
 
 - `native` (default): file-backed persistence.
 - `browser`: `wasm32-unknown-unknown` profile (in-memory plus snapshot
