@@ -505,8 +505,24 @@ impl SyncedDb {
             // committed by `rejoin_as_new_device`.
             return Ok(0);
         }
+        if self.catching_up() {
+            // The device was restored from an older copy and has not yet
+            // received all of its own earlier ops back. Signing now would
+            // reuse a position it already published. The writes wait in the
+            // capture queue and are committed by the first call after the
+            // pull that completes the catch-up.
+            return Ok(0);
+        }
         let changes = self.take(|db| db.take_changes())?;
         Ok(self.commit(changes, now_ms, false))
+    }
+
+    /// True while a restored device is still receiving its own earlier ops
+    /// back from the relay. Local writes are kept and uploaded afterwards.
+    pub fn catching_up(&self) -> bool {
+        self.replica
+            .as_ref()
+            .is_some_and(|r| r.stats().own_ops_missing > 0)
     }
 
     /// Whether this device's sync state was rolled back (see
