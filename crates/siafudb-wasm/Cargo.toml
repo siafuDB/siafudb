@@ -12,7 +12,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 wasm-bindgen = "=0.2.130"
-siafudb-core = { path = "../siafudb-core", default-features = false, features = ["browser"] }
+siafudb-core = { path = "../siafudb-core", default-features = false, features = [
+  "browser",
+] }
 serde_json = { workspace = true }
 # getrandom 0.4 needs the wasm_js backend on wasm32-unknown-unknown.
 getrandom = { version = "0.4", features = ["wasm_js"] }

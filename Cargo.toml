@@ -14,15 +14,17 @@ resolver = "2"
 #   siafudb-server  — Optional standalone server mode for development and testing.
 #   siafudb         — The unified crate that re-exports everything. What users depend on.
 
-exclude = ["engine"] # vendored fork: its own workspace (engine/Cargo.toml), published separately
+exclude = [
+  "engine",
+] # vendored fork: its own workspace (engine/Cargo.toml), published separately
 members = [
-    "crates/siafudb",
-    "crates/siafudb-core",
-    "crates/siafudb-sync",
-    "crates/siafudb-access",
-    "crates/siafudb-server",
-    "crates/siafudb-wasm",
-    "crates/siafudb-ffi",
+  "crates/siafudb",
+  "crates/siafudb-core",
+  "crates/siafudb-sync",
+  "crates/siafudb-access",
+  "crates/siafudb-server",
+  "crates/siafudb-wasm",
+  "crates/siafudb-ffi",
 ]
 
 [workspace.package]
@@ -41,7 +43,10 @@ categories = ["database", "data-structures"]
 # SiafuDB-specific capabilities on top. If the relationship evolves,
 # we can fork or reimplement — but we start with dependency, not divergence.
 # default-features off: each consumer picks a profile (siafudb-core: `native` or `browser`).
-grafeo = { package = "siafudb-graph", version = "0.1.0", path = "engine/grafeo", default-features = false, features = ["gql", "cypher"] }
+grafeo = { package = "siafudb-graph", version = "0.1.0", path = "engine/grafeo", default-features = false, features = [
+  "gql",
+  "cypher",
+] }
 
 # === Serialization & Data ===
 serde = { version = "1", features = ["derive"] }

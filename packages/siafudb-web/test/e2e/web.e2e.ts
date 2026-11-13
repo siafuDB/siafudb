@@ -10,6 +10,7 @@ import {
   type Page,
 } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { SiafuDB } from "../../src/index.js";
 
 const root = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -168,8 +169,7 @@ describe("@siafudb/web in headless Chromium", () => {
     expect([true, false, null]).toContain(opened.persisted);
 
     const r = await page.evaluate(async (hostile) => {
-      const db = (window as unknown as { db: import("/dist/index.js").SiafuDB })
-        .db;
+      const db = (window as unknown as { db: SiafuDB }).db;
       for (const [i, s] of hostile.entries()) {
         await db.execute(
           "CREATE (:Doc {id: $id, name: $s, n: $n, ok: $ok, none: $none})",
@@ -240,8 +240,7 @@ describe("@siafudb/web in headless Chromium", () => {
     const page = await newPage();
     await openIn(page, "persist1", { autosaveMs: 0 });
     await page.evaluate(async (marker) => {
-      const db = (window as unknown as { db: import("/dist/index.js").SiafuDB })
-        .db;
+      const db = (window as unknown as { db: SiafuDB }).db;
       for (let i = 0; i < 50; i++)
         await db.execute("CREATE (:Doc {id: $i, note: $m})", { i, m: marker });
       await db.flush();
@@ -263,8 +262,7 @@ describe("@siafudb/web in headless Chromium", () => {
     expect(again.backend).toBe("opfs");
     expect(again.restored).toBe(true);
     const q = await page.evaluate(async () => {
-      const db = (window as unknown as { db: import("/dist/index.js").SiafuDB })
-        .db;
+      const db = (window as unknown as { db: SiafuDB }).db;
       return {
         count: await db.query("MATCH (d:Doc) RETURN count(d)"),
         one: await db.query("MATCH (d:Doc {id: $i}) RETURN d.note", { i: 7 }),
@@ -306,9 +304,7 @@ describe("@siafudb/web in headless Chromium", () => {
     await page.reload(); // no flush/close: the worker is simply killed
     await openIn(page, "autosave1");
     const q = await page.evaluate(() =>
-      (window as unknown as { db: import("/dist/index.js").SiafuDB }).db.query(
-        "MATCH (t:T) RETURN t.v",
-      ),
+      (window as unknown as { db: SiafuDB }).db.query("MATCH (t:T) RETURN t.v"),
     );
     expect(q.rows).toEqual([["autosaved"]]);
     await page.close();
@@ -318,8 +314,7 @@ describe("@siafudb/web in headless Chromium", () => {
     const page = await newPage();
     await openIn(page, "tamper1", { autosaveMs: 0 });
     await page.evaluate(async (m) => {
-      const db = (window as unknown as { db: import("/dist/index.js").SiafuDB })
-        .db;
+      const db = (window as unknown as { db: SiafuDB }).db;
       await db.execute("CREATE (:Doc {note: $m})", { m });
       await db.flush();
       await db.close();
@@ -346,9 +341,7 @@ describe("@siafudb/web in headless Chromium", () => {
     await openIn(page, "rollback1", { autosaveMs: 0 });
     const save = (v: string) =>
       page.evaluate(async (v) => {
-        const db = (
-          window as unknown as { db: import("/dist/index.js").SiafuDB }
-        ).db;
+        const db = (window as unknown as { db: SiafuDB }).db;
         await db.execute("CREATE (:V {v: $v})", { v });
         await db.flush();
       }, v);
@@ -357,9 +350,7 @@ describe("@siafudb/web in headless Chromium", () => {
     await save("v2");
     await save("v3");
     await page.evaluate(() =>
-      (
-        window as unknown as { db: import("/dist/index.js").SiafuDB }
-      ).db.close(),
+      (window as unknown as { db: SiafuDB }).db.close(),
     );
     await writeOpfs(page, "rollback1", old); // attacker restores the old, authentic files
     const res = await openIn(page, "rollback1");
@@ -375,8 +366,7 @@ describe("@siafudb/web in headless Chromium", () => {
     if (isFailure(opened)) return;
     expect(opened.backend).toBe("idb");
     await page.evaluate(async (m) => {
-      const db = (window as unknown as { db: import("/dist/index.js").SiafuDB })
-        .db;
+      const db = (window as unknown as { db: SiafuDB }).db;
       for (let i = 0; i < 30; i++)
         await db.execute("CREATE (:Doc {id: $i, note: $m})", { i, m });
       await db.flush();
@@ -410,15 +400,13 @@ describe("@siafudb/web in headless Chromium", () => {
     const again = await openIn(page, "idb1", { workerUrl });
     expect(isFailure(again) ? again.failed.message : again.backend).toBe("idb");
     const q = await page.evaluate(() =>
-      (window as unknown as { db: import("/dist/index.js").SiafuDB }).db.query(
+      (window as unknown as { db: SiafuDB }).db.query(
         "MATCH (d:Doc) RETURN count(d)",
       ),
     );
     expect(q.rows).toEqual([[30]]);
     await page.evaluate(() =>
-      (
-        window as unknown as { db: import("/dist/index.js").SiafuDB }
-      ).db.close(),
+      (window as unknown as { db: SiafuDB }).db.close(),
     );
 
     await page.evaluate(
@@ -449,15 +437,12 @@ describe("@siafudb/web in headless Chromium", () => {
     const b = await newPage();
     await openIn(a, "shared", { autosaveMs: 0 });
     await a.evaluate(() =>
-      (
-        window as unknown as { db: import("/dist/index.js").SiafuDB }
-      ).db.execute("CREATE (:Row {who: $w})", { w: "A1" }),
+      (window as unknown as { db: SiafuDB }).db.execute(
+        "CREATE (:Row {who: $w})",
+        { w: "A1" },
+      ),
     );
-    await a.evaluate(() =>
-      (
-        window as unknown as { db: import("/dist/index.js").SiafuDB }
-      ).db.flush(),
-    );
+    await a.evaluate(() => (window as unknown as { db: SiafuDB }).db.flush());
 
     // B refuses immediately (lock: 'fail')
     const refused = await openIn(b, "shared", { lock: "fail" });
@@ -479,7 +464,7 @@ describe("@siafudb/web in headless Chromium", () => {
       (window as unknown as Record<string, unknown>).bOpen = SiafuDB.open(
         "shared",
         { autosaveMs: 0 },
-      ).then((db) => {
+      ).then((db: SiafuDB) => {
         (window as unknown as Record<string, unknown>).db = db;
         return db;
       });
@@ -492,16 +477,14 @@ describe("@siafudb/web in headless Chromium", () => {
     ).toBe(false); // still waiting
 
     await a.evaluate(async () => {
-      const db = (window as unknown as { db: import("/dist/index.js").SiafuDB })
-        .db;
+      const db = (window as unknown as { db: SiafuDB }).db;
       await db.execute("CREATE (:Row {who: $w})", { w: "A2" });
       await db.close(); // flushes, then releases the lock
     });
 
     const seenByB = await b.evaluate(async () => {
       await (window as unknown as { bOpen: Promise<unknown> }).bOpen;
-      const db = (window as unknown as { db: import("/dist/index.js").SiafuDB })
-        .db;
+      const db = (window as unknown as { db: SiafuDB }).db;
       const before = await db.query(
         "MATCH (r:Row) RETURN r.who ORDER BY r.who",
       );
@@ -513,7 +496,7 @@ describe("@siafudb/web in headless Chromium", () => {
 
     await openIn(a, "shared"); // A reopens and must see B's write on top of its own
     const final = await a.evaluate(() =>
-      (window as unknown as { db: import("/dist/index.js").SiafuDB }).db.query(
+      (window as unknown as { db: SiafuDB }).db.query(
         "MATCH (r:Row) RETURN r.who ORDER BY r.who",
       ),
     );
@@ -537,9 +520,7 @@ describe("@siafudb/web in headless Chromium", () => {
     expect(blockedWhileOpen).toBe("DatabaseLockedError");
     await page.evaluate(async () => {
       const { SiafuDB } = await (window as any).siafuReady;
-      await (
-        window as unknown as { db: import("/dist/index.js").SiafuDB }
-      ).db.close();
+      await (window as unknown as { db: SiafuDB }).db.close();
       await SiafuDB.destroy("gone1");
     });
     const fresh = await openIn(page, "gone1");
