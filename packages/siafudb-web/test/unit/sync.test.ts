@@ -449,12 +449,26 @@ describe("SyncLoop", () => {
     engine.outbox.push(5);
     loop.notifyLocalWrite();
     await until(() => relay.log.includes(5) && engine.outbox.length === 0);
-    // Whichever came first, the pull that saw the reset or a push refused
-    // with 403: the secret was sent again, and not after that.
+    // The secret was sent again. Two things can ask for it, a push refused
+    // with 403 and the pull that sees the reset, and they race: when the
+    // pull notices after the push already registered the group, one more
+    // push carries the secret. Never more than that.
     const later = pushes().slice(2);
-    expect(later.filter((r) => r.registration === "s3cret")).toHaveLength(1);
-    expect(later.at(-1)!.registration).toBe("s3cret");
+    const withSecret = later.filter((r) => r.registration === "s3cret").length;
+    expect(withSecret).toBeGreaterThanOrEqual(1);
+    expect(withSecret).toBeLessThanOrEqual(2);
     expect(JSON.stringify(loop.state())).not.toContain("s3cret");
+
+    // Once things have settled, an ordinary write goes out without it.
+    await sleep(60);
+    const before = pushes().length;
+    engine.outbox.push(6);
+    loop.notifyLocalWrite();
+    await until(() => relay.log.includes(6) && engine.outbox.length === 0);
+    await sleep(60);
+    const afterSettling = pushes().slice(before);
+    expect(afterSettling.length).toBeGreaterThanOrEqual(1);
+    expect(afterSettling.at(-1)!.registration).toBeNull();
     await loop.stop();
   });
 
