@@ -1,0 +1,5 @@
+swift/SiafuDBFFI.xcframework/
+swift/.build/
+kotlin/src/main/jniLibs/
+kotlin/build/
+kotlin/.gradle/

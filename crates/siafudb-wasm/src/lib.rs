@@ -146,7 +146,12 @@ mod tests {
         let tail = v(&c.changes_since(1).unwrap());
         assert_eq!(tail.as_array().unwrap().len(), 1);
         assert_eq!(tail[0]["sequence"], 2);
-        assert!(v(&c.changes_since(2).unwrap()).as_array().unwrap().is_empty());
+        assert!(
+            v(&c.changes_since(2).unwrap())
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -154,7 +159,8 @@ mod tests {
         let c = Core::new().unwrap();
         let evil = "x' }) DETACH DELETE n // \\ \"q\" \\n";
         let p = json!({ "n": evil }).to_string();
-        c.execute("CREATE (:P {name: $n})", Some(p.clone())).unwrap();
+        c.execute("CREATE (:P {name: $n})", Some(p.clone()))
+            .unwrap();
         let r = v(&c
             .query("MATCH (p:P {name: $n}) RETURN p.name", Some(p))
             .unwrap());
@@ -170,7 +176,12 @@ mod tests {
         let d = Core::from_snapshot(&snap).unwrap();
         let r = v(&d.query("MATCH (p:P) RETURN p.name", None).unwrap());
         assert_eq!(r["rows"][0][0], "z");
-        assert!(v(&d.changes_since(0).unwrap()).as_array().unwrap().is_empty());
+        assert!(
+            v(&d.changes_since(0).unwrap())
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
