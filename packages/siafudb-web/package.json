@@ -1,5 +1,5 @@
 {
-  "name": "@siafudb/web",
+  "name": "@bundu/siafudb-web",
   "version": "0.1.0",
   "description": "SiafuDB for the browser: wasm graph engine in a Worker with encrypted OPFS / IndexedDB persistence.",
   "license": "Apache-2.0",
@@ -22,6 +22,9 @@
     "dist",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build:wasm": "node scripts/build-wasm.mjs",
     "build:ts": "tsc -p tsconfig.json && node scripts/copy-wasm.mjs",
