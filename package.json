@@ -10,8 +10,5 @@
   "workspaces": [
     "packages/*",
     "apps/*"
-  ],
-  "devDependencies": {
-    "vite-plus": "1.6.0"
-  }
+  ]
 }
