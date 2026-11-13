@@ -136,7 +136,9 @@ class Session {
   private meta(): SyncMeta {
     try {
       const meta = JSON.parse(this.db.syncMeta() || "{}") as unknown;
-      return typeof meta === "object" && meta !== null ? (meta as SyncMeta) : {};
+      return typeof meta === "object" && meta !== null
+        ? (meta as SyncMeta)
+        : {};
     } catch {
       return {};
     }
@@ -181,6 +183,7 @@ class Session {
             emit({ type: "autosave-error", message: (e as Error).message }),
           );
         },
+        durable: () => this.flush(),
         touched: () => this.markDirty(),
         applied: (changes) => emit({ type: "sync-applied", changes }),
       },

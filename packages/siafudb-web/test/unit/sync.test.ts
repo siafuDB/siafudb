@@ -87,7 +87,8 @@ class FakeRelay {
       await sleep(1);
       if (init.signal?.aborted) throw new DOMException("aborted", "AbortError");
       if (this.down) throw new TypeError(`fetch failed for ${TOKEN}`);
-      if (this.status !== 200) return new Response("no", { status: this.status });
+      if (this.status !== 200)
+        return new Response("no", { status: this.status });
       const body = new Uint8Array(init.body as Uint8Array);
       if (kind === "push") {
         this.log.push(...body);
@@ -115,7 +116,15 @@ class FakeRelay {
 function setup(options: { online?: boolean } = {}) {
   const engine = new FakeEngine();
   const relay = new FakeRelay();
-  const seen = { persisted: 0, touched: 0, applied: 0, online: options.online ?? true };
+  const seen = {
+    disk: "ok" as "ok" | "full",
+    /** Number of requests made so far, at each call of `durable`. */
+    durable: [] as number[],
+    persisted: 0,
+    touched: 0,
+    applied: 0,
+    online: options.online ?? true,
+  };
   const onlineListeners = new Set<() => void>();
   const host: SyncHost = {
     fetch: relay.fetch,
@@ -128,6 +137,10 @@ function setup(options: { online?: boolean } = {}) {
     },
     persist: async () => {
       seen.persisted += 1;
+    },
+    durable: async () => {
+      if (seen.disk === "full") throw new Error("QuotaExceededError");
+      seen.durable.push(relay.requests.length);
     },
     touched: () => {
       seen.touched += 1;
@@ -191,22 +204,30 @@ describe("SyncLoop", () => {
     expect(seen.touched).toBe(3); // 7 items, 3 per frame
 
     // A burst of writes becomes one push after the debounce.
-    const pushesBefore = relay.requests.filter((r) => r.path.endsWith("/push")).length;
+    const pushesBefore = relay.requests.filter((r) =>
+      r.path.endsWith("/push"),
+    ).length;
     for (const n of [8, 9]) {
       engine.outbox.push(n);
       loop.notifyLocalWrite();
     }
     await until(() => engine.outbox.length === 0 && engine.cursor === 14);
-    expect(
-      relay.requests.filter((r) => r.path.endsWith("/push")).length,
-    ).toBe(pushesBefore + 1);
+    expect(relay.requests.filter((r) => r.path.endsWith("/push")).length).toBe(
+      pushesBefore + 1,
+    );
 
     // Catch-up pulls do not wait; the idle one is a long poll.
     await until(() => relay.requests.at(-1)!.wait === 5_000);
     expect(relay.requests[0]!.path).toMatch(/^\/base\/v0\/(push|pull)$/);
-    expect(relay.requests.every((r) => r.auth === `Bearer ${TOKEN}`)).toBe(true);
+    expect(relay.requests.every((r) => r.auth === `Bearer ${TOKEN}`)).toBe(
+      true,
+    );
     expect(relay.maxActive).toEqual({ push: 1, pull: 1 });
-    expect(loop.state()).toMatchObject({ running: true, connected: true, lastError: null });
+    expect(loop.state()).toMatchObject({
+      running: true,
+      connected: true,
+      lastError: null,
+    });
 
     await loop.stop();
     expect(loop.state()).toMatchObject({ running: false, connected: false });
@@ -225,7 +246,11 @@ describe("SyncLoop", () => {
     loop.start();
     await until(() => relay.requests.length >= 6);
     const state = loop.state();
-    expect(state).toMatchObject({ running: true, connected: false, lastError: "relay unreachable" });
+    expect(state).toMatchObject({
+      running: true,
+      connected: false,
+      lastError: "relay unreachable",
+    });
     expect(engine.outbox).toEqual([1, 2]); // nothing lost
     const failure = await loop.syncNow().then(
       () => null,
@@ -233,7 +258,9 @@ describe("SyncLoop", () => {
     );
     expect(failure).toBeInstanceOf(SiafuError);
     expect((failure as SiafuError).code).toBe("sync");
-    expect(JSON.stringify([failure!.message, loop.state()])).not.toContain(TOKEN);
+    expect(JSON.stringify([failure!.message, loop.state()])).not.toContain(
+      TOKEN,
+    );
     // Retries are spaced out: far fewer than one per millisecond.
     const before = relay.requests.length;
     await sleep(100);
@@ -244,6 +271,31 @@ describe("SyncLoop", () => {
     expect(relay.log).toEqual([1, 2]);
     expect(loop.state().lastError).toBeNull();
     expect(relay.maxActive).toEqual({ push: 1, pull: 1 });
+    await loop.stop();
+  });
+
+  it("saves before every push and sends nothing if it cannot save", async () => {
+    const { engine, relay, loop, seen } = setup();
+    seen.disk = "full";
+    engine.outbox.push(1, 2, 3, 4);
+    loop.start();
+    await until(() => loop.state().lastError !== null);
+    expect(loop.state().lastError).toBe(
+      "could not save before uploading; nothing was sent",
+    );
+    await sleep(30);
+    expect(relay.requests.filter((r) => r.path.endsWith("/push"))).toEqual([]);
+    expect(engine.outbox).toEqual([1, 2, 3, 4]);
+
+    seen.disk = "ok";
+    await until(() => engine.outbox.length === 0);
+    // Each of the two push requests was preceded by its own save.
+    const pushes = relay.requests
+      .map((r, i) => (r.path.endsWith("/push") ? i : -1))
+      .filter((i) => i >= 0);
+    expect(pushes).toHaveLength(2);
+    for (const [n, at] of pushes.entries())
+      expect(seen.durable.filter((d) => d <= at).length).toBeGreaterThan(n);
     await loop.stop();
   });
 
@@ -262,12 +314,17 @@ describe("SyncLoop", () => {
   });
 
   it("makes no request while offline and resumes on the online event", async () => {
-    const { engine, relay, loop, goOnline, onlineListeners } = setup({ online: false });
+    const { engine, relay, loop, goOnline, onlineListeners } = setup({
+      online: false,
+    });
     engine.outbox.push(1);
     loop.start();
     await sleep(40);
     expect(relay.requests).toEqual([]);
-    expect(loop.state()).toMatchObject({ connected: false, lastError: "offline" });
+    expect(loop.state()).toMatchObject({
+      connected: false,
+      lastError: "offline",
+    });
     goOnline();
     await until(() => engine.outbox.length === 0 && loop.state().connected);
     await loop.stop();

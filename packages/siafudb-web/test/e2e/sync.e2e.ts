@@ -82,11 +82,9 @@ const consoleLines: string[] = [];
 /** Start the relay on a free port; resolves to its base URL. */
 function startRelay(bin: string, dataDir: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      bin,
-      ["--addr", "127.0.0.1:0", "--data-dir", dataDir],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
+    const child = spawn(bin, ["--addr", "127.0.0.1:0", "--data-dir", dataDir], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
     relay = child;
     const timer = setTimeout(
       () => reject(new Error("gsp-relay did not start within 20 s")),
@@ -544,10 +542,9 @@ describe.skipIf(!relayBin)("sync between two browser contexts", () => {
       (g) => g.includes("after-reload") && g.includes("b-after-reload"),
     );
     for (const d of [a, b]) {
-      const keys = (await rows(
-        d,
-        "MATCH (n) RETURN n.key ORDER BY n.key",
-      )) as [string][];
+      const keys = (await rows(d, "MATCH (n) RETURN n.key ORDER BY n.key")) as [
+        string,
+      ][];
       expect(keys).toEqual([
         ["after-reload"],
         ["b-after-reload"],
@@ -586,9 +583,9 @@ describe.skipIf(!relayBin)("sync between two browser contexts", () => {
   it("the relay's data directory holds no plaintext", async () => {
     // The marker really is in both databases...
     for (const d of [a, b])
-      expect(
-        await rows(d, "MATCH (n:Note {key: 'n1'}) RETURN n.text"),
-      ).toEqual([[MARKER]]);
+      expect(await rows(d, "MATCH (n:Note {key: 'n1'}) RETURN n.text")).toEqual(
+        [[MARKER]],
+      );
     // ...and the relay really stored this group's items on disk.
     const files = filesUnder(relayDir);
     const logs = files.filter((f) => f.file.endsWith(".log"));

@@ -36,7 +36,14 @@ export interface SyncHost {
   onOnline(listener: () => void): () => void;
   /** Persist the database now (engine and sync state are one blob). Must not reject. */
   persist(): Promise<void>;
-  /** The outbox shrank: a save is wanted soon, not necessarily now. */
+  /**
+   * Resolve once everything written so far is on disk; reject if it cannot
+   * be saved. Called before every push: an op must not reach the relay
+   * before the device itself has it durably, or a crash would make the
+   * device reuse that op's sequence number for a different op.
+   */
+  durable(): Promise<void>;
+  /** The outbox shrank or the cursor moved: a save is wanted soon, not necessarily now. */
   touched(): void;
   /** Remote changes were applied to the graph. */
   applied(changes: number): void;
@@ -352,6 +359,15 @@ export class SyncLoop {
       this.pushWaiters = [];
       try {
         for (;;) {
+          try {
+            await this.host.durable();
+          } catch {
+            throw new RelayError(
+              "could not save before uploading; nothing was sent",
+              false,
+            );
+          }
+          if (!this.running) break;
           const frame = this.engine(() => this.db.syncPushFrame());
           if (frame === undefined) break;
           const reply = await this.post("/v0/push", frame, REQUEST_SLACK_MS);
@@ -400,6 +416,7 @@ export class SyncLoop {
           () =>
             JSON.parse(this.db.syncIngestBatch(reply, now)) as {
               items: number;
+              ops: number;
               changes: number;
               more: boolean;
               stalled: boolean;
@@ -412,8 +429,11 @@ export class SyncLoop {
         // "More" with nothing in the frame would spin; a relay does not say that.
         more = out.more && out.items > 0;
         // Cursor and data are one blob: save before asking for more, so a
-        // reload continues from here.
-        if (out.items > 0 || late > 0) await this.host.persist();
+        // reload continues from here. A frame that only echoed this
+        // device's own items moved nothing but the cursor; the next
+        // ordinary save covers that.
+        if (out.ops > 0 || late > 0) await this.host.persist();
+        else if (out.items > 0) this.host.touched();
         if (out.changes + late > 0) this.host.applied(out.changes + late);
         // The engine could not take an item yet and the relay would hand it
         // straight back: retry after a long delay instead.
