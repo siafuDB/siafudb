@@ -4,16 +4,20 @@
  * that stores only ciphertext.
  *
  * The relay binary is not part of this repository. Build it from the
- * protocol repository (`cargo build -p gsp-relay --release`) and point
- * `GSP_RELAY_BIN` at it. Without the variable the usual local build
- * locations are tried; if none exists the suite is skipped with a warning.
- * With the variable set, a missing binary is a failure.
+ * protocol repository at the commit pinned in the workspace `Cargo.toml`
+ * (`cargo build -p gsp-relay --release`) and point `GSP_RELAY_BIN` at it.
+ * Without the variable the usual local build locations are tried. If no
+ * binary is found the suite is skipped with a warning on a developer's
+ * machine and FAILS in CI (`CI` set), as it does when `GSP_RELAY_BIN` names
+ * a file that does not exist.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  cpSync,
   createReadStream,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -64,6 +68,10 @@ function findRelay(): string | null {
 }
 
 const relayBin = findRelay();
+if (!relayBin && process.env.CI)
+  throw new Error(
+    "sync.e2e: no gsp-relay binary. In CI this suite must run: build the relay and set GSP_RELAY_BIN.",
+  );
 if (!relayBin)
   console.warn(
     "sync.e2e: SKIPPED, no gsp-relay binary found. Build it from the protocol repository and set GSP_RELAY_BIN.",
@@ -72,31 +80,50 @@ if (!relayBin)
 let server: http.Server;
 let origin = "";
 let browser: Browser;
-let relay: ChildProcess | undefined;
 let relayUrl = "";
 let relayDir = "";
 let relayLog = "";
+let scratch = "";
 /** Everything the pages and their workers printed. */
 const consoleLines: string[] = [];
+/** Relay processes to stop at the end. */
+const relays = new Set<ChildProcess>();
+let mainRelay: ChildProcess;
 
-/** Start the relay on a free port; resolves to its base URL. */
-function startRelay(bin: string, dataDir: string): Promise<string> {
+/**
+ * Start a relay; resolves to the process and its base URL. `port` 0 picks a
+ * free one. `registrationToken` goes through the environment, as the relay's
+ * documentation recommends.
+ */
+function startRelay(
+  dataDir: string,
+  port = 0,
+  registrationToken?: string,
+): Promise<{ child: ChildProcess; url: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, ["--addr", "127.0.0.1:0", "--data-dir", dataDir], {
-      stdio: ["ignore", "ignore", "pipe"],
-    });
-    relay = child;
+    const env = { ...process.env };
+    delete env.GSP_RELAY_REGISTRATION_TOKEN;
+    if (registrationToken !== undefined)
+      env.GSP_RELAY_REGISTRATION_TOKEN = registrationToken;
+    const child = spawn(
+      relayBin!,
+      ["--addr", `127.0.0.1:${port}`, "--data-dir", dataDir],
+      { stdio: ["ignore", "ignore", "pipe"], env },
+    );
+    relays.add(child);
+    let log = "";
     const timer = setTimeout(
       () => reject(new Error("gsp-relay did not start within 20 s")),
       20_000,
     );
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", (chunk: string) => {
+      log += chunk;
       relayLog += chunk;
-      const m = /listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(relayLog);
+      const m = /listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(log);
       if (m) {
         clearTimeout(timer);
-        resolve(m[1]!);
+        resolve({ child, url: m[1]! });
       }
     });
     child.once("error", (e) => {
@@ -105,9 +132,17 @@ function startRelay(bin: string, dataDir: string): Promise<string> {
     });
     child.once("exit", (code) => {
       clearTimeout(timer);
-      reject(new Error(`gsp-relay exited early with code ${code}`));
+      relays.delete(child);
+      reject(new Error(`gsp-relay exited early with code ${code}: ${log}`));
     });
   });
+}
+
+async function stopRelay(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const gone = new Promise((r) => child.once("exit", r));
+  child.kill("SIGTERM");
+  await gone;
 }
 
 beforeAll(async () => {
@@ -130,20 +165,20 @@ beforeAll(async () => {
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  relayDir = mkdtempSync(path.join(tmpdir(), "siafudb-relay-"));
-  relayUrl = await startRelay(relayBin, relayDir);
+  scratch = mkdtempSync(path.join(tmpdir(), "siafudb-sync-e2e-"));
+  relayDir = path.join(scratch, "relay");
+  mkdirSync(relayDir);
+  const started = await startRelay(relayDir);
+  mainRelay = started.child;
+  relayUrl = started.url;
   browser = await chromium.launch();
 });
 
 afterAll(async () => {
   await browser?.close();
   server?.close();
-  if (relay && relay.exitCode === null) {
-    const gone = new Promise((r) => relay!.once("exit", r));
-    relay.kill("SIGTERM");
-    await gone;
-  }
-  if (relayDir) rmSync(relayDir, { recursive: true, force: true });
+  for (const child of [...relays]) await stopRelay(child);
+  if (scratch) rmSync(scratch, { recursive: true, force: true });
 });
 
 /** One device: its own browser context (own OPFS, IndexedDB, locks) and page. */
@@ -159,8 +194,8 @@ type Win = {
   siafuReady: Promise<{ SiafuDB: typeof SiafuDB }>;
 };
 
-async function newDevice(label: string): Promise<Device> {
-  const ctx = await browser.newContext();
+async function newDevice(label: string, ctx?: BrowserContext): Promise<Device> {
+  ctx ??= await browser.newContext();
   const page = await ctx.newPage();
   const note = (text: string) => consoleLines.push(`[${label}] ${text}`);
   page.on("pageerror", (e) => note(`pageerror ${e.message}`));
@@ -171,20 +206,67 @@ async function newDevice(label: string): Promise<Device> {
 }
 
 /** Open the database `name` as `window.db` and count remote-change events. */
-async function openDb(d: Device, name: string) {
-  return d.page.evaluate(async (name) => {
-    const w = window as unknown as Win;
-    const { SiafuDB } = await w.siafuReady;
-    const db = await SiafuDB.open(name, { autosaveMs: 50 });
-    w.db = db;
-    w.remote = { events: 0, changes: 0 };
-    db.sync.onRemoteChange((e) => {
-      w.remote.events += 1;
-      w.remote.changes += e.changes;
-    });
-    return { restored: db.restored, status: await db.sync.status() };
-  }, name);
+async function openDb(
+  d: Device,
+  name: string,
+  options: { workerUrl?: string } = {},
+) {
+  return d.page.evaluate(
+    async ({ name, options }) => {
+      const w = window as unknown as Win;
+      const { SiafuDB } = await w.siafuReady;
+      const db = await SiafuDB.open(name, { autosaveMs: 50, ...options });
+      w.db = db;
+      w.remote = { events: 0, changes: 0 };
+      db.sync.onRemoteChange((e) => {
+        w.remote.events += 1;
+        w.remote.changes += e.changes;
+      });
+      return {
+        restored: db.restored,
+        backend: db.backend,
+        status: await db.sync.status(),
+      };
+    },
+    { name, options },
+  );
 }
+
+const join = (d: Device, code: string, url = relayUrl) =>
+  d.page.evaluate(
+    ({ url, code }) =>
+      (window as unknown as Win).db.sync.join({ relayUrl: url, code }),
+    { url, code },
+  );
+
+const syncNow = (d: Device) =>
+  d.page.evaluate(() => (window as unknown as Win).db.sync.syncNow());
+
+const keys = async (d: Device, label = "Note") =>
+  (
+    (await rows(d, `MATCH (n:${label}) RETURN n.key ORDER BY n.key`)) as [
+      string,
+    ][]
+  ).map((r) => r[0]);
+
+/** Call a `db.sync` method that should reject; resolves to `code: message`. */
+const failure = (
+  d: Device,
+  method: "create" | "join" | "rejoinAsNewDevice" | "syncNow",
+  arg?: Record<string, unknown>,
+) =>
+  d.page.evaluate(
+    ({ method, arg }) =>
+      (
+        (window as unknown as Win).db.sync[method] as (
+          a?: unknown,
+        ) => Promise<unknown>
+      )(arg).then(
+        () => "resolved",
+        (e: Error & { code?: string }) => `${e.code}: ${e.message}`,
+      ),
+    { method, arg },
+  );
 
 const run = (d: Device, query: string, params: Record<string, unknown> = {}) =>
   d.page.evaluate(
@@ -659,6 +741,383 @@ describe.skipIf(!relayBin)("sync between two browser contexts", () => {
     expect((await status(d)).enabled).toBe(false);
     await c.ctx.close();
     await d.ctx.close();
+  });
+
+  it("syncs over the IndexedDB fallback backend: join, converge, reload", async () => {
+    const i = await newDevice("I");
+    const workerUrl = "/test/e2e/site/worker-no-opfs.js";
+    const opened = await openDb(i, "sync-idb", { workerUrl });
+    expect(opened.backend).toBe("idb");
+    await run(
+      i,
+      "CREATE (:Note {key: 'idb-before-join', text: 'local first'})",
+    );
+    await join(i, code);
+    await converged(
+      [a, b, i],
+      "the IndexedDB device to join and converge",
+      (g) => g.includes("idb-before-join"),
+    );
+    expect(await keys(i)).toEqual(await keys(a));
+    expect(await rows(i, "MATCH (n:Note {key: 'n1'}) RETURN n.text")).toEqual([
+      [MARKER],
+    ]);
+
+    // Reload without close: the state comes back from IndexedDB and sync resumes.
+    const before = await canonical(i);
+    await i.page.reload();
+    const reopened = await openDb(i, "sync-idb", { workerUrl });
+    expect(reopened).toMatchObject({ backend: "idb", restored: true });
+    expect(reopened.status).toMatchObject({ enabled: true, running: true });
+    expect(await canonical(i)).toBe(before);
+    await run(a, "CREATE (:Note {key: 'for-idb', text: 'from A'})");
+    await run(
+      i,
+      "MATCH (n:Note {key: 'idb-before-join'}) SET n.text = 'edited'",
+    );
+    await converged(
+      [a, b, i],
+      "sync to resume on the IndexedDB device",
+      (g) => g.includes("for-idb") && g.includes("edited"),
+    );
+    const gids = (await rows(i, "MATCH (n) RETURN n._gid")) as [string][];
+    expect(new Set(gids.map((g) => g[0])).size).toBe(gids.length);
+    expect((await remote(i)).changes).toBe(1);
+    await i.page.evaluate(() => (window as unknown as Win).db.close());
+    await i.ctx.close();
+  });
+
+  it("a device with a wrong clock is reported and does not stall the others", async () => {
+    // W's clock is three days ahead (in its worker, where sync stamps ops).
+    const w = await newDevice("W");
+    await openDb(w, "sync-w", {
+      workerUrl: "/test/e2e/site/worker-clock-ahead.js",
+    });
+    await join(w, code);
+    // W receives the group's data like any device.
+    await until(
+      "W to receive the group's data",
+      async () => (await canonical(w)) === (await canonical(a)),
+      async () => [await status(w), await canonical(w), await canonical(a)],
+    );
+    await run(w, "CREATE (:Note {key: 'from-the-future', text: 'W'})");
+    await run(w, "MATCH (n:Note {key: 'n1'}) SET n.owner = 'w'");
+
+    // The others refuse W's writes (they would win every conflict for three
+    // days) and say whose clock is off, by how much.
+    const DAY = 24 * 60 * 60 * 1000;
+    for (const d of [a, b]) {
+      await until(
+        `${d.label} to report the device whose clock is ahead`,
+        async () =>
+          (await status(d)).deviceList.some((x) => x.clockLeadMs > DAY),
+        () => status(d),
+      );
+      const s = await status(d);
+      const ahead = s.deviceList.filter((x) => x.clockLeadMs > 0);
+      expect(ahead).toHaveLength(1);
+      expect(ahead[0]).toMatchObject({ own: false, appliedSeq: 0 });
+      expect(ahead[0]!.clockLeadMs).toBeGreaterThan(2.9 * DAY);
+      expect(ahead[0]!.clockLeadMs).toBeLessThan(3.1 * DAY);
+      expect(s.deviceList.filter((x) => x.own)).toHaveLength(1);
+      expect(s.notApplied).toBeGreaterThan(0);
+      expect(s.needsRejoin).toBe(false);
+      expect(await keys(d)).not.toContain("from-the-future");
+      expect(
+        await rows(d, "MATCH (n:Note {key: 'n1'}) RETURN n.owner"),
+      ).toEqual([["a"]]);
+    }
+
+    // Their own writes, and each other's, still flow; W receives them too.
+    await run(a, "CREATE (:Note {key: 'a-despite-w', text: 'A'})");
+    await run(b, "CREATE (:Note {key: 'b-despite-w', text: 'B'})");
+    await run(b, "MATCH (n:Note {key: 'a-despite-w'}) SET n.seen = true");
+    await converged(
+      [a, b],
+      "A and B to keep converging next to the wrong-clock device",
+      (g) => g.includes("a-despite-w") && g.includes("b-despite-w"),
+    );
+    await until(
+      "W to receive what A and B wrote",
+      async () => {
+        const k = await keys(w);
+        return k.includes("a-despite-w") && k.includes("b-despite-w");
+      },
+      async () => [await status(w), await keys(w)],
+    );
+    expect((await status(w)).pendingUploads).toBe(0);
+    await w.page.evaluate(() => (window as unknown as Win).db.close());
+    await w.ctx.close();
+  });
+
+  it("a device restored from an older copy needs to rejoin, and loses none of its writes", async () => {
+    // F lives in its own browser profile directory, so the whole of its
+    // storage (snapshot, keys, rollback counter) can be put back as it was.
+    const profile = path.join(scratch, "profile-f");
+    const backup = path.join(scratch, "profile-f.backup");
+    const launch = async () => {
+      const ctx = await chromium.launchPersistentContext(profile);
+      const f = await newDevice("F", ctx);
+      const opened = await openDb(f, "sync-f");
+      return { f, opened };
+    };
+    const shut = async (f: Device) => {
+      await f.page.evaluate(() => (window as unknown as Win).db.close());
+      await f.ctx.close();
+    };
+
+    let { f } = await launch();
+    await join(f, code);
+    await run(f, "CREATE (:Note {key: 'f-base', text: 'before the backup'})");
+    await converged([a, f], "F to join", (g) => g.includes("f-base"));
+    const devicesBefore = (await status(a)).devices;
+    await shut(f);
+    cpSync(profile, backup, { recursive: true });
+
+    // F goes on, uploads a write...
+    ({ f } = await launch());
+    await run(
+      f,
+      "CREATE (:Note {key: 'f-w1', text: 'uploaded, then lost locally'})",
+    );
+    await converged([a, f], "F's write to reach A", (g) => g.includes("f-w1"));
+    await shut(f);
+    // ...and then its storage is rolled back to the backup.
+    rmSync(profile, { recursive: true, force: true });
+    cpSync(backup, profile, { recursive: true });
+
+    let opened;
+    ({ f, opened } = await launch());
+    expect(opened.restored).toBe(true);
+    expect(opened.status).toMatchObject({ enabled: true, running: true });
+    // It finds its own lost write on the relay and knows it was rolled back.
+    await until(
+      "F to notice the rollback",
+      async () => (await status(f)).needsRejoin,
+      () => status(f),
+    );
+    expect(await keys(f)).toContain("f-w1"); // it follows what it had published
+
+    // Writes still work locally, but go nowhere.
+    await run(f, "CREATE (:Note {key: 'f-w2', text: 'written while forked'})");
+    await run(
+      f,
+      "MATCH (n:Note {key: 'f-base'}) SET n.text = 'edited while forked'",
+    );
+    await run(a, "CREATE (:Note {key: 'a-meanwhile', text: 'A'})");
+    await until(
+      "F to keep receiving while forked",
+      async () => (await keys(f)).includes("a-meanwhile"),
+      () => status(f),
+    );
+    await syncNow(a);
+    expect(await keys(a)).not.toContain("f-w2");
+    expect(await status(f)).toMatchObject({ needsRejoin: true, running: true });
+    // ...also across a reload.
+    await shut(f);
+    ({ f, opened } = await launch());
+    expect(opened.status.needsRejoin).toBe(true);
+    expect(await keys(f)).toContain("f-w2");
+
+    // Only the forked device can rejoin.
+    expect(await failure(a, "rejoinAsNewDevice")).toMatch(
+      /^sync: this device does not need to rejoin/,
+    );
+    await f.page.evaluate(() =>
+      (window as unknown as Win).db.sync.rejoinAsNewDevice(),
+    );
+    expect((await status(f)).needsRejoin).toBe(false);
+    await converged(
+      [a, b, f],
+      "the rejoined device's writes to arrive",
+      (g) => g.includes("f-w2") && g.includes("edited while forked"),
+    );
+    for (const d of [a, f]) {
+      const k = await keys(d);
+      for (const key of ["f-base", "f-w1", "f-w2", "a-meanwhile"])
+        expect(
+          k.filter((x) => x === key),
+          key,
+        ).toHaveLength(1);
+    }
+    // To the others it is one device more.
+    await until(
+      "A to see the new identity",
+      async () => (await status(a)).devices === devicesBefore + 1,
+      () => status(a),
+    );
+    // And it can write again.
+    await run(f, "CREATE (:Note {key: 'f-after-rejoin', text: 'F'})");
+    await converged([a, b, f], "F to sync normally again", (g) =>
+      g.includes("f-after-rejoin"),
+    );
+    await shut(f);
+  });
+
+  it("a relay that requires a registration secret: create needs it, join does not", async () => {
+    const SECRET = "registration-secret-quokka-5512";
+    const dir = path.join(scratch, "relay-registration");
+    mkdirSync(dir);
+    const { child, url } = await startRelay(dir, 0, SECRET);
+    const r1 = await newDevice("R1");
+    await openDb(r1, "sync-r1");
+    await run(r1, "CREATE (:Note {key: 'r1', text: 'registered'})");
+
+    // Without the secret: a clear error, and no half-made group.
+    expect(await failure(r1, "create", { relayUrl: url })).toBe(
+      "sync: this relay requires a registration token to create a sync group; pass registrationToken to sync.create()",
+    );
+    expect(await status(r1)).toMatchObject({ enabled: false, running: false });
+    // With a wrong one: also refused.
+    expect(
+      await failure(r1, "create", {
+        relayUrl: url,
+        registrationToken: "wrong",
+      }),
+    ).toBe(
+      "sync: the relay did not accept the registration token; no sync group was created",
+    );
+    expect((await status(r1)).enabled).toBe(false);
+    expect(filesUnder(dir).filter((f) => f.file.endsWith(".log"))).toEqual([]);
+
+    // With it: created and registered.
+    const groupCode = await r1.page.evaluate(
+      ({ url, SECRET }) =>
+        (window as unknown as Win).db.sync.create({
+          relayUrl: url,
+          registrationToken: SECRET,
+        }),
+      { url, SECRET },
+    );
+    expect(groupCode).toMatch(/^gsp0-/);
+    expect(filesUnder(dir).filter((f) => f.file.endsWith(".log"))).toHaveLength(
+      1,
+    );
+
+    // A second device joins with the pairing code alone.
+    const r2 = await newDevice("R2");
+    await openDb(r2, "sync-r2");
+    await join(r2, groupCode, url);
+    await run(r2, "CREATE (:Note {key: 'r2', text: 'joined'})");
+    await converged(
+      [r1, r2],
+      "the two devices on the closed relay",
+      (g) => g.includes('"r1"') && g.includes('"r2"'),
+    );
+    for (const d of [r1, r2])
+      expect(await status(d)).toMatchObject({
+        connected: true,
+        lastError: null,
+      });
+
+    // The secret is in no log and not on the relay's disk.
+    for (const text of [relayLog, consoleLines.join("\n")])
+      expect(text.includes(SECRET)).toBe(false);
+    for (const { bytes } of filesUnder(dir))
+      expect(bytes.includes(Buffer.from(SECRET))).toBe(false);
+    // Nor in what the device stores: after a reload it is simply gone.
+    await r1.page.reload();
+    await openDb(r1, "sync-r1");
+    await run(r1, "CREATE (:Note {key: 'r1-later', text: 'no secret needed'})");
+    await converged([r1, r2], "sync after reload without the secret", (g) =>
+      g.includes("r1-later"),
+    );
+    for (const d of [r1, r2]) {
+      await d.page.evaluate(() => (window as unknown as Win).db.close());
+      await d.ctx.close();
+    }
+    await stopRelay(child);
+  });
+
+  it("only https relays, except on this machine", async () => {
+    const d = await newDevice("H");
+    await openDb(d, "sync-h");
+    expect(
+      await failure(d, "create", { relayUrl: "http://relay.example.org" }),
+    ).toBe(
+      "sync: relayUrl must use https:// (plain http:// is accepted for localhost, 127.0.0.1 and [::1] only)",
+    );
+    expect(
+      await failure(d, "join", { relayUrl: "ftp://relay.example.org", code }),
+    ).toBe("sync: relayUrl must be an https:// URL");
+    expect(
+      await failure(d, "create", {
+        relayUrl: "https://relay.example.org/?a=1",
+      }),
+    ).toMatch(/must not carry credentials, a query or a fragment/);
+    expect((await status(d)).enabled).toBe(false);
+    await d.ctx.close();
+  });
+
+  it("a relay that lost its data: devices notice, keep syncing, and report that history is gone", async () => {
+    await converged([a, b], "A and B to be level before the relay is wiped");
+    const before = await canonical(a);
+    expect((await status(a)).relayResets).toBe(0);
+
+    // The relay comes back on the same address with an empty data directory.
+    const port = Number(new URL(relayUrl).port);
+    await stopRelay(mainRelay);
+    rmSync(relayDir, { recursive: true, force: true });
+    mkdirSync(relayDir);
+    mainRelay = (await startRelay(relayDir, port)).child;
+    expect(filesUnder(relayDir).filter((f) => f.file.endsWith(".log"))).toEqual(
+      [],
+    );
+
+    // Both devices find out by themselves and lose nothing they had.
+    for (const d of [a, b]) {
+      await until(
+        `${d.label} to notice the relay was reset`,
+        async () => {
+          const s = await status(d);
+          return s.relayResets === 1 && s.connected;
+        },
+        () => status(d),
+      );
+      expect(await canonical(d)).toBe(before);
+    }
+
+    // They go on syncing with each other through the new, empty log.
+    await run(a, "CREATE (:Note {key: 'a-after-reset', text: 'A'})");
+    await run(b, "CREATE (:Note {key: 'b-after-reset', text: 'B'})");
+    await run(b, "MATCH (n:Note {key: 'n1'}) SET n.owner = 'b after reset'");
+    await converged(
+      [a, b],
+      "A and B to converge through the wiped relay",
+      (g) => g.includes("a-after-reset") && g.includes("b-after-reset"),
+    );
+    expect(await rows(a, "MATCH (n:Note {key: 'n1'}) RETURN n.owner")).toEqual([
+      ["b after reset"],
+    ]);
+    for (const d of [a, b])
+      expect(await status(d)).toMatchObject({
+        relayResets: 1,
+        needsRejoin: false,
+        lastError: null,
+        pendingUploads: 0,
+      });
+
+    // What only the relay held is gone: a device that joins now cannot read
+    // what A and B write (it never gets their first messages), and says so.
+    const n = await newDevice("N");
+    await openDb(n, "sync-n");
+    await join(n, code);
+    await run(n, "CREATE (:Note {key: 'n-new-device', text: 'N'})");
+    await syncNow(n);
+    await until(
+      "the late device to hold A's and B's commits as unusable",
+      async () => (await status(n)).pendingDownloads >= 3,
+      () => status(n),
+    );
+    expect(await keys(n)).toEqual(["n-new-device"]);
+    expect((await remote(n)).events).toBe(0);
+    expect((await status(n)).deviceList).toHaveLength(1);
+    // The others do receive what the late device writes.
+    await converged([a, b], "A and B to receive the late device's write", (g) =>
+      g.includes("n-new-device"),
+    );
+    await n.page.evaluate(() => (window as unknown as Win).db.close());
+    await n.ctx.close();
   });
 
   it("close() stops syncing cleanly", async () => {

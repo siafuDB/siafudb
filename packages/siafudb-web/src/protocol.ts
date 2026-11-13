@@ -106,6 +106,12 @@ export interface SyncStatus {
   relayUrl: string | null;
   /** Local commits queued for upload (they survive reloads). */
   pendingUploads: number;
+  /**
+   * Received commits that cannot be applied yet: they wait for an earlier
+   * commit of the same device, for that device's first message, or for this
+   * device's clock to catch up with theirs.
+   */
+  pendingDownloads: number;
   /** Devices seen in the group, this one included. */
   devices: number;
   /** `Date.now()` of the latest successful request to the relay. */

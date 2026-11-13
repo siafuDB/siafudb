@@ -3,10 +3,7 @@
  * Lock, the encrypted snapshot store and the debounced autosave. The main
  * thread talks to it through `client.ts`; do not import this file directly.
  */
-import init, {
-  canonicalRelayOrigin,
-  Database,
-} from "./wasm/siafudb_wasm.js";
+import init, { canonicalRelayOrigin, Database } from "./wasm/siafudb_wasm.js";
 import { chooseBackend, IdbBackend, OpfsBackend } from "./backends.js";
 import { DatabaseLockedError, SiafuError, serializeError } from "./errors.js";
 import type {
@@ -291,6 +288,7 @@ class Session {
   syncStatus(): SyncStatus {
     const engine = JSON.parse(this.db.syncStatus()) as {
       outbox: number;
+      pending: number;
       devices: number;
       rejected: number;
       droppedLocal: number;
@@ -308,6 +306,7 @@ class Session {
       connected: loop?.connected ?? false,
       relayUrl: engine === null ? null : (this.meta().relayUrl ?? null),
       pendingUploads: engine?.outbox ?? 0,
+      pendingDownloads: engine?.pending ?? 0,
       devices: engine?.devices ?? 0,
       lastSyncAt: loop?.lastSyncAt ?? null,
       lastError: loop?.lastError ?? null,

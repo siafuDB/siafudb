@@ -161,9 +161,7 @@ class FakeRelay {
   };
 }
 
-function setup(
-  options: { online?: boolean; registrationToken?: string } = {},
-) {
+function setup(options: { online?: boolean; registrationToken?: string } = {}) {
   const engine = new FakeEngine();
   const relay = new FakeRelay();
   const seen = {
