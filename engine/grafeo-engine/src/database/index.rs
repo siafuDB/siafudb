@@ -1,0 +1,1334 @@
+//! Index management for GrafeoDB (property, vector, and text indexes).
+//!
+//! Creating or dropping an index is a standalone change (see
+//! [`standalone`](super::standalone)): the index is built from the data
+//! first, without holding commits off, then its catalog record is logged and
+//! the index installed while commits are held off. Replay applies the
+//! record, and builds the index from the replayed data.
+
+#[cfg(feature = "vector-index")]
+use grafeo_common::grafeo_info;
+use grafeo_common::types::ReadView;
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
+use std::sync::Arc;
+
+use grafeo_common::change::StandaloneOp;
+use grafeo_common::storage::catalog_record::{
+    CatalogKey, CatalogRecord, IndexKeyRecord, IndexKindRecord, IndexRecord, LabelIndexRecord,
+};
+use grafeo_common::utils::error::{Error, Result};
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
+use grafeo_core::graph::GraphStore;
+use grafeo_core::graph::rowgroup::RowGroupStore;
+
+use crate::catalog::{Catalog, IndexType};
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
+use crate::transaction::BuiltIndex;
+use crate::transaction::StandaloneChange;
+
+/// An index as `SHOW INDEXES` and `list_indexes` list it.
+pub(crate) struct ListedIndex {
+    /// The name `CREATE INDEX` gave it, `None` for one made through the API.
+    pub(crate) name: Option<String>,
+    pub(crate) kind: IndexType,
+    /// `None` for a property index made through the API, which covers
+    /// every label.
+    pub(crate) label: Option<String>,
+    pub(crate) property: String,
+}
+
+/// The indexes `CREATE INDEX` made, by their catalog definitions, and the
+/// indexes of `store` (the current graph's) that no definition covers: the
+/// ones made through the API (`create_property_index`, `create_vector_index`,
+/// `create_text_index`), which have no name: the named ones first, by name
+/// as the catalog lists them, then the unnamed ones by label and property.
+pub(crate) fn listed_indexes(catalog: &Catalog, store: Option<&RowGroupStore>) -> Vec<ListedIndex> {
+    let defined = catalog.all_indexes();
+    let mut listed: Vec<ListedIndex> = defined
+        .iter()
+        .map(|def| ListedIndex {
+            name: Some(def.name.clone()),
+            kind: def.index_type,
+            label: Some(
+                catalog
+                    .get_label_name(def.label)
+                    .map_or_else(|| "?".to_string(), |name| name.to_string()),
+            ),
+            property: catalog
+                .get_property_key_name(def.property_key)
+                .map_or_else(|| "?".to_string(), |name| name.to_string()),
+        })
+        .collect();
+    // Whether a definition of one of `kinds` covers `property` (on `label`, when given). An
+    // index on every label has a definition on any label, one a file made before indexes went
+    // per label, unless an index of its own stands for that definition.
+    let on_label = store
+        .map(RowGroupStore::label_index_entries)
+        .unwrap_or_default();
+    let covers_every_label = |property: &str| {
+        listed.iter().any(|index| {
+            matches!(index.kind, IndexType::Hash | IndexType::BTree)
+                && index.property == property
+                && !index.label.as_ref().is_some_and(|label| {
+                    on_label
+                        .iter()
+                        .any(|(own, key)| own == label && key == property)
+                })
+        })
+    };
+    let covered = |kinds: &[IndexType], label: Option<&str>, property: &str| {
+        listed.iter().any(|index| {
+            kinds.contains(&index.kind)
+                && index.property == property
+                && label.is_none_or(|label| index.label.as_deref() == Some(label))
+        })
+    };
+    let mut unnamed = Vec::new();
+    if let Some(store) = store {
+        for property in store.property_index_keys() {
+            if !covers_every_label(&property) {
+                unnamed.push(ListedIndex {
+                    name: None,
+                    kind: IndexType::Hash,
+                    label: None,
+                    property,
+                });
+            }
+        }
+        for (label, property) in &on_label {
+            if !covered(&[IndexType::Hash, IndexType::BTree], Some(label), property) {
+                unnamed.push(ListedIndex {
+                    name: None,
+                    kind: IndexType::Hash,
+                    label: Some(label.clone()),
+                    property: property.clone(),
+                });
+            }
+        }
+        #[cfg(feature = "vector-index")]
+        for (label, property, _) in store.vector_index_entries() {
+            if !covered(&[IndexType::Vector], Some(&label), &property) {
+                unnamed.push(ListedIndex {
+                    name: None,
+                    kind: IndexType::Vector,
+                    label: Some(label),
+                    property,
+                });
+            }
+        }
+        #[cfg(feature = "text-index")]
+        for (label, property, _) in store.text_index_entries() {
+            if !covered(&[IndexType::FullText], Some(&label), &property) {
+                unnamed.push(ListedIndex {
+                    name: None,
+                    kind: IndexType::FullText,
+                    label: Some(label),
+                    property,
+                });
+            }
+        }
+    }
+    unnamed.sort_by(|a, b| {
+        (&a.label, &a.property, kind_rank(a.kind)).cmp(&(&b.label, &b.property, kind_rank(b.kind)))
+    });
+    listed.append(&mut unnamed);
+    listed
+}
+
+/// The order of the unnamed indexes of one label and property.
+fn kind_rank(kind: IndexType) -> u8 {
+    match kind {
+        IndexType::Hash => 0,
+        IndexType::BTree => 1,
+        IndexType::FullText => 2,
+        IndexType::Vector => 3,
+    }
+}
+
+/// The distance metric `name` names for a new vector index (cosine when
+/// `None`).
+///
+/// # Errors
+///
+/// An invalid-value error naming the metrics there are, for a name that is
+/// none of them.
+#[cfg(feature = "vector-index")]
+pub(crate) fn vector_index_metric(
+    name: Option<&str>,
+) -> Result<grafeo_core::index::vector::DistanceMetric> {
+    use grafeo_core::index::vector::DistanceMetric;
+    match name {
+        Some(name) => DistanceMetric::from_str(name).ok_or_else(|| {
+            Error::InvalidValue(format!(
+                "Unknown distance metric '{name}'. Use: cosine, euclidean, dot_product, manhattan"
+            ))
+        }),
+        None => Ok(DistanceMetric::Cosine),
+    }
+}
+
+/// Checks the dimensions given for a new vector index.
+///
+/// # Errors
+///
+/// An invalid-value error for 0: a vector index measures vectors with at
+/// least one value.
+#[cfg(feature = "vector-index")]
+pub(crate) fn check_vector_index_dimensions(dimensions: Option<usize>) -> Result<()> {
+    if dimensions == Some(0) {
+        return Err(Error::InvalidValue(
+            "a vector index needs at least 1 dimension".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a vector a new vector index of `dimensions` would hold, the vector
+/// of `node`: the index can measure it only when it has that many values
+/// (at least one), none of them NaN or infinite.
+///
+/// # Errors
+///
+/// An invalid-value error naming the node and what is wrong with its vector.
+#[cfg(feature = "vector-index")]
+pub(crate) fn check_vector_for_index(
+    node: grafeo_common::types::NodeId,
+    vector: &[f32],
+    dimensions: usize,
+) -> Result<()> {
+    check_vector_index_dimensions(Some(dimensions))?;
+    if vector.len() != dimensions {
+        return Err(Error::InvalidValue(format!(
+            "Vector dimension mismatch: expected {dimensions}, found {} on node {}",
+            vector.len(),
+            node.0
+        )));
+    }
+    if let Some((position, value)) = grafeo_core::index::vector::first_non_finite(vector) {
+        return Err(Error::InvalidValue(format!(
+            "the vector of node {} has {value} at position {position}: a vector index cannot \
+             measure it",
+            node.0
+        )));
+    }
+    Ok(())
+}
+
+/// A list of numbers a new vector index takes as a vector (#587): the node,
+/// the list it holds, and the vector of it.
+#[cfg(feature = "vector-index")]
+pub(crate) struct VectorIndexList {
+    node: grafeo_common::types::NodeId,
+    list: grafeo_common::types::Value,
+    vector: std::sync::Arc<[f32]>,
+}
+
+/// The lists of numbers that `property` holds on the nodes of `graph` with
+/// `label`, which a vector index of `dimensions` (from the first vector or
+/// list when `None`) about to be built takes as vectors (#587): a write of a
+/// list to an indexed property stores it as a vector, so a list written
+/// before the index becomes one too ([`convert_vector_lists`]). Every vector
+/// and list is checked as the index checks a vector, before anything is
+/// converted.
+///
+/// # Errors
+///
+/// An invalid-value error for a vector or list of another size or with a
+/// value the index cannot measure, and for a list with an element that is
+/// not a number, naming the node.
+#[cfg(feature = "vector-index")]
+pub(crate) fn vector_index_lists(
+    graph: &dyn GraphStore,
+    label: &str,
+    property: &str,
+    dimensions: Option<usize>,
+) -> Result<Vec<VectorIndexList>> {
+    use grafeo_common::types::Value;
+
+    let latest = ReadView::latest();
+    let mut expected = dimensions;
+    let mut lists = Vec::new();
+    for node in graph.nodes_by_label(label, latest)? {
+        let (vector, list) = match graph.node_property(node, property, latest)? {
+            Some(Value::Vector(vector)) => (vector, None),
+            Some(list @ Value::List(_)) => (list_vector(node, &list)?, Some(list)),
+            _ => continue,
+        };
+        check_vector_for_index(node, &vector, *expected.get_or_insert(vector.len()))?;
+        if let Some(list) = list {
+            lists.push(VectorIndexList { node, list, vector });
+        }
+    }
+    Ok(lists)
+}
+
+/// The vector a vector index takes `list` (the value of `node`) as: each
+/// element the nearest 32-bit float, as `vector()` makes it.
+#[cfg(feature = "vector-index")]
+fn list_vector(
+    node: grafeo_common::types::NodeId,
+    list: &grafeo_common::types::Value,
+) -> Result<std::sync::Arc<[f32]>> {
+    let grafeo_common::types::Value::List(items) = list else {
+        return Err(Error::Internal(format!("node {} holds no list", node.0)));
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(position, item)| {
+            item.as_vector_component().ok_or_else(|| {
+                Error::InvalidValue(format!(
+                    "the list of node {} has {} at position {position}: a vector index takes a list \
+                     of numbers",
+                    node.0,
+                    item.type_name()
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Writes each of `lists` (from [`vector_index_lists`]) to `property` as its
+/// vector through `writer`, in one transaction. A list that changed since it
+/// was checked is left as it is now: it was written as any value is.
+///
+/// # Errors
+///
+/// The error of a write, such as a conflict with an open transaction.
+#[cfg(feature = "vector-index")]
+pub(crate) fn convert_vector_lists(
+    writer: &grafeo_core::execution::operators::GraphWriter,
+    property: &str,
+    lists: Vec<VectorIndexList>,
+) -> std::result::Result<(), grafeo_core::execution::operators::OperatorError> {
+    for VectorIndexList { node, list, vector } in lists {
+        if writer
+            .store()
+            .node_property(node, property, writer.view())?
+            == Some(list)
+        {
+            super::direct::set_node_property(
+                writer,
+                node,
+                property,
+                grafeo_common::types::Value::Vector(vector),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The name [`create_vector_index`](super::GrafeoDB::create_vector_index)
+/// takes for a quantization.
+#[cfg(feature = "vector-index")]
+pub(super) fn quantization_name(
+    quantization: grafeo_core::index::vector::QuantizationType,
+) -> Option<&'static str> {
+    use grafeo_core::index::vector::QuantizationType;
+    match quantization {
+        QuantizationType::Scalar => Some("scalar"),
+        QuantizationType::Binary => Some("binary"),
+        QuantizationType::Product { .. } => Some("product"),
+        _ => None,
+    }
+}
+
+/// A vector index of `property` on the nodes of `graph` that have `label`,
+/// built from their vectors, for `create_vector_index` and `CREATE VECTOR
+/// INDEX`: `dimensions` from the first vector when `None`, `metric` cosine
+/// when `None`, `m` and `ef_construction` the HNSW defaults when `None`,
+/// `quantization` a name `create_vector_index` takes.
+///
+/// # Errors
+///
+/// An unknown metric or quantization, 0 dimensions, a vector of other
+/// dimensions or with a NaN or infinite value, or no vector and no
+/// dimensions.
+#[cfg(feature = "vector-index")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the arguments of create_vector_index and the graph"
+)]
+pub(crate) fn vector_index_from_data(
+    graph: &dyn GraphStore,
+    label: &str,
+    property: &str,
+    dimensions: Option<usize>,
+    metric: Option<&str>,
+    m: Option<usize>,
+    ef_construction: Option<usize>,
+    quantization: Option<&str>,
+) -> Result<grafeo_core::index::vector::VectorIndexKind> {
+    // The index holds each node's newest vector: it reads every commit so
+    // far, and every search rechecks its candidates at the reader's view.
+    vector_index_at(
+        graph,
+        label,
+        property,
+        dimensions,
+        metric,
+        m,
+        ef_construction,
+        quantization,
+        ReadView::latest(),
+    )
+}
+
+/// [`vector_index_from_data`] of what `latest` sees.
+#[cfg(feature = "vector-index")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parameters of an index and the view it reads"
+)]
+fn vector_index_at(
+    graph: &dyn GraphStore,
+    label: &str,
+    property: &str,
+    dimensions: Option<usize>,
+    metric: Option<&str>,
+    m: Option<usize>,
+    ef_construction: Option<usize>,
+    quantization: Option<&str>,
+    latest: ReadView,
+) -> Result<grafeo_core::index::vector::VectorIndexKind> {
+    use grafeo_common::types::Value;
+    use grafeo_core::index::vector::VectorIndexKind;
+
+    let metric = vector_index_metric(metric)?;
+    check_vector_index_dimensions(dimensions)?;
+    let quantization = super::GrafeoDB::parse_quantization(quantization)?;
+
+    let nodes = graph.nodes_by_label(label, latest)?;
+    let vector_of = |node_id| -> Result<Option<std::sync::Arc<[f32]>>> {
+        Ok(match graph.node_property(node_id, property, latest)? {
+            Some(Value::Vector(v)) => Some(v),
+            _ => None,
+        })
+    };
+    // A first pass checks the vectors and counts them, a second inserts
+    // them: no copy of every vector is held while the index is built (an
+    // open builds every vector index from the rows).
+    let mut found_dims = dimensions;
+    let mut count = 0;
+    for &node_id in &nodes {
+        if let Some(v) = vector_of(node_id)? {
+            let expected = *found_dims.get_or_insert(v.len());
+            check_vector_for_index(node_id, &v, expected)?;
+            count += 1;
+        }
+    }
+    let Some(dims) = found_dims else {
+        return Err(Error::InvalidValue(format!(
+            "No vector properties found on :{label}({property}) and no dimensions specified"
+        )));
+    };
+
+    let index =
+        super::GrafeoDB::build_vector_index(dims, metric, m, ef_construction, quantization, count);
+    match &index {
+        VectorIndexKind::Hnsw(_) => {
+            let accessor =
+                grafeo_core::index::vector::PropertyVectorAccessor::new(graph, property, latest);
+            for &node_id in &nodes {
+                if let Some(v) = vector_of(node_id)? {
+                    index.insert(node_id, &v, &accessor);
+                    accessor.check()?;
+                }
+            }
+        }
+        VectorIndexKind::Quantized(quantized) => {
+            for &node_id in &nodes {
+                if let Some(v) = vector_of(node_id)? {
+                    quantized.insert(node_id, &v);
+                }
+            }
+        }
+    }
+    grafeo_info!(
+        "Vector index built: :{label}({property}) - {count} vectors, {dims} dimensions, metric={}",
+        metric.name()
+    );
+    Ok(index)
+}
+
+/// About the heap bytes a text index takes per node it holds: its
+/// postings, its terms' share and the document's length.
+#[cfg(feature = "text-index")]
+pub(crate) const TEXT_INDEX_BYTES_PER_NODE: usize = 256;
+
+/// About the heap bytes a vector index of `dimensions` takes per node it
+/// holds: its copy of the vector and its graph's neighbours.
+#[cfg(feature = "vector-index")]
+pub(crate) fn vector_index_bytes_per_node(dimensions: Option<usize>) -> usize {
+    dimensions.map_or(1_024, |dimensions| {
+        dimensions.saturating_mul(4).saturating_add(256)
+    })
+}
+
+/// A grant of what an index build over the nodes of `label` in `store`
+/// takes, `per_node` bytes each, reserved before the build runs: `None`
+/// without a buffer manager.
+///
+/// # Errors
+///
+/// The memory limit's refusal (`GRAFEO-S001`), after the buffer manager made
+/// what room it could: nothing was built.
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
+pub(crate) fn reserve_index_build(
+    store: &RowGroupStore,
+    label: &str,
+    per_node: usize,
+) -> Result<Option<grafeo_common::memory::buffer::MemoryGrant>> {
+    use grafeo_common::memory::buffer::MemoryRegion;
+    use grafeo_common::utils::error::LimitBound;
+
+    let Some(manager) = store.memory_manager() else {
+        return Ok(None);
+    };
+    let nodes = GraphStore::nodes_by_label_count(store, label, ReadView::latest())?;
+    let bytes = nodes.saturating_mul(per_node);
+    let mut grant = manager.empty_grant(MemoryRegion::IndexBuffers);
+    if grant.try_grow(bytes) || (manager.make_room(bytes) && grant.try_grow(bytes)) {
+        Ok(Some(grant))
+    } else {
+        Err(manager.refusal(LimitBound::MemoryLimit, bytes).into())
+    }
+}
+
+/// A text index of `property` on the nodes of `graph` that have `label`,
+/// with `options`, built from their text values, for `create_text_index`
+/// and `CREATE INDEX ... USING TEXT`.
+#[cfg(feature = "text-index")]
+pub(crate) fn text_index_from_data(
+    graph: &dyn GraphStore,
+    label: &str,
+    property: &str,
+    options: &grafeo_core::index::text::TextIndexOptions,
+) -> Result<grafeo_core::index::text::InvertedIndex> {
+    // The index holds each node's newest text (see `vector_index_from_data`).
+    text_index_at(graph, label, property, options, ReadView::latest())
+}
+
+/// [`text_index_from_data`] of what `latest` sees.
+#[cfg(feature = "text-index")]
+fn text_index_at(
+    graph: &dyn GraphStore,
+    label: &str,
+    property: &str,
+    options: &grafeo_core::index::text::TextIndexOptions,
+    latest: ReadView,
+) -> Result<grafeo_core::index::text::InvertedIndex> {
+    use grafeo_common::types::Value;
+    use grafeo_core::index::text::InvertedIndex;
+
+    let mut index = InvertedIndex::with_options(options.clone());
+    for node_id in graph.nodes_by_label(label, latest)? {
+        if let Some(Value::String(text)) = graph.node_property(node_id, property, latest)? {
+            index.insert(node_id, text.as_str());
+        }
+    }
+    Ok(index)
+}
+
+/// The vector or text index `record` puts, built from what `view` sees: a commit's, for
+/// a statement of its transaction, holds what the transaction wrote and what others
+/// committed since. `None` for a property index, built as it is put.
+///
+/// # Errors
+///
+/// The errors of the build, which refuse the commit before anything is logged.
+pub(crate) fn built_for_commit(
+    store: &dyn grafeo_core::graph::GraphStore,
+    record: &IndexRecord,
+    view: ReadView,
+) -> Result<Option<crate::transaction::BuiltIndex>> {
+    #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+    let _ = (store, view);
+    let mut graphs = super::catalog_records::graph_indexes(vec![record.clone()])?;
+    let Some(indexes) = graphs.pop() else {
+        return Ok(None);
+    };
+    #[cfg(feature = "vector-index")]
+    if let Some(def) = indexes.vector.into_iter().next() {
+        let quantization = def.quantization.and_then(quantization_name);
+        return vector_index_at(
+            store,
+            &def.label,
+            &def.property,
+            Some(def.dimensions),
+            Some(def.metric.name()),
+            Some(def.m),
+            Some(def.ef_construction),
+            quantization,
+            view,
+        )
+        .map(|index| Some(crate::transaction::BuiltIndex::Vector(index)));
+    }
+    #[cfg(feature = "text-index")]
+    if let Some(def) = indexes.text.into_iter().next() {
+        return text_index_at(store, &def.label, &def.property, &def.options, view)
+            .map(|index| Some(crate::transaction::BuiltIndex::Text(index)));
+    }
+    #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+    let _ = indexes;
+    Ok(None)
+}
+
+/// The catalog record of `index`, a vector index of `property` on the nodes
+/// with `label` in the graph with storage key `graph` (`None` for the
+/// default graph), with every parameter it was built with.
+///
+/// # Errors
+///
+/// A parameter a catalog record cannot hold (see
+/// [`index_records`](super::catalog_records::index_records)).
+#[cfg(feature = "vector-index")]
+pub(crate) fn vector_index_record(
+    graph: Option<&str>,
+    label: &str,
+    property: &str,
+    index: &grafeo_core::index::vector::VectorIndexKind,
+) -> Result<IndexRecord> {
+    let config = index.config();
+    let definition = super::catalog_section::VectorIndexDefinition {
+        label: label.to_string(),
+        property: property.to_string(),
+        dimensions: config.dimensions,
+        metric: config.metric,
+        m: config.m,
+        ef_construction: config.ef_construction,
+        quantization: index.quantization_type(),
+    };
+    let records = super::catalog_records::index_records(&[super::catalog_section::GraphIndexes {
+        graph: graph.map(ToString::to_string),
+        vector: vec![definition],
+        ..super::catalog_section::GraphIndexes::default()
+    }])?;
+    records
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Internal("a vector index made no catalog record".to_string()))
+}
+
+/// The catalog record of a text index of `property` on the nodes with
+/// `label`, with `options`.
+///
+/// # Errors
+///
+/// Options a catalog record cannot hold (see
+/// [`text_index_record`](super::catalog_records::text_index_record)).
+#[cfg(feature = "text-index")]
+pub(crate) fn text_index_kind(
+    label: &str,
+    property: &str,
+    options: &grafeo_core::index::text::TextIndexOptions,
+) -> Result<IndexKindRecord> {
+    super::catalog_records::text_index_record(&super::catalog_section::TextIndexDefinition {
+        label: label.to_string(),
+        property: property.to_string(),
+        options: options.clone(),
+    })
+}
+
+/// The put of the index of `kind` in the graph with storage key `graph`.
+pub(crate) fn put_index(graph: Option<&str>, kind: IndexKindRecord) -> StandaloneOp {
+    StandaloneOp::PutCatalog(CatalogRecord::Index(IndexRecord {
+        graph: graph.map(ToString::to_string),
+        index: kind,
+    }))
+}
+
+/// The drop of the index `key` names in the graph with storage key `graph`.
+pub(crate) fn drop_index(graph: Option<&str>, key: IndexKeyRecord) -> StandaloneOp {
+    StandaloneOp::DropCatalog(CatalogKey::Index {
+        graph: graph.map(ToString::to_string),
+        index: key,
+    })
+}
+
+/// The put of the property index on `label` and `key` in the graph with storage key `graph`.
+pub(crate) fn put_label_index(graph: Option<&str>, label: &str, key: &str) -> StandaloneOp {
+    StandaloneOp::PutCatalog(CatalogRecord::LabelIndex(LabelIndexRecord {
+        graph: graph.map(ToString::to_string),
+        label: label.to_string(),
+        key: key.to_string(),
+    }))
+}
+
+/// The drop of the property index on `label` and `key` in the graph with storage key `graph`.
+pub(crate) fn drop_label_index(graph: Option<&str>, label: &str, key: &str) -> StandaloneOp {
+    StandaloneOp::DropCatalog(CatalogKey::LabelIndex {
+        graph: graph.map(ToString::to_string),
+        label: label.to_string(),
+        key: key.to_string(),
+    })
+}
+
+/// The drops of every property index on `key` in `store`, the graph with storage key `graph`:
+/// the one on every label and each one on a label.
+pub(crate) fn drops_of_property_indexes(
+    store: &RowGroupStore,
+    graph: Option<&str>,
+    key: &str,
+) -> Vec<StandaloneOp> {
+    let mut drops = Vec::new();
+    if store.index_serves(&[], key) {
+        drops.push(drop_index(
+            graph,
+            IndexKeyRecord::Property {
+                key: key.to_string(),
+            },
+        ));
+    }
+    for (label, on) in store.label_index_entries() {
+        if on == key {
+            drops.push(drop_label_index(graph, &label, key));
+        }
+    }
+    drops
+}
+
+impl super::GrafeoDB {
+    // =========================================================================
+    // PROPERTY INDEX API
+    // =========================================================================
+
+    /// The storage key of the current graph, where the property index calls
+    /// work: `None` for the default graph, also when the graph selected no
+    /// longer exists (as [`current_lpg_store`](Self::current_lpg_store)).
+    pub(super) fn current_graph_key(&self) -> Option<String> {
+        crate::session::graph_storage_key(
+            self.current_schema.read().as_deref(),
+            self.current_graph.read().as_deref(),
+        )
+        .filter(|key| {
+            self.root_store()
+                .is_some_and(|root| root.graph(key).is_some())
+        })
+    }
+
+    /// Creates an index on a node property of the current graph, for O(1)
+    /// lookups by value.
+    ///
+    /// After creating an index, calls to [`Self::find_nodes_by_property`] will be
+    /// O(1) instead of O(n) for this property. The index is automatically
+    /// maintained when properties are set or removed. Commits are held off
+    /// while it is built, as for `CREATE INDEX`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database-closed error after `close()` of a persistent
+    /// database, and the incomplete-commit error after a commit that did not
+    /// complete.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafeo_engine::GrafeoDB;
+    /// # use grafeo_common::types::Value;
+    /// # let db = GrafeoDB::new_in_memory();
+    /// // Create an index on the 'email' property
+    /// db.create_property_index("email")?;
+    ///
+    /// // Now lookups by email are O(1)
+    /// let nodes = db.find_nodes_by_property("email", &Value::from("alix@example.com"));
+    /// # Ok::<(), grafeo_common::utils::error::Error>(())
+    /// ```
+    pub fn create_property_index(&self, property: &str) -> Result<()> {
+        let held = self.hold_for_standalone(false)?;
+        let graph = self.current_graph_key();
+        if self.current_lpg_store()?.index_serves(&[], property) {
+            return Ok(());
+        }
+        let mut change = StandaloneChange::new();
+        change.push(put_index(
+            graph.as_deref(),
+            IndexKindRecord::Property {
+                key: property.to_string(),
+            },
+        ));
+        self.commit_standalone(change, &held)
+    }
+
+    /// Drops every index on a node property of the current graph: the one on every label and
+    /// each one `CREATE INDEX` made on a label.
+    ///
+    /// Returns `true` if the index existed and was removed.
+    ///
+    /// # Errors
+    ///
+    /// As [`create_property_index`](Self::create_property_index).
+    pub fn drop_property_index(&self, property: &str) -> Result<bool> {
+        let held = self.hold_for_standalone(false)?;
+        let graph = self.current_graph_key();
+        let drops =
+            drops_of_property_indexes(&*self.current_lpg_store()?, graph.as_deref(), property);
+        if drops.is_empty() {
+            return Ok(false);
+        }
+        let mut change = StandaloneChange::new();
+        for drop in drops {
+            change.push(drop);
+        }
+        self.commit_standalone(change, &held)?;
+        Ok(true)
+    }
+
+    /// Fails before an index is built when it could not be installed: after
+    /// `close()` of a persistent database, or after a commit that did not
+    /// complete. The install checks again, holding commits off.
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
+    fn check_index_change(&self) -> Result<()> {
+        self.transaction_manager.check_no_incomplete_commit()?;
+        self.transaction_manager.check_open()
+    }
+
+    /// Returns `true` if the property has an index in the current graph, on every label or on
+    /// one.
+    #[must_use]
+    pub fn has_property_index(&self, property: &str) -> bool {
+        // A backend of its own has no index.
+        self.current_lpg_store()
+            .is_ok_and(|store| store.has_property_index(property))
+    }
+
+    /// Finds all nodes of the current graph that have a specific property value.
+    ///
+    /// If the property is indexed, this is O(1). Otherwise, it scans all nodes
+    /// which is O(n). Use [`Self::create_property_index`] for frequently queried properties.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafeo_engine::GrafeoDB;
+    /// # use grafeo_common::types::Value;
+    /// # let db = GrafeoDB::new_in_memory();
+    /// // Create index for fast lookups (optional but recommended)
+    /// db.create_property_index("city")?;
+    ///
+    /// // Find all nodes where city = "Amsterdam"
+    /// let in_amsterdam = db.find_nodes_by_property("city", &Value::from("Amsterdam"))?;
+    /// # Ok::<(), grafeo_common::utils::error::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The error of a read the store cannot do (an external store's own).
+    pub fn find_nodes_by_property(
+        &self,
+        property: &str,
+        value: &grafeo_common::types::Value,
+    ) -> Result<Vec<grafeo_common::types::NodeId>> {
+        // The index also holds nodes created by transactions that have not
+        // committed yet; return only what a reader at the current epoch sees.
+        let epoch = self.read_epoch();
+        self.read_store(super::direct::DirectTarget::Current)?
+            .find_nodes_by_property(property, value, ReadView::committed(epoch))
+    }
+
+    // =========================================================================
+    // VECTOR INDEX API
+    // =========================================================================
+
+    /// Creates a vector similarity index on a node property.
+    ///
+    /// This enables efficient approximate nearest-neighbor search on vector
+    /// properties: it builds an HNSW index over the nodes with `label` whose
+    /// `property` holds a vector of the expected dimensions.
+    ///
+    /// A list of numbers in the property is stored as a vector of 32-bit
+    /// floats once the index exists: the lists already there are converted
+    /// when it is created, and a list written later is stored as one. The
+    /// property then reads back as those floats (a decimal `0.0070` as
+    /// `0.007000000216...`).
+    ///
+    /// # Arguments
+    ///
+    /// * `label` - Node label to index (e.g., `"Doc"`)
+    /// * `property` - Property containing vector embeddings (e.g., `"embedding"`)
+    /// * `dimensions` - Expected vector dimensions (inferred from data if `None`)
+    /// * `metric` - Distance metric: `"cosine"` (default), `"euclidean"`, `"dot_product"`, `"manhattan"`
+    /// * `m` - HNSW links per node (default: 16). Higher = better recall, more memory.
+    /// * `ef_construction` - Construction beam width (default: 128). Higher = better index quality, slower build.
+    /// * `quantization` - Quantization mode: `None` (default), `"scalar"`, `"binary"`, or `"product"`.
+    ///   Quantized indexes use less memory at the cost of slightly lower recall.
+    ///
+    /// The index is built from the data without holding commits off, then
+    /// logged and installed (in place of an index on the same label and
+    /// property) holding them off; a database opened again after a crash
+    /// builds it again, with these parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metric is invalid, no vectors are found, or
+    /// dimensions don't match; the database-closed error after `close()` of a
+    /// persistent database, and the incomplete-commit error after a commit
+    /// that did not complete; an error in a build without the `vector-index`
+    /// feature.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_vector_index(
+        &self,
+        label: &str,
+        property: &str,
+        dimensions: Option<usize>,
+        metric: Option<&str>,
+        m: Option<usize>,
+        ef_construction: Option<usize>,
+        quantization: Option<&str>,
+    ) -> Result<()> {
+        #[cfg(feature = "vector-index")]
+        {
+            self.check_index_change()?;
+            // On the current graph, as the other direct calls (#677).
+            let key = self.current_graph_key();
+            let (graph, store) = self.index_target(key.as_deref())?;
+            self.convert_vector_lists(&store, key.as_deref(), label, property, dimensions)?;
+            // Held until the index is in: the store counts it then.
+            let _reserved =
+                reserve_index_build(&store, label, vector_index_bytes_per_node(dimensions))?;
+            let index = vector_index_from_data(
+                &*graph,
+                label,
+                property,
+                dimensions,
+                metric,
+                m,
+                ef_construction,
+                quantization,
+            )?;
+            let record = vector_index_record(key.as_deref(), label, property, &index)?;
+            let held = self.hold_for_standalone(false)?;
+            let mut change = StandaloneChange::new();
+            change.push_built(
+                StandaloneOp::PutCatalog(CatalogRecord::Index(record)),
+                BuiltIndex::Vector(index),
+            );
+            self.commit_standalone(change, &held)
+        }
+        #[cfg(not(feature = "vector-index"))]
+        {
+            let _ = (
+                label,
+                property,
+                dimensions,
+                metric,
+                m,
+                ef_construction,
+                quantization,
+            );
+            Err(Error::from(
+                grafeo_common::utils::error::QueryError::unsupported(
+                    "this build has no vector indexes (the `vector-index` feature)",
+                ),
+            ))
+        }
+    }
+
+    /// The graph an index reads and the store that holds it, for the graph
+    /// with storage key `graph` (`None` for the default graph).
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
+    fn index_target(
+        &self,
+        graph: Option<&str>,
+    ) -> Result<(Arc<dyn GraphStore>, Arc<RowGroupStore>)> {
+        match graph {
+            None => Ok((self.graph_store(), self.lpg_store()?)),
+            Some(key) => {
+                let store = self
+                    .lpg_store()?
+                    .graph(key)
+                    .ok_or_else(|| super::direct::missing_graph(key))?;
+                Ok((Arc::clone(&store) as Arc<dyn GraphStore>, store))
+            }
+        }
+    }
+
+    /// The store that takes an index of the graph with storage key `graph`
+    /// (`None` for the default graph).
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
+    fn install_target(&self, graph: Option<&str>) -> Result<Arc<RowGroupStore>> {
+        self.index_target(graph).map(|(_, target)| target)
+    }
+
+    /// Builds the vector index a load found defined (in the catalog of the
+    /// image, or put by the replayed WAL) from the data of the graph with
+    /// storage key `graph` (`None` for the default graph), and installs it
+    /// without logging it again.
+    ///
+    /// # Errors
+    ///
+    /// As [`create_vector_index`](Self::create_vector_index), and when the
+    /// graph does not exist.
+    #[cfg(feature = "vector-index")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the arguments of create_vector_index and the graph"
+    )]
+    pub(super) fn create_vector_index_in(
+        &self,
+        graph: Option<&str>,
+        label: &str,
+        property: &str,
+        dimensions: Option<usize>,
+        metric: Option<&str>,
+        m: Option<usize>,
+        ef_construction: Option<usize>,
+        quantization: Option<&str>,
+    ) -> Result<()> {
+        self.check_index_change()?;
+        let (read, _) = self.index_target(graph)?;
+        let index = vector_index_from_data(
+            &*read,
+            label,
+            property,
+            dimensions,
+            metric,
+            m,
+            ef_construction,
+            quantization,
+        )?;
+        // The store that takes the index is resolved once commits are held.
+        let _held = self.hold_for_standalone(false)?;
+        self.install_target(graph)?
+            .add_vector_index(label, property, Arc::new(index));
+        Ok(())
+    }
+
+    /// Parses a quantization string into a [`QuantizationType`].
+    #[cfg(feature = "vector-index")]
+    fn parse_quantization(
+        quantization: Option<&str>,
+    ) -> Result<grafeo_core::index::vector::QuantizationType> {
+        use grafeo_core::index::vector::QuantizationType;
+        match quantization {
+            None | Some("none") => Ok(QuantizationType::None),
+            Some("scalar") => Ok(QuantizationType::Scalar),
+            Some("binary") => Ok(QuantizationType::Binary),
+            Some("product") => Ok(QuantizationType::Product { num_subvectors: 8 }),
+            Some(other) => Err(grafeo_common::utils::error::Error::InvalidValue(format!(
+                "unknown quantization '{other}': use none, scalar, binary or product"
+            ))),
+        }
+    }
+
+    /// Builds a [`VectorIndexKind`] from the given parameters.
+    #[cfg(feature = "vector-index")]
+    pub(super) fn build_vector_index(
+        dims: usize,
+        metric: grafeo_core::index::vector::DistanceMetric,
+        m: Option<usize>,
+        ef_construction: Option<usize>,
+        quantization: grafeo_core::index::vector::QuantizationType,
+        capacity: usize,
+    ) -> grafeo_core::index::vector::VectorIndexKind {
+        use grafeo_core::index::vector::{
+            HnswConfig, HnswIndex, QuantizationType, QuantizedHnswIndex, VectorIndexKind,
+        };
+
+        let mut config = HnswConfig::new(dims, metric);
+        if let Some(m_val) = m {
+            config = config.with_m(m_val);
+        }
+        if let Some(ef_c) = ef_construction {
+            config = config.with_ef_construction(ef_c);
+        }
+
+        match quantization {
+            QuantizationType::None => {
+                VectorIndexKind::Hnsw(HnswIndex::with_capacity(config, capacity))
+            }
+            _ => VectorIndexKind::Quantized(QuantizedHnswIndex::new(config, quantization)),
+        }
+    }
+
+    /// Drops a vector index for the given label and property.
+    ///
+    /// Returns `true` if the index existed and was removed, `false` if no
+    /// index was found.
+    ///
+    /// After dropping, [`vector_search`](Self::vector_search) for this
+    /// label+property pair will return an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database-closed error after `close()` of a persistent
+    /// database, and the incomplete-commit error after a commit that did not
+    /// complete.
+    #[cfg(feature = "vector-index")]
+    pub fn drop_vector_index(&self, label: &str, property: &str) -> Result<bool> {
+        let held = self.hold_for_standalone(false)?;
+        if self
+            .current_lpg_store()?
+            .get_vector_index(label, property)
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let mut change = StandaloneChange::new();
+        change.push(drop_index(
+            self.current_graph_key().as_deref(),
+            IndexKeyRecord::Vector {
+                label: label.to_string(),
+                property: property.to_string(),
+            },
+        ));
+        self.commit_standalone(change, &held)?;
+        grafeo_info!("Vector index dropped: :{label}({property})");
+        // A spilled column no index reads any more comes back from its
+        // cache file: nothing else would reload it (#594).
+        #[cfg(feature = "vector-index")]
+        self.reload_unindexed_column(property);
+        Ok(true)
+    }
+
+    /// Reloads the spilled column `property` when no vector index uses it any
+    /// more. A column that cannot be read stays spilled (and readable).
+    #[cfg(feature = "vector-index")]
+    fn reload_unindexed_column(&self, property: &str) {
+        // A backend of its own spills nothing of the built-in store's.
+        let Some(store) = self.root_store() else {
+            return;
+        };
+        let still_indexed = store
+            .vector_index_entries()
+            .iter()
+            .any(|(_, indexed, _)| indexed == property);
+        if still_indexed {
+            return;
+        }
+        let key = grafeo_common::types::PropertyKey::new(property);
+        if let Err(error) = store.reload_node_property_column(&key) {
+            grafeo_common::grafeo_warn!("the column {property} stays spilled: {error}");
+        }
+    }
+
+    /// Drops and recreates a vector index, rescanning all matching nodes.
+    ///
+    /// In normal usage you do **not** need to call this. Vector indexes
+    /// auto-sync when nodes are created or updated via
+    /// [`set_node_property`](Self::set_node_property),
+    /// [`batch_create_nodes`](Self::batch_create_nodes), or
+    /// [`batch_create_nodes_with_props`](Self::batch_create_nodes_with_props).
+    ///
+    /// Use `rebuild_vector_index` only when:
+    /// - Data was loaded through non-standard paths (e.g., persistence
+    ///   restore or direct store manipulation) before the index existed.
+    /// - You want to compact the index after many deletions (HNSW does
+    ///   not reclaim deleted-node slots automatically).
+    /// - The index configuration needs to be refreshed after upgrading.
+    ///
+    /// When the index still exists, the previous configuration (dimensions,
+    /// metric, M, ef\_construction) is preserved. When it has already been
+    /// dropped, dimensions are inferred from existing data and default
+    /// parameters are used. The new index replaces the old one once it is
+    /// built; a rebuild that fails leaves the old one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rebuild fails (e.g., no matching vectors found
+    /// and no dimensions can be inferred), and the errors of
+    /// [`create_vector_index`](Self::create_vector_index).
+    #[cfg(feature = "vector-index")]
+    pub fn rebuild_vector_index(&self, label: &str, property: &str) -> Result<()> {
+        // Preserve config and quantization type from existing index if available
+        let existing = self.current_lpg_store()?.get_vector_index(label, property);
+
+        let (config, quantization_name) = if let Some(ref idx) = existing {
+            let qt = idx.quantization_type().and_then(quantization_name);
+            (Some(idx.config().clone()), qt)
+        } else {
+            (None, None)
+        };
+
+        // The new index replaces the old one when it is installed.
+        if let Some(config) = config {
+            self.create_vector_index(
+                label,
+                property,
+                Some(config.dimensions),
+                Some(config.metric.name()),
+                Some(config.m),
+                Some(config.ef_construction),
+                quantization_name,
+            )
+        } else {
+            // Index was already dropped: infer dimensions from data
+            self.create_vector_index(label, property, None, None, None, None, None)
+        }
+    }
+
+    // =========================================================================
+    // TEXT INDEX API
+    // =========================================================================
+
+    /// Creates a BM25 text index on a node property for full-text search,
+    /// with the default options: BM25 with k1 1.2 and b 0.75, the `simple`
+    /// tokenizer and its English stop words (see
+    /// [`create_text_index_with`](Self::create_text_index_with)).
+    ///
+    /// Indexes all existing nodes with the given label and property.
+    /// The index stays in sync automatically as nodes are created, updated,
+    /// or deleted. Use [`rebuild_text_index`](Self::rebuild_text_index) only
+    /// if the index was created before existing data was loaded.
+    ///
+    /// The index is built from the data without holding commits off, then
+    /// logged and installed (in place of an index on the same label and
+    /// property) holding them off.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database-closed error after `close()` of a persistent
+    /// database, and the incomplete-commit error after a commit that did not
+    /// complete.
+    #[cfg(feature = "text-index")]
+    pub fn create_text_index(&self, label: &str, property: &str) -> Result<()> {
+        self.create_text_index_with(
+            label,
+            property,
+            grafeo_core::index::text::TextIndexOptions::new(),
+        )
+    }
+
+    /// Creates a BM25 text index on a node property with `options`: its
+    /// BM25 parameters (k1, b), its tokenizer and its stop words, as
+    /// [`create_text_index`](Self::create_text_index) does otherwise. The
+    /// database keeps the options with the index: a reopen, a crash
+    /// recovery and [`rebuild_text_index`](Self::rebuild_text_index) build
+    /// it with them.
+    ///
+    /// ```no_run
+    /// # use grafeo_engine::GrafeoDB;
+    /// use grafeo_engine::{TextIndexOptions, TokenizerKind};
+    ///
+    /// # let db = GrafeoDB::new_in_memory();
+    /// db.create_text_index_with(
+    ///     "Article",
+    ///     "body",
+    ///     TextIndexOptions::new()
+    ///         .with_k1(1.5)
+    ///         .with_b(0.3)
+    ///         .with_tokenizer(TokenizerKind::CjkBigram),
+    /// )?;
+    /// # Ok::<(), grafeo_common::utils::error::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// An invalid-value error (`GRAFEO-V001`) when k1 is not a finite number
+    /// of at least 0, b not a number from 0 to 1, or the stop words hold more
+    /// than [`MAX_STOP_WORD_BYTES`](grafeo_core::index::text::MAX_STOP_WORD_BYTES);
+    /// and the errors of [`create_text_index`](Self::create_text_index).
+    #[cfg(feature = "text-index")]
+    pub fn create_text_index_with(
+        &self,
+        label: &str,
+        property: &str,
+        options: grafeo_core::index::text::TextIndexOptions,
+    ) -> Result<()> {
+        options.check()?;
+        self.check_index_change()?;
+        // On the current graph, as the other direct calls (#677).
+        let key = self.current_graph_key();
+        let (graph, store) = self.index_target(key.as_deref())?;
+        // Held until the index is in: the store counts it then.
+        let _reserved = reserve_index_build(&store, label, TEXT_INDEX_BYTES_PER_NODE)?;
+        let index = text_index_from_data(&*graph, label, property, &options)?;
+        let kind = text_index_kind(label, property, &options)?;
+        let held = self.hold_for_standalone(false)?;
+        let mut change = StandaloneChange::new();
+        change.push_built(put_index(key.as_deref(), kind), BuiltIndex::Text(index));
+        self.commit_standalone(change, &held)
+    }
+
+    /// The options of the text index on `label` and `property` of the
+    /// current graph, or `None` when there is no such index.
+    #[cfg(feature = "text-index")]
+    #[must_use]
+    pub fn text_index_options(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<grafeo_core::index::text::TextIndexOptions> {
+        // A backend of its own has no text index.
+        self.root_store()?;
+        self.current_lpg_store()
+            .ok()?
+            .get_text_index(label, property)
+            .map(|index| index.read().options().clone())
+    }
+
+    /// Builds the text index a load found defined (see
+    /// [`create_vector_index_in`](Self::create_vector_index_in)) from the
+    /// data of the graph with storage key `graph` (`None` for the default
+    /// graph), and installs it without logging it again.
+    ///
+    /// # Errors
+    ///
+    /// As [`create_text_index`](Self::create_text_index), and when the
+    /// graph does not exist.
+    #[cfg(feature = "text-index")]
+    pub(super) fn create_text_index_in(
+        &self,
+        graph: Option<&str>,
+        label: &str,
+        property: &str,
+        options: &grafeo_core::index::text::TextIndexOptions,
+    ) -> Result<()> {
+        self.check_index_change()?;
+        let (read, _) = self.index_target(graph)?;
+        let index = text_index_from_data(&*read, label, property, options)?;
+        let _held = self.hold_for_standalone(false)?;
+        self.install_target(graph)?.add_text_index(
+            label,
+            property,
+            Arc::new(parking_lot::RwLock::new(index)),
+        );
+        Ok(())
+    }
+
+    /// Drops a text index on a label+property pair.
+    ///
+    /// Returns `true` if the index existed and was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database-closed error after `close()` of a persistent
+    /// database, and the incomplete-commit error after a commit that did not
+    /// complete.
+    #[cfg(feature = "text-index")]
+    pub fn drop_text_index(&self, label: &str, property: &str) -> Result<bool> {
+        let held = self.hold_for_standalone(false)?;
+        if self
+            .current_lpg_store()?
+            .get_text_index(label, property)
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let mut change = StandaloneChange::new();
+        change.push(drop_index(
+            self.current_graph_key().as_deref(),
+            IndexKeyRecord::Text {
+                label: label.to_string(),
+                property: property.to_string(),
+            },
+        ));
+        self.commit_standalone(change, &held)?;
+        Ok(true)
+    }
+
+    /// Rebuilds a text index by re-scanning all matching nodes: the new index
+    /// replaces the old one once it is built, with the options of the old
+    /// one (the default options when there is none).
+    ///
+    /// Use after bulk property updates to keep the index current.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`create_text_index`](Self::create_text_index).
+    #[cfg(feature = "text-index")]
+    pub fn rebuild_text_index(&self, label: &str, property: &str) -> Result<()> {
+        let options = self.text_index_options(label, property).unwrap_or_default();
+        self.create_text_index_with(label, property, options)
+    }
+}

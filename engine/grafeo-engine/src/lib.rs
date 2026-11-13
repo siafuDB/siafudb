@@ -1,0 +1,89 @@
+#![allow(warnings)] // SiafuDB fork: upstream warning-cleanliness is not ours to gate (see engine/CHANGES.md)
+//! # grafeo-engine
+//!
+//! The engine behind Grafeo. You'll find everything here for creating databases,
+//! running queries, and managing transactions.
+//!
+//! Most users should start with the main `grafeo` crate, which re-exports the
+//! key types. If you're here directly, [`GrafeoDB`] is your entry point.
+//!
+//! ## Modules
+//!
+//! - [`database`] - Create and manage databases with [`GrafeoDB`]
+//! - [`session`] - Lightweight handles for concurrent access
+//! - [`config`] - Tune memory, threads, and durability settings
+//! - [`transaction`] - MVCC transaction management (snapshot isolation)
+//! - [`query`] - The full query pipeline: parsing, planning, optimization, execution
+//! - [`catalog`] - Schema metadata: labels, property keys, indexes
+//! - [`admin`] - Admin API types for inspection, backup, and maintenance
+
+#![deny(unsafe_code)]
+
+// SPARQL's REGEX runs on the regex backend the build chose: `regex` for
+// native builds, `regex-lite` for WASM. The triple store picks neither, so a
+// build may choose the small one.
+#[cfg(all(
+    feature = "triple-store",
+    not(any(feature = "regex", feature = "regex-lite"))
+))]
+compile_error!(
+    "the `triple-store` feature needs a regex backend: enable `regex` (native) or `regex-lite` (WASM)"
+);
+
+/// The version of the grafeo-engine crate (from Cargo.toml).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod admin;
+pub mod auth;
+pub mod catalog;
+#[cfg(feature = "cdc")]
+pub mod cdc;
+pub mod config;
+pub mod database;
+#[cfg(feature = "embed")]
+pub mod embedding;
+pub mod execution;
+pub mod export;
+#[cfg(feature = "gql")]
+pub mod import;
+pub mod loader;
+pub mod memory_usage;
+#[cfg(feature = "metrics")]
+pub mod metrics;
+pub mod procedures;
+pub mod query;
+pub mod session;
+mod snapshot;
+pub mod transaction;
+#[cfg(feature = "shacl")]
+pub mod validation;
+
+pub use admin::{
+    AdminService, CheckpointStatus, CheckpointTriggers, CompactReport, DatabaseInfo, DatabaseMode,
+    DatabaseStats, DumpFormat, IndexInfo, LpgSchemaInfo, OpenWarning, RdfSchemaInfo, SchemaInfo,
+    ValidationError, ValidationResult, ValidationWarning, WalStatus,
+};
+pub use auth::{Grant, Identity, Role, StatementKind};
+pub use catalog::{Catalog, CatalogError, IndexDefinition, IndexType};
+pub use config::{
+    AccessMode, Config, ConfigError, DEFAULT_CHECKPOINT_WAL_SIZE, DEFAULT_WAL_RETENTION_LIMIT,
+    DEFAULT_WAL_SEGMENT_SIZE, DurabilityMode, GraphModel, HistoryRetention, SpillLimit,
+};
+pub use database::GrafeoDB;
+pub use database::GraphHandle;
+/// The syntax `GrafeoDB::load_rdf` reads.
+#[cfg(feature = "triple-store")]
+pub use database::RdfFormat;
+pub use database::{AsOfView, TimePoint};
+pub use grafeo_core::graph::{Direction, GraphStore, ProjectionSpec};
+/// The options `GrafeoDB::create_text_index_with` takes.
+#[cfg(feature = "text-index")]
+pub use grafeo_core::index::text::{TextIndexOptions, TokenizerKind};
+pub use memory_usage::MemoryUsage;
+#[cfg(feature = "metrics")]
+pub use metrics::{MetricsRegistry, MetricsSnapshot};
+#[cfg(feature = "gql")]
+pub use query::executor::stream::{OwnedResultStream, OwnedRowIterator, ResultStream, RowIterator};
+pub use session::Session;
+pub use snapshot::Snapshot;
+pub use transaction::{CommitInfo, PreparedCommit};

@@ -1,0 +1,307 @@
+//! Only one `GrafeoDB` can open a persistent database for writing (#405).
+//!
+//! Without a lock, two processes could open the same database and the one
+//! that closed last silently overwrote the other's commits. A second
+//! read-write open of the same single file now fails with a "locked" error
+//! until the first one closes, whatever its name (`.grafeo` or none).
+//!
+//! ```bash
+//! cargo test -p grafeo-engine --features full --test main database_lock::
+//! ```
+
+#![allow(missing_docs)]
+
+#[cfg(all(feature = "wal", feature = "grafeo-file"))]
+mod tests {
+    use grafeo_common::testing::child_process;
+    use grafeo_common::types::Value;
+    use grafeo_engine::config::StorageFormat;
+    use grafeo_engine::{Config, GrafeoDB};
+    use std::path::{Path, PathBuf};
+
+    /// Environment variable that turns [`child_open_fails`] into a helper run
+    /// in a separate process.
+    const CHILD_PATH_VAR: &str = "GRAFEO_LOCK_TEST_CHILD_PATH";
+    const CHILD_FORMAT_VAR: &str = "GRAFEO_LOCK_TEST_CHILD_FORMAT";
+    /// Set when the child opens the database read-only.
+    const CHILD_READ_ONLY_VAR: &str = "GRAFEO_LOCK_TEST_CHILD_READ_ONLY";
+
+    /// The databases each test runs on, both with the default format: a
+    /// `.grafeo` file, and a file without an extension (a path that was a WAL
+    /// directory before 0.6).
+    fn formats(dir: &Path) -> Vec<(&'static str, PathBuf, StorageFormat)> {
+        vec![
+            ("grafeo", dir.join("single.grafeo"), StorageFormat::Auto),
+            ("auto", dir.join("db"), StorageFormat::Auto),
+        ]
+    }
+
+    fn format_from_name(name: &str) -> StorageFormat {
+        match name {
+            "grafeo" | "auto" => StorageFormat::Auto,
+            other => panic!("unknown format {other}"),
+        }
+    }
+
+    fn open(path: &Path, format: StorageFormat) -> grafeo_common::utils::error::Result<GrafeoDB> {
+        GrafeoDB::with_config(Config::persistent(path).with_storage_format(format))
+    }
+
+    fn names(db: &GrafeoDB) -> Vec<Value> {
+        let result = db
+            .session()
+            .execute("MATCH (n:Item) RETURN n.name ORDER BY n.name")
+            .unwrap();
+        result.rows().iter().map(|row| row[0].clone()).collect()
+    }
+
+    fn insert(db: &GrafeoDB, name: &str) {
+        db.session()
+            .execute(&format!("INSERT (:Item {{name: '{name}'}})"))
+            .unwrap();
+    }
+
+    #[test]
+    fn second_open_fails_while_first_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, path, format) in formats(dir.path()) {
+            let first = open(&path, format).unwrap();
+            insert(&first, "Alix");
+            assert!(path.is_file(), "{name}: the database is a single file");
+
+            let Err(err) = open(&path, format) else {
+                panic!("{name}: second open of a database in use must fail");
+            };
+            assert!(
+                err.to_string().contains("locked"),
+                "{name}: expected a locked error, got: {err}"
+            );
+
+            // The failed open must not disturb the first handle or its data.
+            insert(&first, "Gus");
+            first.close().unwrap();
+
+            let reopened = open(&path, format).unwrap();
+            assert_eq!(
+                names(&reopened),
+                vec![Value::String("Alix".into()), Value::String("Gus".into())],
+                "{name}: data after reopen"
+            );
+            reopened.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn close_releases_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, path, format) in formats(dir.path()) {
+            let first = open(&path, format).unwrap();
+            insert(&first, "Alix");
+            first.close().unwrap();
+
+            // `first` is still alive: close() alone must release the lock.
+            let second = open(&path, format)
+                .unwrap_or_else(|e| panic!("{name}: open after close failed: {e}"));
+            assert_eq!(names(&second), vec![Value::String("Alix".into())]);
+            second.close().unwrap();
+            drop(first);
+        }
+    }
+
+    #[test]
+    fn drop_releases_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, path, format) in formats(dir.path()) {
+            {
+                let first = open(&path, format).unwrap();
+                insert(&first, "Alix");
+            }
+            let second = open(&path, format)
+                .unwrap_or_else(|e| panic!("{name}: open after drop failed: {e}"));
+            assert_eq!(names(&second), vec![Value::String("Alix".into())]);
+            second.close().unwrap();
+        }
+    }
+
+    /// The scenario from the issue: another process opens the database while
+    /// this one has it open. It must fail instead of later overwriting it.
+    #[test]
+    fn open_from_another_process_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, path, format) in formats(dir.path()) {
+            let first = open(&path, format).unwrap();
+            insert(&first, "Alix");
+
+            let child = child_process::output(
+                grafeo_common::child_test!("child_open_fails")
+                    .env(CHILD_PATH_VAR, &path)
+                    .env(CHILD_FORMAT_VAR, name),
+            )
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success(),
+                "{name}: the other process could open the database\n{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            // A child that matched no test would also exit successfully.
+            assert!(
+                stdout.contains("1 passed"),
+                "{name}: the child ran no test:\n{stdout}"
+            );
+
+            insert(&first, "Gus");
+            first.close().unwrap();
+            let reopened = open(&path, format).unwrap();
+            assert_eq!(
+                names(&reopened),
+                vec![Value::String("Alix".into()), Value::String("Gus".into())],
+                "{name}: data after reopen"
+            );
+            reopened.close().unwrap();
+        }
+    }
+
+    /// A read-only open from another process while this one writes is refused
+    /// too: it would read a file the writer is changing (#405).
+    #[test]
+    fn read_only_open_from_another_process_while_a_writer_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, path, format) in formats(dir.path()) {
+            let first = open(&path, format).unwrap();
+            insert(&first, "Alix");
+
+            let child = child_process::output(
+                grafeo_common::child_test!("child_open_fails")
+                    .env(CHILD_PATH_VAR, &path)
+                    .env(CHILD_FORMAT_VAR, name)
+                    .env(CHILD_READ_ONLY_VAR, "1"),
+            )
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success(),
+                "{name}: the other process could open the database read-only\n{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "{name}: the child ran no test:\n{stdout}"
+            );
+
+            insert(&first, "Gus");
+            first.close().unwrap();
+            let reopened = open(&path, format).unwrap();
+            assert_eq!(
+                names(&reopened),
+                vec![Value::String("Alix".into()), Value::String("Gus".into())],
+                "{name}: data after reopen"
+            );
+            reopened.close().unwrap();
+        }
+    }
+
+    /// A reader keeps a writer in another process out, until it closes.
+    #[test]
+    fn read_write_open_from_another_process_while_a_reader_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, path, format) in formats(dir.path()) {
+            let first = open(&path, format).unwrap();
+            insert(&first, "Alix");
+            first.close().unwrap();
+
+            let reader = GrafeoDB::open_read_only(&path).unwrap();
+            let child = child_process::output(
+                grafeo_common::child_test!("child_open_fails")
+                    .env(CHILD_PATH_VAR, &path)
+                    .env(CHILD_FORMAT_VAR, name),
+            )
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success(),
+                "{name}: the other process could open the database to write\n{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "{name}: the child ran no test:\n{stdout}"
+            );
+            assert_eq!(names(&reader), vec![Value::String("Alix".into())], "{name}");
+            reader.close().unwrap();
+
+            let writer = open(&path, format).unwrap();
+            insert(&writer, "Gus");
+            writer.close().unwrap();
+        }
+    }
+
+    /// Readers in two processes coexist.
+    #[test]
+    fn read_only_open_from_another_process_while_a_reader_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, path, format) in formats(dir.path()) {
+            let first = open(&path, format).unwrap();
+            insert(&first, "Alix");
+            first.close().unwrap();
+
+            let reader = GrafeoDB::open_read_only(&path).unwrap();
+            let child = child_process::output(
+                grafeo_common::child_test!("child_read_only_open_reads")
+                    .env(CHILD_PATH_VAR, &path)
+                    .env(CHILD_FORMAT_VAR, name),
+            )
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success(),
+                "{name}: the other process could not read\n{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "{name}: the child ran no test:\n{stdout}"
+            );
+            reader.close().unwrap();
+        }
+    }
+
+    /// Helper for [`read_only_open_from_another_process_while_a_reader_holds_it`]; a no-op when
+    /// run directly.
+    #[test]
+    fn child_read_only_open_reads() {
+        let Some(path) = std::env::var_os(CHILD_PATH_VAR) else {
+            return;
+        };
+        let reader = GrafeoDB::open_read_only(Path::new(&path)).unwrap();
+        assert_eq!(names(&reader), vec![Value::String("Alix".into())]);
+        reader.close().unwrap();
+    }
+
+    /// Helper for [`open_from_another_process_fails`] and
+    /// [`read_only_open_from_another_process_while_a_writer_holds_it`]; a
+    /// no-op when run directly.
+    #[test]
+    fn child_open_fails() {
+        let (Some(path), Ok(format)) = (
+            std::env::var_os(CHILD_PATH_VAR),
+            std::env::var(CHILD_FORMAT_VAR),
+        ) else {
+            return;
+        };
+        let format = format_from_name(&format);
+        let opened = if std::env::var_os(CHILD_READ_ONLY_VAR).is_some() {
+            GrafeoDB::open_read_only(Path::new(&path))
+        } else {
+            open(Path::new(&path), format)
+        };
+        match opened {
+            Ok(db) => {
+                // Do not write anything on the way out.
+                std::mem::forget(db);
+                panic!("opened a database that another process holds");
+            }
+            Err(err) => assert!(err.to_string().contains("locked"), "{err}"),
+        }
+    }
+}

@@ -1,0 +1,1456 @@
+//! Shortest path algorithms: Dijkstra, A*, Bellman-Ford, Floyd-Warshall.
+//!
+//! These algorithms find optimal paths in weighted graphs, supporting
+//! both single-source and all-pairs variants.
+
+use std::collections::BinaryHeap;
+use std::sync::OnceLock;
+
+#[cfg(test)]
+use grafeo_common::types::PropertyKey;
+use grafeo_common::types::{NodeId, Value};
+use grafeo_common::utils::error::{Error, Result};
+use grafeo_common::utils::hash::FxHashMap;
+use grafeo_core::graph::Direction;
+use grafeo_core::graph::GraphStore;
+#[cfg(test)]
+#[cfg(test)]
+use grafeo_core::graph::rowgroup::RowGroupStore;
+
+use super::super::Domain;
+use super::super::{AlgorithmResult, ParameterDef, ParameterType, Prepared};
+use super::traits::{
+    EdgeWeight, GraphAlgorithm, MinScored, Ticker, impl_algorithm, int_value, node_id_from_param,
+};
+
+/// The weight Dijkstra and A* read: a search that settles a node for good needs no negative edge.
+const NON_NEGATIVE_WEIGHT: EdgeWeight = EdgeWeight {
+    what: "weight",
+    default: 1.0,
+    domain: Domain::NonNegative,
+};
+
+/// The weight Bellman-Ford and Floyd-Warshall read, which are made for negative edges.
+const ANY_WEIGHT: EdgeWeight = EdgeWeight {
+    what: "weight",
+    default: 1.0,
+    domain: Domain::OfType,
+};
+
+// ============================================================================
+// Dijkstra's Algorithm
+// ============================================================================
+
+/// Result of Dijkstra's algorithm.
+#[derive(Debug, Clone)]
+pub struct DijkstraResult {
+    /// Distances from source to each reachable node.
+    pub distances: FxHashMap<NodeId, f64>,
+    /// Predecessor map for path reconstruction.
+    pub predecessors: FxHashMap<NodeId, NodeId>,
+}
+
+impl DijkstraResult {
+    /// Reconstructs the path from source to target.
+    ///
+    /// Returns `None` if target is unreachable.
+    pub fn path_to(&self, source: NodeId, target: NodeId) -> Option<Vec<NodeId>> {
+        if !self.distances.contains_key(&target) {
+            return None;
+        }
+
+        let mut path = Vec::new();
+        let mut current = target;
+
+        while current != source {
+            path.push(current);
+            current = *self.predecessors.get(&current)?;
+        }
+        path.push(source);
+        path.reverse();
+
+        Some(path)
+    }
+
+    /// Returns the distance to a target node.
+    pub fn distance_to(&self, target: NodeId) -> Option<f64> {
+        self.distances.get(&target).copied()
+    }
+}
+
+/// Runs Dijkstra's algorithm from a source node.
+///
+/// # Arguments
+///
+/// * `store` - The graph store
+/// * `source` - Starting node ID
+/// * `weight_property` - Optional property name for edge weights (defaults to 1.0)
+///
+/// # Returns
+///
+/// Distances and predecessors for all reachable nodes.
+///
+/// # Complexity
+///
+/// O((V + E) log V) using a binary heap.
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn dijkstra(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    source: NodeId,
+    weight_property: Option<&str>,
+) -> grafeo_common::utils::error::Result<DijkstraResult> {
+    let graph = super::traits::GraphView::new(store, view);
+    let found = dijkstra_on(&graph, source, weight_property);
+    graph.finish(found)?
+}
+
+/// [`dijkstra`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn dijkstra_on(
+    store: &super::traits::GraphView<'_>,
+    source: NodeId,
+    weight_property: Option<&str>,
+) -> grafeo_common::utils::error::Result<DijkstraResult> {
+    let mut ticker = Ticker::new();
+    let mut distances: FxHashMap<NodeId, f64> = FxHashMap::default();
+    let mut predecessors: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+    let mut heap: BinaryHeap<MinScored<NodeId>> = BinaryHeap::new();
+
+    // Check if source exists
+    if store.node(source).is_none() {
+        return Ok(DijkstraResult {
+            distances,
+            predecessors,
+        });
+    }
+
+    distances.insert(source, 0.0);
+    heap.push(MinScored::new(0.0, source));
+
+    while let Some(MinScored(dist, node)) = heap.pop() {
+        // Skip if we've found a better path
+        if let Some(&best) = distances.get(&node)
+            && dist > best
+        {
+            continue;
+        }
+
+        // Explore neighbors: a unit of work per node settled.
+        ticker.tick()?;
+        for (neighbor, edge_id) in store.edges(node, Direction::Outgoing) {
+            let weight = store.edge_weight(edge_id, weight_property, NON_NEGATIVE_WEIGHT)?;
+            let new_dist = dist + weight;
+
+            let is_better = distances
+                .get(&neighbor)
+                .map_or(true, |&current| new_dist < current);
+
+            if is_better {
+                distances.insert(neighbor, new_dist);
+                predecessors.insert(neighbor, node);
+                heap.push(MinScored::new(new_dist, neighbor));
+            }
+        }
+    }
+
+    Ok(DijkstraResult {
+        distances,
+        predecessors,
+    })
+}
+
+/// Runs Dijkstra's algorithm to find shortest path to a specific target.
+///
+/// Early terminates when target is reached.
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn dijkstra_path(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    source: NodeId,
+    target: NodeId,
+    weight_property: Option<&str>,
+) -> grafeo_common::utils::error::Result<Option<(f64, Vec<NodeId>)>> {
+    let graph = super::traits::GraphView::new(store, view);
+    let found = dijkstra_path_on(&graph, source, target, weight_property);
+    graph.finish(found)?
+}
+
+/// [`dijkstra_path`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn dijkstra_path_on(
+    store: &super::traits::GraphView<'_>,
+    source: NodeId,
+    target: NodeId,
+    weight_property: Option<&str>,
+) -> grafeo_common::utils::error::Result<Option<(f64, Vec<NodeId>)>> {
+    let mut ticker = Ticker::new();
+    let mut distances: FxHashMap<NodeId, f64> = FxHashMap::default();
+    let mut predecessors: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+    let mut heap: BinaryHeap<MinScored<NodeId>> = BinaryHeap::new();
+
+    // Check if source and target exist
+    if store.node(source).is_none() || store.node(target).is_none() {
+        return Ok(None);
+    }
+
+    distances.insert(source, 0.0);
+    heap.push(MinScored::new(0.0, source));
+
+    while let Some(MinScored(dist, node)) = heap.pop() {
+        // Early termination if we've reached target
+        if node == target {
+            // Reconstruct path
+            let mut path = Vec::new();
+            let mut current = target;
+            while current != source {
+                path.push(current);
+                let Some(&previous) = predecessors.get(&current) else {
+                    return Ok(None);
+                };
+                current = previous;
+            }
+            path.push(source);
+            path.reverse();
+            return Ok(Some((dist, path)));
+        }
+
+        // Skip if we've found a better path
+        if let Some(&best) = distances.get(&node)
+            && dist > best
+        {
+            continue;
+        }
+
+        // Explore neighbors: a unit of work per node settled.
+        ticker.tick()?;
+        for (neighbor, edge_id) in store.edges(node, Direction::Outgoing) {
+            let weight = store.edge_weight(edge_id, weight_property, NON_NEGATIVE_WEIGHT)?;
+            let new_dist = dist + weight;
+
+            let is_better = distances
+                .get(&neighbor)
+                .map_or(true, |&current| new_dist < current);
+
+            if is_better {
+                distances.insert(neighbor, new_dist);
+                predecessors.insert(neighbor, node);
+                heap.push(MinScored::new(new_dist, neighbor));
+            }
+        }
+    }
+
+    Ok(None) // Target not reachable
+}
+
+// ============================================================================
+// A* Algorithm
+// ============================================================================
+
+/// Runs A* algorithm with a heuristic function.
+///
+/// # Arguments
+///
+/// * `store` - The graph store
+/// * `source` - Starting node ID
+/// * `target` - Target node ID
+/// * `weight_property` - Optional property name for edge weights
+/// * `heuristic` - Function estimating cost from node to target (must be admissible)
+///
+/// # Returns
+///
+/// The shortest path distance and path, or `None` if unreachable.
+///
+/// # Complexity
+///
+/// O(E) in the best case with a good heuristic, O((V + E) log V) in the worst case.
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn astar<H>(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    source: NodeId,
+    target: NodeId,
+    weight_property: Option<&str>,
+    heuristic: H,
+) -> grafeo_common::utils::error::Result<Option<(f64, Vec<NodeId>)>>
+where
+    H: Fn(NodeId) -> f64,
+{
+    let graph = super::traits::GraphView::new(store, view);
+    let found = astar_on::<H>(&graph, source, target, weight_property, heuristic);
+    graph.finish(found)?
+}
+
+/// [`astar`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn astar_on<H>(
+    store: &super::traits::GraphView<'_>,
+    source: NodeId,
+    target: NodeId,
+    weight_property: Option<&str>,
+    heuristic: H,
+) -> grafeo_common::utils::error::Result<Option<(f64, Vec<NodeId>)>>
+where
+    H: Fn(NodeId) -> f64,
+{
+    let mut ticker = Ticker::new();
+    let mut g_score: FxHashMap<NodeId, f64> = FxHashMap::default();
+    let mut predecessors: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+    let mut heap: BinaryHeap<MinScored<NodeId>> = BinaryHeap::new();
+
+    // Check if source and target exist
+    if store.node(source).is_none() || store.node(target).is_none() {
+        return Ok(None);
+    }
+
+    g_score.insert(source, 0.0);
+    let f_score = heuristic(source);
+    heap.push(MinScored::new(f_score, source));
+
+    while let Some(MinScored(_, node)) = heap.pop() {
+        if node == target {
+            // Reconstruct path
+            let mut path = Vec::new();
+            let mut current = target;
+            while current != source {
+                path.push(current);
+                let Some(&previous) = predecessors.get(&current) else {
+                    return Ok(None);
+                };
+                current = previous;
+            }
+            path.push(source);
+            path.reverse();
+            return Ok(g_score.get(&target).map(|&g| (g, path)));
+        }
+
+        let current_g = *g_score.get(&node).unwrap_or(&f64::INFINITY);
+
+        // Explore neighbors: a unit of work per node settled.
+        ticker.tick()?;
+        for (neighbor, edge_id) in store.edges(node, Direction::Outgoing) {
+            let weight = store.edge_weight(edge_id, weight_property, NON_NEGATIVE_WEIGHT)?;
+            let tentative_g = current_g + weight;
+
+            let is_better = g_score
+                .get(&neighbor)
+                .map_or(true, |&current| tentative_g < current);
+
+            if is_better {
+                predecessors.insert(neighbor, node);
+                g_score.insert(neighbor, tentative_g);
+                let f = tentative_g + heuristic(neighbor);
+                heap.push(MinScored::new(f, neighbor));
+            }
+        }
+    }
+
+    Ok(None) // Target not reachable
+}
+
+// ============================================================================
+// Bellman-Ford Algorithm
+// ============================================================================
+
+/// Result of Bellman-Ford algorithm.
+#[derive(Debug, Clone)]
+pub struct BellmanFordResult {
+    /// Distances from source to each reachable node.
+    pub distances: FxHashMap<NodeId, f64>,
+    /// Predecessor map for path reconstruction.
+    pub predecessors: FxHashMap<NodeId, NodeId>,
+    /// Whether a negative cycle was detected.
+    pub has_negative_cycle: bool,
+    /// The source node used for path reconstruction.
+    source: NodeId,
+}
+
+impl BellmanFordResult {
+    /// Reconstructs the path from source to target.
+    pub fn path_to(&self, target: NodeId) -> Option<Vec<NodeId>> {
+        if !self.distances.contains_key(&target) {
+            return None;
+        }
+
+        let mut path = vec![target];
+        let mut current = target;
+
+        while current != self.source {
+            let pred = self.predecessors.get(&current)?;
+            path.push(*pred);
+            current = *pred;
+        }
+
+        path.reverse();
+        Some(path)
+    }
+}
+
+/// Runs Bellman-Ford algorithm from a source node.
+///
+/// Unlike Dijkstra, this algorithm handles negative edge weights
+/// and detects negative cycles.
+///
+/// # Arguments
+///
+/// * `store` - The graph store
+/// * `source` - Starting node ID
+/// * `weight_property` - Optional property name for edge weights
+///
+/// # Returns
+///
+/// Distances, predecessors, and negative cycle detection flag.
+///
+/// # Complexity
+///
+/// O(V × E)
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn bellman_ford(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    source: NodeId,
+    weight_property: Option<&str>,
+) -> grafeo_common::utils::error::Result<BellmanFordResult> {
+    let graph = super::traits::GraphView::new(store, view);
+    let found = bellman_ford_on(&graph, source, weight_property);
+    graph.finish(found)?
+}
+
+/// [`bellman_ford`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn bellman_ford_on(
+    store: &super::traits::GraphView<'_>,
+    source: NodeId,
+    weight_property: Option<&str>,
+) -> grafeo_common::utils::error::Result<BellmanFordResult> {
+    let mut ticker = Ticker::new();
+    let mut distances: FxHashMap<NodeId, f64> = FxHashMap::default();
+    let mut predecessors: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+
+    // Check if source exists
+    if store.node(source).is_none() {
+        return Ok(BellmanFordResult {
+            distances,
+            predecessors,
+            has_negative_cycle: false,
+            source,
+        });
+    }
+
+    // Collect all nodes and edges
+    let nodes: Vec<NodeId> = store.node_ids();
+    let edges: Vec<(NodeId, NodeId, grafeo_common::types::EdgeId)> = nodes
+        .iter()
+        .flat_map(|&node| {
+            store
+                .edges(node, Direction::Outgoing)
+                .into_iter()
+                .map(move |(neighbor, edge_id)| (node, neighbor, edge_id))
+        })
+        .collect();
+
+    let n = nodes.len();
+
+    // Initialize distances
+    distances.insert(source, 0.0);
+
+    // Relax edges V-1 times
+    for _ in 0..n.saturating_sub(1) {
+        let mut changed = false;
+        for &(u, v, edge_id) in &edges {
+            ticker.tick()?;
+            if let Some(&dist_u) = distances.get(&u) {
+                let weight = store.edge_weight(edge_id, weight_property, ANY_WEIGHT)?;
+                let new_dist = dist_u + weight;
+
+                let is_better = distances
+                    .get(&v)
+                    .map_or(true, |&current| new_dist < current);
+
+                if is_better {
+                    distances.insert(v, new_dist);
+                    predecessors.insert(v, u);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break; // Early termination
+        }
+    }
+
+    // Check for negative cycles
+    let mut has_negative_cycle = false;
+    for &(u, v, edge_id) in &edges {
+        ticker.tick()?;
+        if let Some(&dist_u) = distances.get(&u) {
+            let weight = store.edge_weight(edge_id, weight_property, ANY_WEIGHT)?;
+            if let Some(&dist_v) = distances.get(&v)
+                && dist_u + weight < dist_v
+            {
+                has_negative_cycle = true;
+                break;
+            }
+        }
+    }
+
+    Ok(BellmanFordResult {
+        distances,
+        predecessors,
+        has_negative_cycle,
+        source,
+    })
+}
+
+// ============================================================================
+// Floyd-Warshall Algorithm
+// ============================================================================
+
+/// Result of Floyd-Warshall algorithm.
+#[derive(Debug, Clone)]
+pub struct FloydWarshallResult {
+    /// Distance matrix: distances[i][j] is the shortest distance from node i to node j.
+    distances: Vec<Vec<f64>>,
+    /// Next-hop matrix for path reconstruction.
+    next: Vec<Vec<Option<usize>>>,
+    /// Mapping from NodeId to matrix index.
+    node_to_index: FxHashMap<NodeId, usize>,
+    /// Mapping from matrix index to NodeId.
+    index_to_node: Vec<NodeId>,
+}
+
+impl FloydWarshallResult {
+    /// Returns the shortest distance between two nodes.
+    pub fn distance(&self, from: NodeId, to: NodeId) -> Option<f64> {
+        let i = *self.node_to_index.get(&from)?;
+        let j = *self.node_to_index.get(&to)?;
+        let dist = self.distances[i][j];
+        if dist == f64::INFINITY {
+            None
+        } else {
+            Some(dist)
+        }
+    }
+
+    /// Reconstructs the shortest path between two nodes.
+    pub fn path(&self, from: NodeId, to: NodeId) -> Option<Vec<NodeId>> {
+        let i = *self.node_to_index.get(&from)?;
+        let j = *self.node_to_index.get(&to)?;
+
+        if self.distances[i][j] == f64::INFINITY {
+            return None;
+        }
+
+        let mut path = vec![from];
+        let mut current = i;
+
+        while current != j {
+            current = self.next[current][j]?;
+            path.push(self.index_to_node[current]);
+        }
+
+        Some(path)
+    }
+
+    /// Checks if the graph has a negative cycle.
+    pub fn has_negative_cycle(&self) -> bool {
+        for i in 0..self.distances.len() {
+            if self.distances[i][i] < 0.0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns all nodes in the graph.
+    pub fn nodes(&self) -> &[NodeId] {
+        &self.index_to_node
+    }
+}
+
+/// Runs Floyd-Warshall algorithm for all-pairs shortest paths.
+///
+/// # Arguments
+///
+/// * `store` - The graph store
+/// * `weight_property` - Optional property name for edge weights
+///
+/// # Returns
+///
+/// All-pairs shortest path distances and path reconstruction data.
+///
+/// # Complexity
+///
+/// O(V³)
+///
+/// # Errors
+///
+/// The error of a read of the store that fails.
+pub fn floyd_warshall(
+    store: &dyn GraphStore,
+    view: grafeo_common::types::ReadView,
+    weight_property: Option<&str>,
+) -> grafeo_common::utils::error::Result<FloydWarshallResult> {
+    let graph = super::traits::GraphView::new(store, view);
+    let found = floyd_warshall_on(&graph, weight_property);
+    graph.finish(found)?
+}
+
+/// [`floyd_warshall`] on the graph a [`GraphView`](super::traits::GraphView) reads.
+pub(crate) fn floyd_warshall_on(
+    store: &super::traits::GraphView<'_>,
+    weight_property: Option<&str>,
+) -> grafeo_common::utils::error::Result<FloydWarshallResult> {
+    let mut ticker = Ticker::new();
+    let nodes: Vec<NodeId> = store.node_ids();
+    let n = nodes.len();
+
+    // Build node index mappings
+    let mut node_to_index: FxHashMap<NodeId, usize> = FxHashMap::default();
+    for (idx, &node) in nodes.iter().enumerate() {
+        node_to_index.insert(node, idx);
+    }
+
+    // Initialize distance matrix
+    let mut distances = vec![vec![f64::INFINITY; n]; n];
+    let mut next: Vec<Vec<Option<usize>>> = vec![vec![None; n]; n];
+
+    // Set diagonal to 0
+    for i in 0..n {
+        distances[i][i] = 0.0;
+    }
+
+    // Initialize with direct edges
+    for (idx, &node) in nodes.iter().enumerate() {
+        for (neighbor, edge_id) in store.edges(node, Direction::Outgoing) {
+            ticker.tick()?;
+            if let Some(&neighbor_idx) = node_to_index.get(&neighbor) {
+                let weight = store.edge_weight(edge_id, weight_property, ANY_WEIGHT)?;
+                if weight < distances[idx][neighbor_idx] {
+                    distances[idx][neighbor_idx] = weight;
+                    next[idx][neighbor_idx] = Some(neighbor_idx);
+                }
+            }
+        }
+    }
+
+    // Floyd-Warshall main loop, a unit of work per row of `n` relaxations.
+    for k in 0..n {
+        for i in 0..n {
+            ticker.tick()?;
+            for j in 0..n {
+                let through_k = distances[i][k] + distances[k][j];
+                if through_k < distances[i][j] {
+                    distances[i][j] = through_k;
+                    next[i][j] = next[i][k];
+                }
+            }
+        }
+    }
+
+    Ok(FloydWarshallResult {
+        distances,
+        next,
+        node_to_index,
+        index_to_node: nodes,
+    })
+}
+
+// ============================================================================
+// Algorithm Wrappers for Plugin Registry
+// ============================================================================
+
+/// Static parameter definitions for Dijkstra algorithm.
+static DIJKSTRA_PARAMS: OnceLock<Vec<ParameterDef>> = OnceLock::new();
+
+fn dijkstra_params() -> &'static [ParameterDef] {
+    DIJKSTRA_PARAMS.get_or_init(|| {
+        vec![
+            ParameterDef {
+                name: "source".to_string(),
+                description: "Source node ID".to_string(),
+                param_type: ParameterType::NodeId,
+                required: true,
+                default: None,
+                domain: Domain::OfType,
+            },
+            ParameterDef {
+                name: "target".to_string(),
+                description: "Target node ID (optional, for single-pair shortest path)".to_string(),
+                param_type: ParameterType::NodeId,
+                required: false,
+                default: None,
+                domain: Domain::OfType,
+            },
+            ParameterDef {
+                name: "weight".to_string(),
+                description: "Edge property name for weights (default: 1.0)".to_string(),
+                param_type: ParameterType::String,
+                required: false,
+                default: None,
+                domain: Domain::OfType,
+            },
+        ]
+    })
+}
+
+/// Dijkstra algorithm wrapper for the plugin registry.
+pub struct DijkstraAlgorithm;
+
+impl GraphAlgorithm for DijkstraAlgorithm {
+    fn name(&self) -> &str {
+        "dijkstra"
+    }
+
+    fn description(&self) -> &str {
+        "Dijkstra's shortest path algorithm"
+    }
+
+    fn parameters(&self) -> &[ParameterDef] {
+        dijkstra_params()
+    }
+
+    // reason: node IDs are sequential counters, well within i64::MAX
+    #[allow(clippy::cast_possible_wrap)]
+    fn compute(
+        &self,
+        store: &dyn GraphStore,
+        view: grafeo_common::types::ReadView,
+        params: &Prepared,
+    ) -> Result<AlgorithmResult> {
+        let graph = super::traits::GraphView::new(store, view);
+        let store = &graph;
+        let found = super::traits::evaluated(|| {
+            let source_id = params.required_int("source")?;
+
+            let source = node_id_from_param(source_id, "source")?;
+            let weight_prop = params.get_string("weight");
+
+            if let Some(target_id) = params.get_int("target") {
+                // Single-pair shortest path
+                let target = node_id_from_param(target_id, "target")?;
+                match dijkstra_path_on(store, source, target, weight_prop)? {
+                    Some((distance, path)) => {
+                        let mut result = AlgorithmResult::new(vec![
+                            "source".to_string(),
+                            "target".to_string(),
+                            "distance".to_string(),
+                            "path".to_string(),
+                        ]);
+
+                        let path_str: String = path
+                            .iter()
+                            .map(|n| n.0.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" -> ");
+
+                        result.add_row(vec![
+                            Value::Int64(source.0 as i64),
+                            Value::Int64(target.0 as i64),
+                            Value::Float64(distance),
+                            Value::String(path_str.into()),
+                        ]);
+
+                        Ok(result)
+                    }
+                    None => {
+                        let mut result = AlgorithmResult::new(vec![
+                            "source".to_string(),
+                            "target".to_string(),
+                            "distance".to_string(),
+                            "path".to_string(),
+                        ]);
+                        result.add_row(vec![
+                            Value::Int64(source.0 as i64),
+                            Value::Int64(target_id),
+                            Value::Null,
+                            Value::String("unreachable".into()),
+                        ]);
+                        Ok(result)
+                    }
+                }
+            } else {
+                // Single-source shortest paths
+                let dijkstra_result = dijkstra_on(store, source, weight_prop)?;
+
+                let mut result =
+                    AlgorithmResult::new(vec!["node_id".to_string(), "distance".to_string()]);
+
+                for (node, distance) in dijkstra_result.distances {
+                    result.add_row(vec![Value::Int64(node.0 as i64), Value::Float64(distance)]);
+                }
+
+                result.sort_by_id_columns(1);
+                Ok(result)
+            }
+        });
+        graph.finish(found)?
+    }
+}
+
+/// Static parameter definitions for SSSP algorithm.
+static SSSP_PARAMS: OnceLock<Vec<ParameterDef>> = OnceLock::new();
+
+fn sssp_params() -> &'static [ParameterDef] {
+    SSSP_PARAMS.get_or_init(|| {
+        vec![
+            ParameterDef {
+                name: "source".to_string(),
+                description: "Source node name (string) or ID (integer as string)".to_string(),
+                param_type: ParameterType::String,
+                required: true,
+                default: None,
+                domain: Domain::OfType,
+            },
+            ParameterDef {
+                name: "weight".to_string(),
+                description: "Edge property name for weights (default: 1.0)".to_string(),
+                param_type: ParameterType::String,
+                required: false,
+                default: None,
+                domain: Domain::OfType,
+            },
+        ]
+    })
+}
+
+/// SSSP (Single-Source Shortest Paths) algorithm for LDBC Graphanalytics compatibility.
+///
+/// Wraps Dijkstra's algorithm with string-based node name resolution.
+/// The source parameter is a string node name (looked up via "name" property)
+/// or falls back to integer ID parsing.
+pub struct SsspAlgorithm;
+
+impl GraphAlgorithm for SsspAlgorithm {
+    fn name(&self) -> &str {
+        "sssp"
+    }
+
+    fn description(&self) -> &str {
+        "Single-source shortest paths (Dijkstra) with string node name support"
+    }
+
+    fn parameters(&self) -> &[ParameterDef] {
+        sssp_params()
+    }
+
+    fn compute(
+        &self,
+        store: &dyn GraphStore,
+        view: grafeo_common::types::ReadView,
+        params: &Prepared,
+    ) -> Result<AlgorithmResult> {
+        let graph = super::traits::GraphView::new(store, view);
+        let store = &graph;
+        let found = super::traits::evaluated(|| {
+            let source_str = params.required_string("source")?;
+
+            // Resolve source: try integer parse first, then name property lookup
+            let source = if let Ok(id) = source_str.parse::<u64>() {
+                NodeId::new(id)
+            } else {
+                let candidates = store.find_nodes_by_property("name", &Value::from(source_str));
+                match candidates.len() {
+                    0 => {
+                        return Err(Error::InvalidValue(format!(
+                            "No node found with name '{source_str}'"
+                        )));
+                    }
+                    1 => candidates[0],
+                    _ => {
+                        return Err(Error::InvalidValue(format!(
+                            "Multiple nodes found with name '{source_str}', use node ID instead"
+                        )));
+                    }
+                }
+            };
+
+            let weight_prop = params.get_string("weight");
+            let dijkstra_result = dijkstra_on(store, source, weight_prop)?;
+
+            let mut result =
+                AlgorithmResult::new(vec!["node_id".to_string(), "distance".to_string()]);
+
+            for (node, distance) in dijkstra_result.distances {
+                result.add_row(vec![int_value(node.0)?, Value::Float64(distance)]);
+            }
+
+            result.sort_by_id_columns(1);
+            Ok(result)
+        });
+        graph.finish(found)?
+    }
+}
+
+/// Static parameter definitions for Bellman-Ford algorithm.
+static BELLMAN_FORD_PARAMS: OnceLock<Vec<ParameterDef>> = OnceLock::new();
+
+fn bellman_ford_params() -> &'static [ParameterDef] {
+    BELLMAN_FORD_PARAMS.get_or_init(|| {
+        vec![
+            ParameterDef {
+                name: "source".to_string(),
+                description: "Source node ID".to_string(),
+                param_type: ParameterType::NodeId,
+                required: true,
+                default: None,
+                domain: Domain::OfType,
+            },
+            ParameterDef {
+                name: "weight".to_string(),
+                description: "Edge property name for weights (default: 1.0)".to_string(),
+                param_type: ParameterType::String,
+                required: false,
+                default: None,
+                domain: Domain::OfType,
+            },
+        ]
+    })
+}
+
+/// Bellman-Ford algorithm wrapper for the plugin registry.
+pub struct BellmanFordAlgorithm;
+
+impl_algorithm! {
+    BellmanFordAlgorithm,
+    name: "bellman_ford",
+    description: "Bellman-Ford shortest path algorithm (handles negative weights)",
+    params: bellman_ford_params,
+    compute(store, params) {
+        let source_id = params.required_int("source")?;
+
+        let source = node_id_from_param(source_id, "source")?;
+        let weight_prop = params.get_string("weight");
+
+        let bf_result = bellman_ford_on(store, source, weight_prop)?;
+
+        let mut result = AlgorithmResult::new(vec![
+            "node_id".to_string(),
+            "distance".to_string(),
+            "has_negative_cycle".to_string(),
+        ]);
+
+        for (node, distance) in bf_result.distances {
+            // reason: Node IDs are sequential counters, well within i64::MAX
+            #[allow(clippy::cast_possible_wrap)]
+            result.add_row(vec![
+                Value::Int64(node.0 as i64),
+                Value::Float64(distance),
+                Value::Bool(bf_result.has_negative_cycle),
+            ]);
+        }
+
+        result.sort_by_id_columns(1);
+        Ok(result)
+    }
+}
+
+/// Static parameter definitions for Floyd-Warshall algorithm.
+static FLOYD_WARSHALL_PARAMS: OnceLock<Vec<ParameterDef>> = OnceLock::new();
+
+fn floyd_warshall_params() -> &'static [ParameterDef] {
+    FLOYD_WARSHALL_PARAMS.get_or_init(|| {
+        vec![ParameterDef {
+            name: "weight".to_string(),
+            description: "Edge property name for weights (default: 1.0)".to_string(),
+            param_type: ParameterType::String,
+            required: false,
+            default: None,
+            domain: Domain::OfType,
+        }]
+    })
+}
+
+/// Floyd-Warshall algorithm wrapper for the plugin registry.
+pub struct FloydWarshallAlgorithm;
+
+impl_algorithm! {
+    FloydWarshallAlgorithm,
+    name: "floyd_warshall",
+    description: "Floyd-Warshall all-pairs shortest paths algorithm",
+    params: floyd_warshall_params,
+    compute(store, params) {
+        let weight_prop = params.get_string("weight");
+
+        let fw_result = floyd_warshall_on(store, weight_prop)?;
+
+        let mut result = AlgorithmResult::new(vec![
+            "source".to_string(),
+            "target".to_string(),
+            "distance".to_string(),
+        ]);
+
+        // Output all pairs with finite distances
+        for (i, &from_node) in fw_result.index_to_node.iter().enumerate() {
+            for (j, &to_node) in fw_result.index_to_node.iter().enumerate() {
+                let dist = fw_result.distances[i][j];
+                if dist < f64::INFINITY {
+                    // reason: Node IDs are sequential counters, well within i64::MAX
+                    #[allow(clippy::cast_possible_wrap)]
+                    result.add_row(vec![
+                        Value::Int64(from_node.0 as i64),
+                        Value::Int64(to_node.0 as i64),
+                        Value::Float64(dist),
+                    ]);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::Parameters;
+    use grafeo_common::types::ReadView;
+
+    fn create_weighted_graph() -> RowGroupStore {
+        let store = RowGroupStore::new();
+
+        // Create a weighted graph:
+        //   0 --2--> 1 --3--> 2
+        //   |        ^        |
+        //   4        1        1
+        //   v        |        v
+        //   3 -------+        4
+        //
+        // Shortest path from 0 to 2: 0 -> 3 -> 1 -> 2 (cost: 4+1+3 = 8)
+        // vs direct: 0 -> 1 -> 2 (cost: 2+3 = 5)
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        let n2 = store.create_node(&["Node"]);
+        let n3 = store.create_node(&["Node"]);
+        let n4 = store.create_node(&["Node"]);
+
+        // Create edges with weights
+        store.create_edge_with_props(
+            n0,
+            n1,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(2.0))],
+        );
+        store.create_edge_with_props(
+            n1,
+            n2,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(3.0))],
+        );
+        store.create_edge_with_props(
+            n0,
+            n3,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(4.0))],
+        );
+        store.create_edge_with_props(
+            n3,
+            n1,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(1.0))],
+        );
+        store.create_edge_with_props(
+            n2,
+            n4,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(1.0))],
+        );
+
+        store
+    }
+
+    #[test]
+    fn decimal_weights_choose_the_astar_route() {
+        use grafeo_common::types::Decimal;
+
+        for (weight, distance) in [
+            (Decimal::new(2500, 4).unwrap(), 0.75),
+            (Decimal::new(0, 4).unwrap(), 0.5),
+        ] {
+            let store = RowGroupStore::new();
+            let source = store.create_node(&["Node"]);
+            let via = store.create_node(&["Node"]);
+            let target = store.create_node(&["Node"]);
+            for (from, to, value) in [
+                (source, via, Value::Decimal(weight)),
+                (via, target, Value::Float64(0.5)),
+                (source, target, Value::Int64(1)),
+            ] {
+                store.create_edge_with_props(from, to, "R", &[(PropertyKey::new("w"), value)]);
+            }
+            assert_eq!(
+                astar(
+                    &store,
+                    ReadView::latest(),
+                    source,
+                    target,
+                    Some("w"),
+                    |_| 0.0
+                )
+                .unwrap(),
+                Some((distance, vec![source, via, target]))
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_weights_keep_zero_and_negative_distances() {
+        use grafeo_common::types::Decimal;
+
+        let store = RowGroupStore::new();
+        let source = store.create_node(&["Node"]);
+        let via = store.create_node(&["Node"]);
+        let target = store.create_node(&["Node"]);
+        for (from, to, value) in [
+            (source, via, Value::Decimal(Decimal::new(-25, 2).unwrap())),
+            (via, target, Value::Decimal(Decimal::new(0, 3).unwrap())),
+            (source, target, Value::Int64(1)),
+        ] {
+            store.create_edge_with_props(from, to, "R", &[(PropertyKey::new("w"), value)]);
+        }
+        let single = bellman_ford(&store, ReadView::latest(), source, Some("w")).unwrap();
+        assert!(!single.has_negative_cycle);
+        assert_eq!(single.distances.get(&target).copied(), Some(-0.25));
+        assert_eq!(single.path_to(target), Some(vec![source, via, target]));
+        let all = floyd_warshall(&store, ReadView::latest(), Some("w")).unwrap();
+        assert!(!all.has_negative_cycle());
+        assert_eq!(all.distance(source, target), Some(-0.25));
+        assert_eq!(all.path(source, target), Some(vec![source, via, target]));
+    }
+
+    #[test]
+    fn test_dijkstra_basic() {
+        let store = create_weighted_graph();
+        let result = dijkstra(&store, ReadView::latest(), NodeId::new(0), Some("weight")).unwrap();
+
+        // From the graph: 0->1 cost 2, 0->1->2 cost 5, 0->3 cost 4, 0->3->1 cost 5
+        assert_eq!(result.distance_to(NodeId::new(0)), Some(0.0));
+        assert_eq!(result.distance_to(NodeId::new(1)), Some(2.0));
+        assert_eq!(result.distance_to(NodeId::new(2)), Some(5.0));
+        assert_eq!(result.distance_to(NodeId::new(3)), Some(4.0));
+        assert_eq!(result.distance_to(NodeId::new(4)), Some(6.0)); // 0->1->2->4 = 2+3+1
+    }
+
+    #[test]
+    fn test_dijkstra_path() {
+        let store = create_weighted_graph();
+        let result = dijkstra(&store, ReadView::latest(), NodeId::new(0), Some("weight")).unwrap();
+
+        let path = result.path_to(NodeId::new(0), NodeId::new(2));
+        assert!(path.is_some());
+
+        let path = path.unwrap();
+        assert_eq!(path[0], NodeId::new(0)); // Start
+        assert_eq!(*path.last().unwrap(), NodeId::new(2)); // End
+    }
+
+    #[test]
+    fn test_dijkstra_single_pair() {
+        let store = create_weighted_graph();
+        let result = dijkstra_path(
+            &store,
+            ReadView::latest(),
+            NodeId::new(0),
+            NodeId::new(4),
+            Some("weight"),
+        )
+        .unwrap();
+
+        assert!(result.is_some());
+        let (distance, path) = result.unwrap();
+        assert!(distance > 0.0);
+        assert_eq!(path[0], NodeId::new(0));
+        assert_eq!(*path.last().unwrap(), NodeId::new(4));
+    }
+
+    #[test]
+    fn test_dijkstra_unreachable() {
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let _n1 = store.create_node(&["Node"]); // Disconnected
+
+        let result = dijkstra_path(&store, ReadView::latest(), n0, NodeId::new(1), None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_bellman_ford_basic() {
+        let store = create_weighted_graph();
+        let result =
+            bellman_ford(&store, ReadView::latest(), NodeId::new(0), Some("weight")).unwrap();
+
+        assert!(!result.has_negative_cycle);
+        assert!(result.distances.contains_key(&NodeId::new(0)));
+        assert_eq!(*result.distances.get(&NodeId::new(0)).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_bellman_ford_negative_weights() {
+        // Graph with a negative edge weight (no cycle):
+        //   0 --10--> 1 --(-5)--> 2
+        //
+        // Shortest: 0 -> 1 -> 2 = 10 + (-5) = 5
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        let n2 = store.create_node(&["Node"]);
+
+        store.create_edge_with_props(
+            n0,
+            n1,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(10.0))],
+        );
+        store.create_edge_with_props(
+            n1,
+            n2,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(-5.0))],
+        );
+
+        let result = bellman_ford(&store, ReadView::latest(), n0, Some("weight")).unwrap();
+
+        assert!(!result.has_negative_cycle);
+        assert_eq!(*result.distances.get(&n0).unwrap(), 0.0);
+        assert_eq!(*result.distances.get(&n1).unwrap(), 10.0);
+        assert_eq!(*result.distances.get(&n2).unwrap(), 5.0);
+
+        // Path reconstruction
+        let path = result.path_to(n2).unwrap();
+        assert_eq!(path, vec![n0, n1, n2]);
+    }
+
+    #[test]
+    fn test_bellman_ford_negative_weight_shortcut() {
+        // Graph where negative edge creates a shorter path:
+        //   0 --6--> 1 --2--> 3
+        //   |                 ^
+        //   +--3--> 2 --(-4)--+
+        //
+        // Direct: 0->1->3 = 8
+        // Via negative: 0->2->3 = 3+(-4) = -1  (shorter!)
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        let n2 = store.create_node(&["Node"]);
+        let n3 = store.create_node(&["Node"]);
+
+        store.create_edge_with_props(
+            n0,
+            n1,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(6.0))],
+        );
+        store.create_edge_with_props(
+            n1,
+            n3,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(2.0))],
+        );
+        store.create_edge_with_props(
+            n0,
+            n2,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(3.0))],
+        );
+        store.create_edge_with_props(
+            n2,
+            n3,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(-4.0))],
+        );
+
+        let result = bellman_ford(&store, ReadView::latest(), n0, Some("weight")).unwrap();
+
+        assert!(!result.has_negative_cycle);
+        assert_eq!(*result.distances.get(&n3).unwrap(), -1.0);
+
+        let path = result.path_to(n3).unwrap();
+        assert_eq!(path, vec![n0, n2, n3]);
+    }
+
+    #[test]
+    fn test_bellman_ford_negative_cycle_detection() {
+        // Graph with a negative cycle:
+        //   0 --1--> 1 --1--> 2
+        //            ^        |
+        //            +--(-3)--+
+        //
+        // Cycle: 1 -> 2 -> 1 with total weight 1 + (-3) = -2 (negative!)
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        let n2 = store.create_node(&["Node"]);
+
+        store.create_edge_with_props(
+            n0,
+            n1,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(1.0))],
+        );
+        store.create_edge_with_props(
+            n1,
+            n2,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(1.0))],
+        );
+        store.create_edge_with_props(
+            n2,
+            n1,
+            "EDGE",
+            &[(PropertyKey::new("weight"), Value::Float64(-3.0))],
+        );
+
+        let result = bellman_ford(&store, ReadView::latest(), n0, Some("weight")).unwrap();
+
+        assert!(
+            result.has_negative_cycle,
+            "Should detect negative cycle: 1->2->1 with total weight -2"
+        );
+    }
+
+    #[test]
+    fn test_floyd_warshall_basic() {
+        let store = create_weighted_graph();
+        let result = floyd_warshall(&store, ReadView::latest(), Some("weight")).unwrap();
+
+        // Self-distances should be 0
+        assert_eq!(result.distance(NodeId::new(0), NodeId::new(0)), Some(0.0));
+        assert_eq!(result.distance(NodeId::new(1), NodeId::new(1)), Some(0.0));
+
+        // Check some paths exist
+        assert!(result.distance(NodeId::new(0), NodeId::new(2)).is_some());
+    }
+
+    #[test]
+    fn test_floyd_warshall_path_reconstruction() {
+        let store = create_weighted_graph();
+        let result = floyd_warshall(&store, ReadView::latest(), Some("weight")).unwrap();
+
+        let path = result.path(NodeId::new(0), NodeId::new(2));
+        assert!(path.is_some());
+
+        let path = path.unwrap();
+        assert_eq!(path[0], NodeId::new(0));
+        assert_eq!(*path.last().unwrap(), NodeId::new(2));
+    }
+
+    #[test]
+    fn test_astar_basic() {
+        let store = create_weighted_graph();
+
+        // Simple heuristic: always return 0 (degenerates to Dijkstra)
+        let heuristic = |_: NodeId| 0.0;
+
+        let result = astar(
+            &store,
+            ReadView::latest(),
+            NodeId::new(0),
+            NodeId::new(4),
+            Some("weight"),
+            heuristic,
+        )
+        .unwrap();
+        assert!(result.is_some());
+
+        let (distance, path) = result.unwrap();
+        assert!(distance > 0.0);
+        assert_eq!(path[0], NodeId::new(0));
+        assert_eq!(*path.last().unwrap(), NodeId::new(4));
+    }
+
+    #[test]
+    fn test_dijkstra_nonexistent_source() {
+        let store = RowGroupStore::new();
+        let result = dijkstra(&store, ReadView::latest(), NodeId::new(999), None).unwrap();
+        assert!(result.distances.is_empty());
+    }
+
+    #[test]
+    fn test_unweighted_defaults() {
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        let n2 = store.create_node(&["Node"]);
+        store.create_edge(n0, n1, "EDGE");
+        store.create_edge(n1, n2, "EDGE");
+
+        // Without weight property, should default to 1.0 per edge
+        let result = dijkstra(&store, ReadView::latest(), n0, None).unwrap();
+        assert_eq!(result.distance_to(n1), Some(1.0));
+        assert_eq!(result.distance_to(n2), Some(2.0));
+    }
+
+    #[test]
+    fn test_sssp_with_named_nodes() {
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        let n2 = store.create_node(&["Node"]);
+        store.set_node_property(n0, "name", Value::from("alix"));
+        store.set_node_property(n1, "name", Value::from("gus"));
+        store.set_node_property(n2, "name", Value::from("harm"));
+        store.create_edge_with_props(
+            n0,
+            n1,
+            "KNOWS",
+            &[(PropertyKey::new("weight"), Value::Float64(1.0))],
+        );
+        store.create_edge_with_props(
+            n1,
+            n2,
+            "KNOWS",
+            &[(PropertyKey::new("weight"), Value::Float64(2.0))],
+        );
+
+        let mut params = Parameters::new();
+        params.set_string("source", "alix");
+        params.set_string("weight", "weight");
+
+        let result = SsspAlgorithm
+            .execute(&store, ReadView::latest(), &params)
+            .unwrap();
+        assert_eq!(result.columns, vec!["node_id", "distance"]);
+        assert_eq!(result.row_count(), 3); // alix, gus, harm
+    }
+
+    #[test]
+    fn test_sssp_with_numeric_source() {
+        let store = RowGroupStore::new();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        store.create_edge(n0, n1, "EDGE");
+
+        let mut params = Parameters::new();
+        params.set_string("source", n0.0.to_string());
+
+        let result = SsspAlgorithm
+            .execute(&store, ReadView::latest(), &params)
+            .unwrap();
+        assert_eq!(result.row_count(), 2);
+    }
+
+    #[test]
+    fn test_sssp_nonexistent_name() {
+        let store = RowGroupStore::new();
+        let _n0 = store.create_node(&["Node"]);
+
+        let mut params = Parameters::new();
+        params.set_string("source", "nonexistent");
+
+        let result = SsspAlgorithm.execute(&store, ReadView::latest(), &params);
+        assert!(result.is_err());
+    }
+}

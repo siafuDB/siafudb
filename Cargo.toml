@@ -14,19 +14,25 @@ resolver = "2"
 #   siafudb-server  — Optional standalone server mode for development and testing.
 #   siafudb         — The unified crate that re-exports everything. What users depend on.
 
+exclude = [
+  "engine",
+] # vendored fork: its own workspace (engine/Cargo.toml), published separately
 members = [
-    "crates/siafudb",
-    "crates/siafudb-core",
-    "crates/siafudb-sync",
-    "crates/siafudb-access",
-    "crates/siafudb-server",
+  "crates/siafudb",
+  "crates/siafudb-core",
+  "crates/siafudb-sync",
+  "crates/siafudb-access",
+  "crates/siafudb-server",
+  "crates/siafudb-wasm",
+  "crates/siafudb-ffi",
+  "crates/siafudb-store",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/nyuchi/siafudb"
+repository = "https://github.com/siafuDB/siafudb"
 homepage = "https://siafudb.org"
 description = "The embedded graph database for device, edge, and Web3. Replaces SQLite with graph-native storage."
 keywords = ["database", "graph", "embedded", "edge", "web3"]
@@ -37,7 +43,11 @@ categories = ["database", "data-structures"]
 # GrafeoDB is our foundation. We depend on it as a library and build
 # SiafuDB-specific capabilities on top. If the relationship evolves,
 # we can fork or reimplement — but we start with dependency, not divergence.
-grafeo = { version = "0.5", features = ["gql", "cypher", "wal"] }
+# default-features off: each consumer picks a profile (siafudb-core: `native` or `browser`).
+grafeo = { package = "siafudb-graph", version = "0.1.0", path = "engine/grafeo", default-features = false, features = [
+  "gql",
+  "cypher",
+] }
 
 # === Serialization & Data ===
 serde = { version = "1", features = ["derive"] }
@@ -61,7 +71,9 @@ crossbeam = "0.8"
 # === Conflict Resolution ===
 # Vector clocks for causal ordering in the sync protocol.
 # CRDTs for conflict-free merge of concurrent mutations.
-uuid = { version = "1", features = ["v4", "serde"] }
+# `js` is a no-op off wasm; on wasm32-unknown-unknown it supplies randomness.
+uuid = { version = "1", features = ["v4", "serde", "js"] }
+web-time = "1"
 
 # === Error Handling ===
 thiserror = "2"
@@ -73,3 +85,19 @@ tracing-subscriber = "0.3"
 
 # === Testing ===
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# Smaller build artifacts (the engine is large; disk is finite on CI and in
+# agent sandboxes).
+[profile.dev]
+debug = "line-tables-only"
+[profile.test]
+debug = "line-tables-only"
+
+# Size-optimised profile for the browser wasm build (packages/siafudb-web/scripts/build-wasm.mjs).
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

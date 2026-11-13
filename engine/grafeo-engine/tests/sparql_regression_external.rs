@@ -1,0 +1,544 @@
+//! Regression tests for SPARQL query execution, inspired by bugs found
+//! in other RDF databases (Oxigraph, Blazegraph, Jena, RDF4J).
+//!
+//! ```bash
+//! cargo test -p grafeo-engine --all-features --test main sparql_regression_external::
+//! ```
+
+#[cfg(all(feature = "sparql", feature = "triple-store"))]
+mod tests {
+    use grafeo_engine::GrafeoDB;
+
+    fn rdf_db() -> GrafeoDB {
+        GrafeoDB::new_in_memory()
+    }
+
+    fn insert_people(db: &GrafeoDB) {
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <http://ex.org/alix> <http://ex.org/name> "Alix" .
+                <http://ex.org/alix> <http://ex.org/age>  "30" .
+                <http://ex.org/gus>  <http://ex.org/name> "Gus" .
+                <http://ex.org/gus>  <http://ex.org/age>  "25" .
+                <http://ex.org/vincent> <http://ex.org/name> "Vincent" .
+            }"#,
+        )
+        .unwrap();
+    }
+
+    // ========================================================================
+    // OPTIONAL clause correctness
+    // Inspired by Oxigraph #1200: second OPTIONAL hides first result.
+    // ========================================================================
+
+    #[test]
+    fn optional_unmatched_produces_null_binding() {
+        let db = rdf_db();
+        insert_people(&db);
+
+        // Vincent has name but no age
+        let r = db
+            .execute_sparql(
+                r#"SELECT ?name ?age WHERE {
+                    <http://ex.org/vincent> <http://ex.org/name> ?name .
+                    OPTIONAL { <http://ex.org/vincent> <http://ex.org/age> ?age }
+                }"#,
+            )
+            .unwrap();
+        assert_eq!(
+            r.row_count(),
+            1,
+            "OPTIONAL with no match should still return 1 row"
+        );
+    }
+
+    /// The query of #361 (three `OPTIONAL` patterns that bind, `LIMIT`, no
+    /// `ORDER BY`) and its variants run on a 128 KB stack. Hosts such as a
+    /// BEAM dirty scheduler (about 320 KB) run queries on small stacks, and a
+    /// stack overflow aborts the process. Linux enforces the size; it needed
+    /// about 31 KB when this test was written.
+    #[test]
+    fn optionals_with_a_limit_run_on_a_small_stack() {
+        const STACK: usize = 128 * 1024;
+        let db = std::sync::Arc::new(rdf_db());
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <http://ex.org/kv1> <http://ex.org/version_public_key> "deadbeefcafe" .
+                <http://ex.org/kv1> <http://ex.org/version> "1" .
+                <http://ex.org/kv1> <http://ex.org/status> "active" .
+                <http://ex.org/kv1> <http://ex.org/valid_until> "2027-01-01" .
+            }"#,
+        )
+        .unwrap();
+        let pattern = r#"?kv <http://ex.org/version_public_key> "deadbeefcafe" .
+            OPTIONAL { ?kv <http://ex.org/version> ?version }
+            OPTIONAL { ?kv <http://ex.org/status> ?status }
+            OPTIONAL { ?kv <http://ex.org/valid_until> ?valid_until }"#;
+        for tail in ["LIMIT 1", "", "ORDER BY ?version LIMIT 1"] {
+            let query =
+                format!("SELECT ?version ?status ?valid_until WHERE {{ {pattern} }} {tail}");
+            let db = std::sync::Arc::clone(&db);
+            let rows = std::thread::Builder::new()
+                .stack_size(STACK)
+                .spawn(move || db.execute_sparql(&query).map(|r| r.rows().to_vec()))
+                .unwrap()
+                .join()
+                .expect("the query thread does not panic")
+                .unwrap();
+            assert_eq!(
+                format!("{rows:?}"),
+                r#"[[RdfTerm("1"), RdfTerm("active"), RdfTerm("2027-01-01")]]"#,
+                "{tail}"
+            );
+        }
+    }
+
+    /// The #361 query shapes on a 128 KB stack, as reported: a database
+    /// file reopened after a close, in the default graph and inside a named
+    /// `GRAPH`, with the reporter's literal and IRI shapes.
+    #[test]
+    fn optionals_with_a_limit_run_on_a_small_stack_in_a_reopened_file() {
+        const STACK: usize = 128 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kv.grafeo");
+        let triples = r#"<urn:substrate:kv1> <urn:substrate:version_public_key> "deadbeefcafe" .
+            <urn:substrate:kv1> <urn:substrate:version> "1" .
+            <urn:substrate:kv1> <urn:substrate:status> "active" .
+            <urn:substrate:kv1> <urn:substrate:valid_until> "2027-01-01" ."#;
+        {
+            let db = GrafeoDB::open(&path).unwrap();
+            db.execute_sparql(&format!(
+                "INSERT DATA {{ {triples} GRAPH <urn:substrate:keys> {{ {triples} }} }}"
+            ))
+            .unwrap();
+            db.close().unwrap();
+        }
+
+        let db = std::sync::Arc::new(GrafeoDB::open(&path).unwrap());
+        let pattern = r#"?kv <urn:substrate:version_public_key> "deadbeefcafe" .
+            OPTIONAL { ?kv <urn:substrate:version> ?version }
+            OPTIONAL { ?kv <urn:substrate:status> ?status }
+            OPTIONAL { ?kv <urn:substrate:valid_until> ?valid_until }"#;
+        for graph in [None, Some("urn:substrate:keys")] {
+            let body = match graph {
+                Some(name) => format!("GRAPH <{name}> {{ {pattern} }}"),
+                None => pattern.to_string(),
+            };
+            for tail in ["LIMIT 1", "", "ORDER BY ?version LIMIT 1"] {
+                let query =
+                    format!("SELECT ?version ?status ?valid_until WHERE {{ {body} }} {tail}");
+                let db = std::sync::Arc::clone(&db);
+                let rows = std::thread::Builder::new()
+                    .stack_size(STACK)
+                    .spawn(move || db.execute_sparql(&query).map(|r| r.rows().to_vec()))
+                    .unwrap()
+                    .join()
+                    .expect("the query thread does not panic")
+                    .unwrap();
+                assert_eq!(
+                    format!("{rows:?}"),
+                    r#"[[RdfTerm("1"), RdfTerm("active"), RdfTerm("2027-01-01")]]"#,
+                    "{graph:?} {tail}"
+                );
+            }
+        }
+    }
+
+    /// The #361 query shapes from four threads at once, each on a 128 KB
+    /// stack, as a host with several small-stack schedulers runs them, while
+    /// a fifth thread inserts other keys: every read returns the one row of
+    /// its key, and no thread overflows its stack.
+    #[test]
+    fn optionals_with_a_limit_run_on_four_small_stacks_at_once() {
+        const STACK: usize = 128 * 1024;
+        let db = rdf_db();
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <http://ex.org/kv1> <http://ex.org/version_public_key> "deadbeefcafe" .
+                <http://ex.org/kv1> <http://ex.org/version> "1" .
+                <http://ex.org/kv1> <http://ex.org/status> "active" .
+                <http://ex.org/kv1> <http://ex.org/valid_until> "2027-01-01" .
+            }"#,
+        )
+        .unwrap();
+        let pattern = r#"?kv <http://ex.org/version_public_key> "deadbeefcafe" .
+            OPTIONAL { ?kv <http://ex.org/version> ?version }
+            OPTIONAL { ?kv <http://ex.org/status> ?status }
+            OPTIONAL { ?kv <http://ex.org/valid_until> ?valid_until }"#;
+        let queries: Vec<String> = ["LIMIT 1", "", "ORDER BY ?version LIMIT 1"]
+            .iter()
+            .map(|tail| {
+                format!("SELECT ?version ?status ?valid_until WHERE {{ {pattern} }} {tail}")
+            })
+            .collect();
+        let start = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..4)
+                .map(|reader| {
+                    let (db, queries, start) = (&db, &queries, &start);
+                    std::thread::Builder::new()
+                        .stack_size(STACK)
+                        .spawn_scoped(scope, move || {
+                            start.wait();
+                            for round in 0..25 {
+                                for query in queries {
+                                    let rows = db.execute_sparql(query).unwrap().rows().to_vec();
+                                    assert_eq!(
+                                        format!("{rows:?}"),
+                                        r#"[[RdfTerm("1"), RdfTerm("active"), RdfTerm("2027-01-01")]]"#,
+                                        "reader {reader}, round {round}: {query}"
+                                    );
+                                }
+                            }
+                        })
+                        .unwrap()
+                })
+                .collect();
+            let (db, start) = (&db, &start);
+            scope.spawn(move || {
+                start.wait();
+                for key in 2..50 {
+                    db.execute_sparql(&format!(
+                        r#"INSERT DATA {{
+                            <http://ex.org/kv{key}> <http://ex.org/version_public_key> "key{key}" .
+                            <http://ex.org/kv{key}> <http://ex.org/version> "{key}" .
+                        }}"#
+                    ))
+                    .unwrap();
+                }
+            });
+            for reader in readers {
+                reader.join().expect("the reader thread does not panic");
+            }
+        });
+        let keys = db
+            .execute_sparql(
+                "SELECT (COUNT(?kv) AS ?n) WHERE { ?kv <http://ex.org/version_public_key> ?key }",
+            )
+            .unwrap();
+        assert_eq!(
+            format!("{:?}", keys.rows()),
+            r#"[[RdfTerm("49"^^<http://www.w3.org/2001/XMLSchema#integer>)]]"#
+        );
+    }
+
+    #[test]
+    fn multiple_optionals_preserve_results() {
+        let db = rdf_db();
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <http://ex.org/x> <http://ex.org/name> "X" .
+                <http://ex.org/x> <http://ex.org/age>  "10" .
+            }"#,
+        )
+        .unwrap();
+
+        // Both OPTIONALLs match
+        let r = db
+            .execute_sparql(
+                r#"SELECT ?name ?age ?extra WHERE {
+                    <http://ex.org/x> <http://ex.org/name> ?name .
+                    OPTIONAL { <http://ex.org/x> <http://ex.org/age> ?age }
+                    OPTIONAL { <http://ex.org/x> <http://ex.org/extra> ?extra }
+                }"#,
+            )
+            .unwrap();
+        assert_eq!(
+            r.row_count(),
+            1,
+            "Multiple OPTIONALLs must not cause the base result to disappear"
+        );
+    }
+
+    // ========================================================================
+    // COUNT on empty result set
+    // Inspired by RDF4J #1978: aggregate on empty set behavior.
+    // ========================================================================
+
+    #[test]
+    fn count_on_empty_returns_zero() {
+        let db = rdf_db();
+        let r = db
+            .execute_sparql(
+                "SELECT (COUNT(?s) AS ?cnt) WHERE { ?s <http://ex.org/nonexistent> ?o }",
+            )
+            .unwrap();
+        assert_eq!(r.row_count(), 1, "COUNT over empty should return 1 row");
+        // COUNT of empty set is 0 per SPARQL spec
+    }
+
+    // ========================================================================
+    // UNION semantics
+    // ========================================================================
+
+    #[test]
+    fn union_returns_both_branches() {
+        let db = rdf_db();
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <http://ex.org/a> <http://ex.org/name> "Alix" .
+                <http://ex.org/a> <http://ex.org/city> "Amsterdam" .
+            }"#,
+        )
+        .unwrap();
+
+        let r = db
+            .execute_sparql(
+                r#"SELECT ?val WHERE {
+                    { <http://ex.org/a> <http://ex.org/name> ?val }
+                    UNION
+                    { <http://ex.org/a> <http://ex.org/city> ?val }
+                }"#,
+            )
+            .unwrap();
+        assert_eq!(
+            r.row_count(),
+            2,
+            "UNION must return results from both branches"
+        );
+    }
+
+    // ========================================================================
+    // FILTER edge cases
+    // ========================================================================
+
+    #[test]
+    fn filter_greater_than() {
+        let db = rdf_db();
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <http://ex.org/a> <http://ex.org/val> "10" .
+                <http://ex.org/b> <http://ex.org/val> "20" .
+                <http://ex.org/c> <http://ex.org/val> "30" .
+            }"#,
+        )
+        .unwrap();
+
+        let r = db
+            .execute_sparql(r#"SELECT ?v WHERE { ?s <http://ex.org/val> ?v FILTER(?v > "15") }"#)
+            .unwrap();
+        assert_eq!(r.row_count(), 2, "FILTER > should match 20 and 30");
+    }
+
+    #[test]
+    fn filter_not_exists() {
+        let db = rdf_db();
+        insert_people(&db);
+
+        // Vincent has name but no age
+        let r = db
+            .execute_sparql(
+                r#"SELECT ?n WHERE {
+                    ?s <http://ex.org/name> ?n .
+                    FILTER NOT EXISTS { ?s <http://ex.org/age> ?a }
+                }"#,
+            )
+            .unwrap();
+        assert_eq!(r.row_count(), 1, "Only Vincent has name without age");
+    }
+
+    // ========================================================================
+    // DISTINCT deduplication
+    // ========================================================================
+
+    #[test]
+    fn select_distinct_deduplicates() {
+        let db = rdf_db();
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <http://ex.org/a> <http://ex.org/type> "Person" .
+                <http://ex.org/b> <http://ex.org/type> "Person" .
+                <http://ex.org/c> <http://ex.org/type> "City" .
+            }"#,
+        )
+        .unwrap();
+
+        let r = db
+            .execute_sparql(r#"SELECT DISTINCT ?t WHERE { ?s <http://ex.org/type> ?t }"#)
+            .unwrap();
+        assert_eq!(
+            r.row_count(),
+            2,
+            "DISTINCT should collapse duplicate 'Person' to 1"
+        );
+    }
+
+    // ========================================================================
+    // INSERT DATA and DELETE DATA correctness
+    // ========================================================================
+
+    #[test]
+    fn insert_and_query_roundtrip() {
+        let db = rdf_db();
+        db.execute_sparql(r#"INSERT DATA { <http://ex.org/x> <http://ex.org/p> "hello" . }"#)
+            .unwrap();
+
+        let r = db
+            .execute_sparql("SELECT ?o WHERE { <http://ex.org/x> <http://ex.org/p> ?o }")
+            .unwrap();
+        assert_eq!(r.row_count(), 1);
+    }
+
+    #[test]
+    fn delete_data_removes_triple() {
+        let db = rdf_db();
+        db.execute_sparql(r#"INSERT DATA { <http://ex.org/x> <http://ex.org/p> "hello" . }"#)
+            .unwrap();
+        db.execute_sparql(r#"DELETE DATA { <http://ex.org/x> <http://ex.org/p> "hello" . }"#)
+            .unwrap();
+
+        let r = db
+            .execute_sparql("SELECT ?o WHERE { <http://ex.org/x> <http://ex.org/p> ?o }")
+            .unwrap();
+        assert_eq!(r.row_count(), 0, "Deleted triple must not be visible");
+    }
+
+    #[test]
+    fn delete_then_reinsert() {
+        let db = rdf_db();
+        db.execute_sparql(r#"INSERT DATA { <http://ex.org/x> <http://ex.org/p> "old" . }"#)
+            .unwrap();
+        db.execute_sparql(r#"DELETE DATA { <http://ex.org/x> <http://ex.org/p> "old" . }"#)
+            .unwrap();
+        db.execute_sparql(r#"INSERT DATA { <http://ex.org/x> <http://ex.org/p> "new" . }"#)
+            .unwrap();
+
+        let r = db
+            .execute_sparql("SELECT ?o WHERE { <http://ex.org/x> <http://ex.org/p> ?o }")
+            .unwrap();
+        assert_eq!(r.row_count(), 1, "Re-inserted triple must be visible");
+    }
+
+    // ========================================================================
+    // LIMIT and OFFSET
+    // ========================================================================
+
+    #[test]
+    fn limit_restricts_results() {
+        let db = rdf_db();
+        for i in 0..10 {
+            db.execute_sparql(&format!(
+                r#"INSERT DATA {{ <http://ex.org/n{i}> <http://ex.org/val> "{i}" . }}"#
+            ))
+            .unwrap();
+        }
+
+        let r = db
+            .execute_sparql("SELECT ?s WHERE { ?s <http://ex.org/val> ?v } LIMIT 3")
+            .unwrap();
+        assert_eq!(r.row_count(), 3, "LIMIT 3 should return exactly 3 rows");
+    }
+
+    #[test]
+    fn offset_skips_rows() {
+        let db = rdf_db();
+        for i in 0..5 {
+            db.execute_sparql(&format!(
+                r#"INSERT DATA {{ <http://ex.org/n{i}> <http://ex.org/val> "{i}" . }}"#
+            ))
+            .unwrap();
+        }
+
+        let all = db
+            .execute_sparql("SELECT ?v WHERE { ?s <http://ex.org/val> ?v } ORDER BY ?v")
+            .unwrap();
+        let offset = db
+            .execute_sparql("SELECT ?v WHERE { ?s <http://ex.org/val> ?v } ORDER BY ?v OFFSET 2")
+            .unwrap();
+        assert_eq!(
+            offset.row_count(),
+            all.row_count() - 2,
+            "OFFSET 2 should skip 2 rows"
+        );
+    }
+
+    // ========================================================================
+    // ORDER BY correctness
+    // ========================================================================
+
+    #[test]
+    fn order_by_ascending() {
+        let db = rdf_db();
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <http://ex.org/c> <http://ex.org/name> "Vincent" .
+                <http://ex.org/a> <http://ex.org/name> "Alix" .
+                <http://ex.org/b> <http://ex.org/name> "Gus" .
+            }"#,
+        )
+        .unwrap();
+
+        let r = db
+            .execute_sparql("SELECT ?n WHERE { ?s <http://ex.org/name> ?n } ORDER BY ?n")
+            .unwrap();
+        assert_eq!(r.row_count(), 3);
+        // First result should be alphabetically first
+    }
+
+    // ========================================================================
+    // GROUP BY with COUNT
+    // Inspired by Oxigraph #646: GROUP BY with HAVING returns 0 rows.
+    // ========================================================================
+
+    #[test]
+    fn group_by_with_count() {
+        let db = rdf_db();
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <http://ex.org/a> <http://ex.org/type> "Person" .
+                <http://ex.org/b> <http://ex.org/type> "Person" .
+                <http://ex.org/c> <http://ex.org/type> "City" .
+            }"#,
+        )
+        .unwrap();
+
+        let r = db
+            .execute_sparql(
+                r#"SELECT ?t (COUNT(?s) AS ?cnt) WHERE {
+                    ?s <http://ex.org/type> ?t
+                } GROUP BY ?t ORDER BY ?t"#,
+            )
+            .unwrap();
+        assert_eq!(r.row_count(), 2, "Should have 2 groups: City and Person");
+    }
+
+    // ========================================================================
+    // Multiple triple patterns in a single query
+    // ========================================================================
+
+    #[test]
+    fn join_two_triple_patterns() {
+        let db = rdf_db();
+        insert_people(&db);
+
+        let r = db
+            .execute_sparql(
+                r#"SELECT ?name ?age WHERE {
+                    ?s <http://ex.org/name> ?name .
+                    ?s <http://ex.org/age> ?age
+                } ORDER BY ?name"#,
+            )
+            .unwrap();
+        assert_eq!(r.row_count(), 2, "Alix and Gus have both name and age");
+    }
+
+    // ========================================================================
+    // REGEX filter
+    // ========================================================================
+
+    #[test]
+    fn filter_regex() {
+        let db = rdf_db();
+        insert_people(&db);
+
+        let r = db
+            .execute_sparql(
+                r#"SELECT ?n WHERE {
+                    ?s <http://ex.org/name> ?n
+                    FILTER(REGEX(?n, "^A"))
+                }"#,
+            )
+            .unwrap();
+        assert_eq!(r.row_count(), 1, "Only Alix starts with A");
+    }
+}

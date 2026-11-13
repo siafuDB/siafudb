@@ -1,0 +1,224 @@
+{
+  "1a_main": {
+    "aff": 0,
+    "q": {
+      "columns": ["p.name"],
+      "rows": [["String(\"Amara\")"], ["String(\"Tatenda\")"]]
+    }
+  },
+  "1b_worker": {
+    "aff": 0,
+    "q": {
+      "columns": ["p.name"],
+      "rows": [["String(\"Amara\")"], ["String(\"Tatenda\")"]]
+    },
+    "ms": 1,
+    "ctx": "worker"
+  },
+  "4_storage": {
+    "persisted_before": false,
+    "persist": false,
+    "persisted_after": false,
+    "estimate": {
+      "quota": 4294967296,
+      "usage": 0,
+      "usageDetails": {}
+    },
+    "isSecureContext": true,
+    "hasOPFS": true
+  },
+  "opfs_persist": {
+    "backend": "opfs",
+    "snapBytes": 3248,
+    "encBytes": 3276,
+    "plainHasSecret": true,
+    "encHasSecret": false,
+    "key": {
+      "dek": {},
+      "kekExtractable": false,
+      "kekCreated": true,
+      "wrappedLen": 60
+    }
+  },
+  "opfs_restore_after_reload": {
+    "found": true,
+    "rawBytes": 3276,
+    "rawHasSecret": false,
+    "kekCreated": false,
+    "cnt": {
+      "columns": ["count(d)"],
+      "rows": [["Int64(50)"]]
+    },
+    "one": {
+      "columns": ["d.name", "d.note"],
+      "rows": [["String(\"doc-7\")", "String(\"SECRET-PLAINTEXT-ZEBRA-7731\")"]]
+    },
+    "secretOk": true
+  },
+  "opfs_tamper": {
+    "rejected": true,
+    "err": "OperationError"
+  },
+  "idb_persist": {
+    "backend": "idb",
+    "snapBytes": 3248,
+    "encBytes": 3276,
+    "plainHasSecret": true,
+    "encHasSecret": false,
+    "key": {
+      "dek": {},
+      "kekExtractable": false,
+      "kekCreated": false,
+      "wrappedLen": 60
+    }
+  },
+  "idb_restore_after_reload": {
+    "found": true,
+    "rawBytes": 3276,
+    "rawHasSecret": false,
+    "kekCreated": false,
+    "cnt": {
+      "columns": ["count(d)"],
+      "rows": [["Int64(50)"]]
+    },
+    "one": {
+      "columns": ["d.name", "d.note"],
+      "rows": [["String(\"doc-7\")", "String(\"SECRET-PLAINTEXT-ZEBRA-7731\")"]]
+    },
+    "secretOk": true
+  },
+  "idb_tamper": {
+    "rejected": true,
+    "err": "OperationError"
+  },
+  "opfs_restore_newpage": {
+    "found": true,
+    "rawBytes": 3276,
+    "rawHasSecret": false,
+    "kekCreated": false,
+    "cnt": {
+      "columns": ["count(d)"],
+      "rows": [["Int64(50)"]]
+    },
+    "one": {
+      "columns": ["d.name", "d.note"],
+      "rows": [["String(\"doc-7\")", "String(\"SECRET-PLAINTEXT-ZEBRA-7731\")"]]
+    },
+    "secretOk": true
+  },
+  "5_cdc": {
+    "enabled_before": false,
+    "latest_epoch": "EpochId(3)",
+    "count": 3,
+    "events": [
+      {
+        "entity_id": {
+          "Node": 0
+        },
+        "kind": "Create",
+        "epoch": 1,
+        "timestamp": 117606168490934270,
+        "before": null,
+        "after": {
+          "n": {
+            "Int64": 1
+          },
+          "name": {
+            "String": "a"
+          }
+        },
+        "labels": ["P"]
+      },
+      {
+        "entity_id": {
+          "Node": 1
+        },
+        "kind": "Create",
+        "epoch": 2,
+        "timestamp": 117606168490999800,
+        "before": null,
+        "after": {
+          "n": {
+            "Int64": 2
+          },
+          "name": {
+            "String": "b"
+          }
+        },
+        "labels": ["P"]
+      },
+      {
+        "entity_id": {
+          "Node": 2
+        },
+        "kind": "Create",
+        "epoch": 3,
+        "timestamp": 117606168491065340,
+        "before": null,
+        "after": {
+          "name": {
+            "String": "c"
+          },
+          "n": {
+            "Int64": 3
+          }
+        },
+        "labels": ["P"]
+      }
+    ]
+  },
+  "6_bench": {
+    "n": 10000,
+    "insertMs": 897,
+    "exportMs": 38.10000000009313,
+    "encMs": 1.2999999998137355,
+    "writeMs": 7.7000000001862645,
+    "restoreMs": 57.5,
+    "snapBytes": 468148,
+    "encBytes": 468176,
+    "cnt": {
+      "columns": ["count(i)"],
+      "rows": [["Int64(10000)"]]
+    }
+  },
+  "pp_storage": {
+    "persisted_before": false,
+    "persist": false,
+    "persisted_after": false,
+    "estimate": {
+      "quota": 10737418240,
+      "usage": 0,
+      "usageDetails": {}
+    },
+    "isSecureContext": true,
+    "hasOPFS": true
+  },
+  "pp_persist": {
+    "backend": "opfs",
+    "snapBytes": 3248,
+    "encBytes": 3276,
+    "plainHasSecret": true,
+    "encHasSecret": false,
+    "key": {
+      "dek": {},
+      "kekExtractable": false,
+      "kekCreated": true,
+      "wrappedLen": 60
+    }
+  },
+  "pp_restore_after_browser_restart": {
+    "found": true,
+    "rawBytes": 3276,
+    "rawHasSecret": false,
+    "kekCreated": false,
+    "cnt": {
+      "columns": ["count(d)"],
+      "rows": [["Int64(50)"]]
+    },
+    "one": {
+      "columns": ["d.name", "d.note"],
+      "rows": [["String(\"doc-7\")", "String(\"SECRET-PLAINTEXT-ZEBRA-7731\")"]]
+    },
+    "secretOk": true
+  }
+}

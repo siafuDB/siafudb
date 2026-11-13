@@ -1,4 +1,5 @@
 [package]
+publish = false # not published yet; see docs/adr/0002
 name = "siafudb-server"
 version.workspace = true
 edition.workspace = true

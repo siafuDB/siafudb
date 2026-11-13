@@ -1,0 +1,606 @@
+//! Expression, literal, and operator translation.
+
+#[allow(clippy::wildcard_imports)]
+use super::*;
+use crate::query::functions::resolve_call;
+use crate::query::plan::BuiltinFunction;
+
+impl GqlTranslator {
+    /// A path function of a quantified edge's variable (`nodes(k)` of
+    /// `-[k]->{1,3}`, `length(k)`, `path_length(k)`, `edges(k)`): of the path
+    /// that edge walks, whose edges the variable lists, as SQL/PGQ reads it.
+    /// `None` for any other call.
+    pub(super) fn group_path_call(
+        &self,
+        name: &str,
+        args: &[ast::Expression],
+        distinct: bool,
+    ) -> Option<Result<LogicalExpression>> {
+        let [ast::Expression::Variable(variable)] = args else {
+            return None;
+        };
+        let call = match BuiltinFunction::from_name(name)? {
+            BuiltinFunction::Size | BuiltinFunction::PathLength => "path_length",
+            BuiltinFunction::Nodes | BuiltinFunction::Edges => name,
+            _ => return None,
+        };
+        let path = self.group_list_variables.borrow().get(variable).cloned()?;
+        Some(resolve_call(
+            call,
+            vec![LogicalExpression::Variable(path)],
+            distinct,
+        ))
+    }
+
+    pub(super) fn translate_expression(&self, expr: &ast::Expression) -> Result<LogicalExpression> {
+        match expr {
+            ast::Expression::Literal(lit) => Ok(self.translate_literal(lit)),
+            ast::Expression::Variable(name) => Ok(LogicalExpression::Variable(name.clone())),
+            ast::Expression::Parameter(name) => Ok(LogicalExpression::Parameter(name.clone())),
+            ast::Expression::PropertyAccess { variable, property } => {
+                Ok(LogicalExpression::Property {
+                    variable: variable.clone(),
+                    property: property.clone(),
+                })
+            }
+            ast::Expression::Binary { left, op, right } => {
+                let left = self.translate_expression(left)?;
+                let right = self.translate_expression(right)?;
+                let op = self.translate_binary_op(*op);
+                Ok(LogicalExpression::Binary {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                })
+            }
+            ast::Expression::Unary { op, operand } => {
+                let operand = self.translate_expression(operand)?;
+                let op = self.translate_unary_op(*op);
+                Ok(LogicalExpression::Unary {
+                    op,
+                    operand: Box::new(operand),
+                })
+            }
+            ast::Expression::FunctionCall {
+                name,
+                args,
+                distinct,
+            } => {
+                // `length(p)` stays a function of the path value: the planner
+                // reads the length column of a path the pattern binds, and
+                // computes it from the value of any other path (one passed on
+                // by a WITH, unwound from a list).
+
+                if self.group_variables_as_paths
+                    && let Some(call) = self.group_path_call(name, args, *distinct)
+                {
+                    return call;
+                }
+
+                // NULLIF(a, b) desugars to CASE WHEN a = b THEN NULL ELSE a END
+                if BuiltinFunction::from_name(name) == Some(BuiltinFunction::Nullif) {
+                    if args.len() != 2 {
+                        return Err(Error::from(QueryError::new(
+                            QueryErrorKind::Semantic,
+                            "NULLIF requires exactly 2 arguments",
+                        )));
+                    }
+                    let a = self.translate_expression(&args[0])?;
+                    let b = self.translate_expression(&args[1])?;
+                    return Ok(LogicalExpression::Case {
+                        operand: None,
+                        when_clauses: vec![(
+                            LogicalExpression::Binary {
+                                left: Box::new(a.clone()),
+                                op: BinaryOp::Eq,
+                                right: Box::new(b),
+                            },
+                            LogicalExpression::Literal(Value::Null),
+                        )],
+                        else_clause: Some(Box::new(a)),
+                    });
+                }
+
+                let args = args
+                    .iter()
+                    .map(|a| self.translate_expression(a))
+                    .collect::<Result<Vec<_>>>()?;
+                resolve_call(name, args, *distinct)
+            }
+            ast::Expression::List(items) => {
+                let items = items
+                    .iter()
+                    .map(|i| self.translate_expression(i))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(LogicalExpression::List(items))
+            }
+            ast::Expression::Case {
+                input,
+                whens,
+                else_clause,
+            } => {
+                let operand = input
+                    .as_ref()
+                    .map(|e| self.translate_expression(e))
+                    .transpose()?
+                    .map(Box::new);
+
+                let when_clauses = whens
+                    .iter()
+                    .map(|(cond, result)| {
+                        Ok((
+                            self.translate_expression(cond)?,
+                            self.translate_expression(result)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let else_clause = else_clause
+                    .as_ref()
+                    .map(|e| self.translate_expression(e))
+                    .transpose()?
+                    .map(Box::new);
+
+                Ok(LogicalExpression::Case {
+                    operand,
+                    when_clauses,
+                    else_clause,
+                })
+            }
+            ast::Expression::Map(entries) => {
+                let entries = entries
+                    .iter()
+                    .map(|(k, v)| Ok((k.clone(), self.translate_expression(v)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(LogicalExpression::Map(entries))
+            }
+            ast::Expression::ExistsSubquery { query } => {
+                // Translate inner query to logical operator
+                let inner_plan = self.translate_subquery_to_operator(query)?;
+                Ok(LogicalExpression::ExistsSubquery(Box::new(inner_plan)))
+            }
+            ast::Expression::CountSubquery { query } => {
+                let inner_plan = self.translate_subquery_to_operator(query)?;
+                Ok(LogicalExpression::CountSubquery(Box::new(inner_plan)))
+            }
+            ast::Expression::IndexAccess { base, index } => {
+                let base_expr = self.translate_expression(base)?;
+                let index_expr = self.translate_expression(index)?;
+                Ok(LogicalExpression::IndexAccess {
+                    base: Box::new(base_expr),
+                    index: Box::new(index_expr),
+                })
+            }
+            ast::Expression::MapAccess { base, key } => {
+                crate::query::translators::common::map_access(self.translate_expression(base)?, key)
+            }
+            ast::Expression::SliceAccess { base, start, end } => {
+                let base_expr = self.translate_expression(base)?;
+                let start_expr = start
+                    .as_ref()
+                    .map(|s| self.translate_expression(s))
+                    .transpose()?
+                    .map(Box::new);
+                let end_expr = end
+                    .as_ref()
+                    .map(|e| self.translate_expression(e))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(LogicalExpression::SliceAccess {
+                    base: Box::new(base_expr),
+                    start: start_expr,
+                    end: end_expr,
+                })
+            }
+            ast::Expression::ValueSubquery { query } => {
+                // VALUE { subquery } returns a scalar from the inner query.
+                // A count() return becomes a CountSubquery over the rows it
+                // counts: those where the argument is not null, one per value
+                // with DISTINCT. Otherwise, translate the full query and use
+                // ValueSubquery + Apply.
+                if let Some((argument, distinct)) =
+                    Self::count_aggregate_return(&query.return_clause)
+                {
+                    let mut inner_plan = self.translate_subquery_to_operator(query)?;
+                    if let Some(argument) = argument {
+                        let argument = self.translate_expression(argument)?;
+                        inner_plan = wrap_filter(
+                            inner_plan,
+                            LogicalExpression::Unary {
+                                op: UnaryOp::IsNotNull,
+                                operand: Box::new(argument.clone()),
+                            },
+                        );
+                        if distinct {
+                            inner_plan = wrap_distinct(LogicalOperator::Project(ProjectOp {
+                                projections: vec![Projection {
+                                    expression: argument,
+                                    alias: Some("__counted".to_string()),
+                                }],
+                                input: Box::new(inner_plan),
+                                pass_through_input: false,
+                            }));
+                        }
+                    }
+                    Ok(LogicalExpression::CountSubquery(Box::new(inner_plan)))
+                } else {
+                    let inner_logical_plan = self.translate_query(query)?;
+                    Ok(LogicalExpression::ValueSubquery(Box::new(
+                        inner_logical_plan.root,
+                    )))
+                }
+            }
+            ast::Expression::ListComprehension {
+                variable,
+                list_expr,
+                filter_expr,
+                map_expr,
+            } => {
+                let list = self.translate_expression(list_expr)?;
+                let filter = filter_expr
+                    .as_ref()
+                    .map(|f| self.translate_expression(f))
+                    .transpose()?
+                    .map(Box::new);
+                let map = self.translate_expression(map_expr)?;
+                Ok(LogicalExpression::ListComprehension {
+                    variable: variable.clone(),
+                    list_expr: Box::new(list),
+                    filter_expr: filter,
+                    map_expr: Box::new(map),
+                })
+            }
+            ast::Expression::ListPredicate {
+                kind,
+                variable,
+                list_expr,
+                predicate,
+            } => {
+                let list = self.translate_expression(list_expr)?;
+                let pred = self.translate_expression(predicate)?;
+                let logical_kind = match kind {
+                    ast::ListPredicateKind::All => plan::ListPredicateKind::All,
+                    ast::ListPredicateKind::Any => plan::ListPredicateKind::Any,
+                    ast::ListPredicateKind::None => plan::ListPredicateKind::None,
+                    ast::ListPredicateKind::Single => plan::ListPredicateKind::Single,
+                };
+                Ok(LogicalExpression::ListPredicate {
+                    kind: logical_kind,
+                    variable: variable.clone(),
+                    list_expr: Box::new(list),
+                    predicate: Box::new(pred),
+                })
+            }
+            ast::Expression::Reduce {
+                accumulator,
+                initial,
+                variable,
+                list,
+                expression,
+            } => {
+                let init = self.translate_expression(initial)?;
+                let list_expr = self.translate_expression(list)?;
+                let body = self.translate_expression(expression)?;
+                Ok(LogicalExpression::Reduce {
+                    accumulator: accumulator.clone(),
+                    initial: Box::new(init),
+                    variable: variable.clone(),
+                    list: Box::new(list_expr),
+                    expression: Box::new(body),
+                })
+            }
+            ast::Expression::LetIn { bindings, body } => {
+                // `LET x = e1, y = e2 IN body END` is `LET x = e1 IN LET y =
+                // e2 IN body END END` (ISO GQL, let value expression): each
+                // value reads the ones before it, and a later definition of a
+                // name shadows the earlier one. The shared path substitutes
+                // safely or retains one lexical binding per value.
+                let mut binding_exprs: Vec<(String, LogicalExpression)> = Vec::new();
+                for (name, expr) in bindings {
+                    let value = self.translate_expression(expr)?;
+                    let value = self.substitute_let_bindings(value, &binding_exprs)?;
+                    binding_exprs.retain(|(earlier, _)| earlier != name);
+                    binding_exprs.push((name.clone(), value));
+                }
+                let body_expr = self.translate_expression(body)?;
+                self.substitute_let_bindings(body_expr, &binding_exprs)
+            }
+        }
+    }
+
+    pub(super) fn translate_literal(&self, lit: &ast::Literal) -> LogicalExpression {
+        let value = match lit {
+            ast::Literal::Null => Value::Null,
+            ast::Literal::Bool(b) => Value::Bool(*b),
+            ast::Literal::Integer(i) => Value::Int64(*i),
+            ast::Literal::Float(f) => Value::Float64(*f),
+            ast::Literal::Decimal(d) => Value::Decimal(*d),
+            ast::Literal::String(s) => Value::String(s.clone().into()),
+            ast::Literal::Date(s) => grafeo_common::types::Date::parse(s)
+                .map_or_else(|| Value::String(s.clone().into()), Value::Date),
+            ast::Literal::Time(s) => grafeo_common::types::Time::parse(s)
+                .map_or_else(|| Value::String(s.clone().into()), Value::Time),
+            ast::Literal::Duration(s) => grafeo_common::types::Duration::parse(s)
+                .map_or_else(|| Value::String(s.clone().into()), Value::Duration),
+            ast::Literal::Datetime(s) => {
+                // An ISO datetime, YYYY-MM-DDTHH:MM:SS[.fff][Z|+HH:MM]: with a time zone
+                // displacement (`Z` is +00:00) a zoned datetime that keeps it, without one a
+                // local datetime (ISO/IEC 39075 21.2 Syntax Rule 65, General Rule 15).
+                if let Some(pos) = s.find('T') {
+                    if let (Some(d), Some(t)) = (
+                        grafeo_common::types::Date::parse(&s[..pos]),
+                        grafeo_common::types::Time::parse(&s[pos + 1..]),
+                    ) {
+                        grafeo_common::types::ZonedDatetime::from_date_time(d, t).map_or_else(
+                            || {
+                                Value::Timestamp(grafeo_common::types::Timestamp::from_date_time(
+                                    d, t,
+                                ))
+                            },
+                            Value::ZonedDatetime,
+                        )
+                    } else {
+                        Value::String(s.clone().into())
+                    }
+                } else if let Some(d) = grafeo_common::types::Date::parse(s) {
+                    Value::Timestamp(d.to_timestamp())
+                } else {
+                    Value::String(s.clone().into())
+                }
+            }
+            ast::Literal::ZonedDatetime(s) => {
+                self.warn(grafeo_common::utils::warning::Warning::ZonedDatetimeLiteral);
+                grafeo_common::types::ZonedDatetime::parse(s)
+                    .map_or_else(|| Value::String(s.clone().into()), Value::ZonedDatetime)
+            }
+            ast::Literal::ZonedTime(s) => {
+                self.warn(grafeo_common::utils::warning::Warning::ZonedTimeLiteral);
+                // Parse as Time with required offset
+                if let Some(t) = grafeo_common::types::Time::parse(s)
+                    && t.offset_seconds().is_some()
+                {
+                    Value::Time(t)
+                } else {
+                    Value::String(s.clone().into())
+                }
+            }
+        };
+        LogicalExpression::Literal(value)
+    }
+
+    pub(super) fn translate_binary_op(&self, op: ast::BinaryOp) -> BinaryOp {
+        match op {
+            ast::BinaryOp::Eq => BinaryOp::Eq,
+            ast::BinaryOp::Ne => BinaryOp::Ne,
+            ast::BinaryOp::Lt => BinaryOp::Lt,
+            ast::BinaryOp::Le => BinaryOp::Le,
+            ast::BinaryOp::Gt => BinaryOp::Gt,
+            ast::BinaryOp::Ge => BinaryOp::Ge,
+            ast::BinaryOp::And => BinaryOp::And,
+            ast::BinaryOp::Or => BinaryOp::Or,
+            ast::BinaryOp::Xor => BinaryOp::Xor,
+            ast::BinaryOp::Add => BinaryOp::Add,
+            ast::BinaryOp::Sub => BinaryOp::Sub,
+            ast::BinaryOp::Mul => BinaryOp::Mul,
+            ast::BinaryOp::Div => BinaryOp::Div,
+            ast::BinaryOp::Mod => BinaryOp::Mod,
+            ast::BinaryOp::Pow => BinaryOp::Pow,
+            ast::BinaryOp::Concat => BinaryOp::Concat,
+            ast::BinaryOp::Like => BinaryOp::Like,
+            ast::BinaryOp::In => BinaryOp::In,
+            ast::BinaryOp::StartsWith => BinaryOp::StartsWith,
+            ast::BinaryOp::EndsWith => BinaryOp::EndsWith,
+            ast::BinaryOp::Contains => BinaryOp::Contains,
+            ast::BinaryOp::RegexMatch => BinaryOp::Regex,
+        }
+    }
+
+    pub(super) fn translate_unary_op(&self, op: ast::UnaryOp) -> UnaryOp {
+        match op {
+            ast::UnaryOp::Not => UnaryOp::Not,
+            ast::UnaryOp::Neg => UnaryOp::Neg,
+            ast::UnaryOp::Pos => UnaryOp::Pos,
+            ast::UnaryOp::IsNull => UnaryOp::IsNull,
+            ast::UnaryOp::IsNotNull => UnaryOp::IsNotNull,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn translator() -> GqlTranslator {
+        GqlTranslator::new("")
+    }
+
+    // --- NULLIF desugaring ---
+
+    #[test]
+    fn test_nullif_desugars_to_case() {
+        // NULLIF(a, b) should produce:
+        //   CASE WHEN a = b THEN NULL ELSE a END
+        let t = translator();
+        let expr = ast::Expression::FunctionCall {
+            name: "NULLIF".to_string(),
+            args: vec![
+                ast::Expression::Variable("a".to_string()),
+                ast::Expression::Variable("b".to_string()),
+            ],
+            distinct: false,
+        };
+
+        let result = t.translate_expression(&expr).unwrap();
+
+        // Verify the Case structure
+        if let LogicalExpression::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } = &result
+        {
+            // No operand (searched CASE, not simple CASE)
+            assert!(
+                operand.is_none(),
+                "NULLIF should produce a searched CASE (no operand)"
+            );
+
+            // Exactly one WHEN clause
+            assert_eq!(
+                when_clauses.len(),
+                1,
+                "NULLIF should produce exactly one WHEN clause"
+            );
+
+            // WHEN condition: a = b
+            let (condition, then_expr) = &when_clauses[0];
+            if let LogicalExpression::Binary { left, op, right } = condition {
+                assert!(
+                    matches!(op, BinaryOp::Eq),
+                    "WHEN condition should use Eq operator"
+                );
+                assert!(
+                    matches!(left.as_ref(), LogicalExpression::Variable(v) if v == "a"),
+                    "left side of condition should be variable 'a'"
+                );
+                assert!(
+                    matches!(right.as_ref(), LogicalExpression::Variable(v) if v == "b"),
+                    "right side of condition should be variable 'b'"
+                );
+            } else {
+                panic!("WHEN condition should be a Binary expression, got: {condition:?}");
+            }
+
+            // THEN NULL
+            assert!(
+                matches!(then_expr, LogicalExpression::Literal(Value::Null)),
+                "THEN clause should be NULL"
+            );
+
+            // ELSE a
+            let else_expr = else_clause
+                .as_ref()
+                .expect("NULLIF should have an ELSE clause");
+            assert!(
+                matches!(else_expr.as_ref(), LogicalExpression::Variable(v) if v == "a"),
+                "ELSE clause should be variable 'a'"
+            );
+        } else {
+            panic!("NULLIF should translate to a Case expression, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_nullif_case_insensitive() {
+        // Verify that "nullif" (lowercase) also works
+        let t = translator();
+        let expr = ast::Expression::FunctionCall {
+            name: "nullif".to_string(),
+            args: vec![
+                ast::Expression::Literal(ast::Literal::Integer(1)),
+                ast::Expression::Literal(ast::Literal::Integer(2)),
+            ],
+            distinct: false,
+        };
+
+        let result = t.translate_expression(&expr).unwrap();
+        assert!(
+            matches!(result, LogicalExpression::Case { .. }),
+            "lowercase 'nullif' should also desugar to Case"
+        );
+    }
+
+    #[test]
+    fn test_nullif_wrong_arity_rejected() {
+        let t = translator();
+
+        // Too few arguments
+        let expr_one = ast::Expression::FunctionCall {
+            name: "NULLIF".to_string(),
+            args: vec![ast::Expression::Variable("a".to_string())],
+            distinct: false,
+        };
+        assert!(
+            t.translate_expression(&expr_one).is_err(),
+            "NULLIF with 1 argument should fail"
+        );
+
+        // Too many arguments
+        let expr_three = ast::Expression::FunctionCall {
+            name: "NULLIF".to_string(),
+            args: vec![
+                ast::Expression::Variable("a".to_string()),
+                ast::Expression::Variable("b".to_string()),
+                ast::Expression::Variable("c".to_string()),
+            ],
+            distinct: false,
+        };
+        assert!(
+            t.translate_expression(&expr_three).is_err(),
+            "NULLIF with 3 arguments should fail"
+        );
+    }
+
+    // --- length() on path variables ---
+
+    #[test]
+    fn test_length_of_path_variable() {
+        // length(p) stays a function of p, which may be a path the pattern
+        // binds or a path value from elsewhere (a WITH, an UNWIND): it does
+        // not name the length column of a pattern's path
+        let t = translator();
+        let expr = ast::Expression::FunctionCall {
+            name: "length".to_string(),
+            args: vec![ast::Expression::Variable("p".to_string())],
+            distinct: false,
+        };
+
+        let result = t.translate_expression(&expr).unwrap();
+        assert!(
+            matches!(
+                &result,
+                LogicalExpression::FunctionCall { name, args, .. }
+                    if name == "length"
+                        && matches!(args.as_slice(), [LogicalExpression::Variable(v)] if v == "p")
+            ),
+            "length(p) should stay length(p), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_length_with_non_variable_arg_is_regular_function() {
+        // length(expr) where expr is NOT a plain variable should remain a regular function call
+        let t = translator();
+        let expr = ast::Expression::FunctionCall {
+            name: "length".to_string(),
+            args: vec![ast::Expression::PropertyAccess {
+                variable: "n".to_string(),
+                property: "name".to_string(),
+            }],
+            distinct: false,
+        };
+
+        let result = t.translate_expression(&expr).unwrap();
+        assert!(
+            matches!(&result, LogicalExpression::FunctionCall { name, .. } if name == "length"),
+            "length(n.name) should stay as FunctionCall, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_length_with_multiple_args_is_an_arity_error() {
+        // length(a, b) is no path length either: the translator refuses the call.
+        let t = translator();
+        let expr = ast::Expression::FunctionCall {
+            name: "length".to_string(),
+            args: vec![
+                ast::Expression::Variable("a".to_string()),
+                ast::Expression::Variable("b".to_string()),
+            ],
+            distinct: false,
+        };
+
+        let error = t.translate_expression(&expr).unwrap_err().to_string();
+        assert!(error.contains("length"), "{error}");
+    }
+}

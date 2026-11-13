@@ -1,0 +1,1010 @@
+//! Admin API types for database inspection, backup, and maintenance.
+//!
+//! These types support both LPG (Labeled Property Graph) and RDF (Resource Description Framework)
+//! data models.
+//!
+//! The result structs are read, not built: later releases may add fields, so
+//! they are `#[non_exhaustive]` and a pattern names their fields with `..`.
+//!
+//! # Stability
+//!
+//! The `grafeo` crate re-exports this module. Its items are stable unless
+//! their documentation has a `# Stability: Experimental` section: see
+//! <https://grafeo.dev/stability/>.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use grafeo_common::types::{NodeId, PropertyMap, ReadView};
+use grafeo_common::utils::error::Result as GrafeoResult;
+use grafeo_common::utils::hash::FxHashMap;
+use grafeo_core::graph::{Direction, GraphStore, Labels};
+use serde::{Deserialize, Serialize};
+
+/// Database mode - either LPG (Labeled Property Graph) or RDF (Triple Store).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum DatabaseMode {
+    /// Labeled Property Graph mode (nodes with labels and properties, typed edges).
+    Lpg,
+    /// RDF mode (subject-predicate-object triples).
+    Rdf,
+}
+
+impl std::fmt::Display for DatabaseMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatabaseMode::Lpg => write!(f, "lpg"),
+            DatabaseMode::Rdf => write!(f, "rdf"),
+        }
+    }
+}
+
+/// High-level database information returned by `db.info()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DatabaseInfo {
+    /// Database mode (LPG or RDF).
+    pub mode: DatabaseMode,
+    /// Number of nodes (LPG) or subjects (RDF).
+    pub node_count: usize,
+    /// Number of edges (LPG) or triples (RDF).
+    pub edge_count: usize,
+    /// Whether the database is backed by a file.
+    pub is_persistent: bool,
+    /// Database file path, if persistent.
+    pub path: Option<PathBuf>,
+    /// Whether WAL is enabled.
+    pub wal_enabled: bool,
+    /// Database version.
+    pub version: String,
+    /// Compiled feature flags (e.g. "gql", "cypher", "algos", "vector-index").
+    pub features: Vec<String>,
+}
+
+/// Detailed database statistics returned by `db.stats()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DatabaseStats {
+    /// Number of nodes (LPG) or subjects (RDF).
+    pub node_count: usize,
+    /// Number of edges (LPG) or triples (RDF).
+    pub edge_count: usize,
+    /// Number of distinct labels (LPG) or classes (RDF).
+    pub label_count: usize,
+    /// Number of distinct edge types (LPG) or predicates (RDF).
+    pub edge_type_count: usize,
+    /// Number of distinct property keys ever written, not the keys in use
+    /// now (see [`GrafeoDB::property_key_count`](crate::GrafeoDB::property_key_count)).
+    pub property_key_count: usize,
+    /// Number of indexes.
+    pub index_count: usize,
+    /// Memory usage in bytes (approximate).
+    pub memory_bytes: usize,
+    /// Disk usage in bytes (if persistent).
+    pub disk_bytes: Option<usize>,
+}
+
+/// Schema information for LPG databases: what the data holds, each list
+/// sorted by name.
+///
+/// Only what is in use is listed: a label no node has any more, an edge type
+/// with no edge left and a property key no node or edge holds are left out,
+/// also when a node or edge type in the catalog declares them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct LpgSchemaInfo {
+    /// The labels some node has.
+    pub labels: Vec<LabelInfo>,
+    /// The edge types some edge has.
+    pub edge_types: Vec<EdgeTypeInfo>,
+    /// The property keys some node or edge holds.
+    pub property_keys: Vec<String>,
+}
+
+/// Information about a label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct LabelInfo {
+    /// The label name.
+    pub name: String,
+    /// Number of nodes with this label.
+    pub count: usize,
+    /// The properties the nodes with this label hold.
+    #[serde(default)]
+    pub properties: Vec<PropertyInfo>,
+}
+
+/// Information about an edge type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct EdgeTypeInfo {
+    /// The edge type name.
+    pub name: String,
+    /// Number of edges with this type.
+    pub count: usize,
+    /// The properties the edges of this type hold.
+    #[serde(default)]
+    pub properties: Vec<PropertyInfo>,
+    /// The labels the edges of this type connect, one entry per source and
+    /// target label: an edge between nodes with several labels counts in
+    /// each pair, and an end without a label is in none.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointInfo>,
+}
+
+/// A property key and the types of the values written to it, as
+/// `valueType` names them (`STRING`, `INT64`, `LIST`, ...), sorted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PropertyInfo {
+    /// The property key.
+    pub name: String,
+    /// The types of its values.
+    pub types: Vec<String>,
+}
+
+/// A source and a target label that edges of one type connect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct EndpointInfo {
+    /// A label of the source node.
+    pub source: String,
+    /// A label of the target node.
+    pub target: String,
+    /// Number of edges of the type from a node with `source` to one with
+    /// `target`.
+    pub count: usize,
+}
+
+/// The property keys of one label or edge type, with the types of the
+/// values each holds.
+#[derive(Default)]
+struct PropertyTally(BTreeMap<String, BTreeSet<&'static str>>);
+
+impl PropertyTally {
+    fn record(&mut self, properties: &PropertyMap) {
+        for (key, value) in properties.iter().filter(|(_, value)| !value.is_null()) {
+            self.0
+                .entry(key.as_str().to_string())
+                .or_default()
+                .insert(value.type_name());
+        }
+    }
+
+    fn into_infos(self) -> Vec<PropertyInfo> {
+        self.0
+            .into_iter()
+            .map(|(name, types)| PropertyInfo {
+                name,
+                types: types.into_iter().map(String::from).collect(),
+            })
+            .collect()
+    }
+}
+
+/// The keys of `properties` that hold a value.
+fn keys_in_use(properties: &PropertyMap) -> impl Iterator<Item = String> + '_ {
+    properties
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(key, _)| key.as_str().to_string())
+}
+
+/// An edge type's count, properties and endpoint pairs, while they are read.
+type EdgeTally = (usize, PropertyTally, BTreeMap<(String, String), usize>);
+
+impl LpgSchemaInfo {
+    /// What a reader at `view` finds in `store`: one pass over the nodes and
+    /// their outgoing edges, so it reads the whole graph, and stops at the
+    /// running query's deadline, a unit of work per node and per edge.
+    /// `GrafeoDB::schema` and the `db.labels`, `db.relationshipTypes` and
+    /// `db.propertyKeys` procedures read this one summary, so they agree.
+    pub(crate) fn in_use(store: &dyn GraphStore, view: ReadView) -> GrafeoResult<Self> {
+        let mut ticker = grafeo_core::execution::deadline::Ticker::new();
+        let mut tick = || {
+            ticker
+                .tick()
+                .map_err(crate::query::executor::convert_operator_error)
+        };
+        let mut labels: BTreeMap<String, (usize, PropertyTally)> = BTreeMap::new();
+        let mut node_labels: FxHashMap<NodeId, Labels> = FxHashMap::default();
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        let node_ids = store.node_ids(view)?;
+        for &id in &node_ids {
+            tick()?;
+            let Some(node) = store.node(id, view)? else {
+                continue;
+            };
+            keys.extend(keys_in_use(&node.properties));
+            for label in &node.labels {
+                let (count, tally) = labels.entry(label.to_string()).or_default();
+                *count += 1;
+                tally.record(&node.properties);
+            }
+            node_labels.insert(id, node.labels);
+        }
+
+        let mut edge_types: BTreeMap<String, EdgeTally> = BTreeMap::new();
+        for &id in &node_ids {
+            let Some(sources) = node_labels.get(&id) else {
+                continue;
+            };
+            for (target, edge_id) in store.edges(id, Direction::Outgoing, &[], view)? {
+                tick()?;
+                let Some(edge) = store.edge(edge_id, view)? else {
+                    continue;
+                };
+                keys.extend(keys_in_use(&edge.properties));
+                let (count, tally, endpoints) =
+                    edge_types.entry(edge.edge_type.to_string()).or_default();
+                *count += 1;
+                tally.record(&edge.properties);
+                let targets = node_labels
+                    .get(&target)
+                    .map_or(&[][..], |labels| &labels[..]);
+                for source in sources {
+                    for target in targets {
+                        *endpoints
+                            .entry((source.to_string(), target.to_string()))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            labels: labels
+                .into_iter()
+                .map(|(name, (count, tally))| LabelInfo {
+                    name,
+                    count,
+                    properties: tally.into_infos(),
+                })
+                .collect(),
+            edge_types: edge_types
+                .into_iter()
+                .map(|(name, (count, tally, endpoints))| EdgeTypeInfo {
+                    name,
+                    count,
+                    properties: tally.into_infos(),
+                    endpoints: endpoints
+                        .into_iter()
+                        .map(|((source, target), count)| EndpointInfo {
+                            source,
+                            target,
+                            count,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            property_keys: keys.into_iter().collect(),
+        })
+    }
+}
+
+/// Schema information for RDF databases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RdfSchemaInfo {
+    /// All predicates used in the database.
+    pub predicates: Vec<PredicateInfo>,
+    /// All named graphs.
+    pub named_graphs: Vec<String>,
+    /// Number of distinct subjects.
+    pub subject_count: usize,
+    /// Number of distinct objects.
+    pub object_count: usize,
+}
+
+/// Information about an RDF predicate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PredicateInfo {
+    /// The predicate IRI.
+    pub iri: String,
+    /// Number of triples using this predicate.
+    pub count: usize,
+}
+
+/// Combined schema information supporting both LPG and RDF.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode")]
+#[non_exhaustive]
+pub enum SchemaInfo {
+    /// LPG schema information.
+    #[serde(rename = "lpg")]
+    Lpg(LpgSchemaInfo),
+    /// RDF schema information.
+    #[serde(rename = "rdf")]
+    Rdf(RdfSchemaInfo),
+}
+
+/// Index information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct IndexInfo {
+    /// Index name.
+    pub name: String,
+    /// Index type (hash, btree, fulltext, etc.).
+    pub index_type: String,
+    /// Target (label:property for LPG, predicate for RDF).
+    pub target: String,
+    /// Whether the index is unique.
+    pub unique: bool,
+    /// Estimated cardinality.
+    pub cardinality: Option<usize>,
+    /// Size in bytes.
+    pub size_bytes: Option<usize>,
+}
+
+/// WAL (Write-Ahead Log) status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WalStatus {
+    /// Whether WAL is enabled.
+    pub enabled: bool,
+    /// WAL file path.
+    pub path: Option<PathBuf>,
+    /// WAL size in bytes.
+    pub size_bytes: usize,
+    /// Number of WAL records.
+    pub record_count: usize,
+    /// Last checkpoint timestamp (Unix epoch seconds).
+    pub last_checkpoint: Option<u64>,
+    /// Current epoch/LSN.
+    pub current_epoch: u64,
+}
+
+/// When a database checkpoints by itself (see
+/// [`GrafeoDB::set_checkpoint_triggers`](crate::GrafeoDB::set_checkpoint_triggers)):
+/// when the interval has passed since the last automatic checkpoint, or when
+/// the WAL holds the given bytes since the last checkpoint. A file database
+/// checkpoints by WAL size by default, at 256 MiB
+/// ([`DEFAULT_CHECKPOINT_WAL_SIZE`](crate::config::DEFAULT_CHECKPOINT_WAL_SIZE)),
+/// and by no interval. With neither, a checkpoint runs only when asked
+/// (`wal_checkpoint()`) and at `close()`.
+///
+/// [`none`](Self::none) is no trigger at all, not the default: the default
+/// comes from [`Config`](crate::Config).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CheckpointTriggers {
+    /// Checkpoint when this long has passed since the last automatic one.
+    pub interval: Option<std::time::Duration>,
+    /// Checkpoint once the WAL holds this many bytes since the last
+    /// checkpoint, at least 1 MiB: the commit that takes the WAL past it
+    /// wakes the checkpoint thread.
+    pub wal_bytes: Option<u64>,
+}
+
+impl CheckpointTriggers {
+    /// No automatic checkpoints.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// These triggers, also checkpointing when `interval` has passed.
+    #[must_use]
+    pub fn with_interval(mut self, interval: std::time::Duration) -> Self {
+        self.interval = Some(interval);
+        self
+    }
+
+    /// These triggers, also checkpointing once the WAL holds `bytes` since
+    /// the last checkpoint.
+    #[must_use]
+    pub fn with_wal_bytes(mut self, bytes: u64) -> Self {
+        self.wal_bytes = Some(bytes);
+        self
+    }
+
+    /// Whether any trigger is set.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.interval.is_some() || self.wal_bytes.is_some()
+    }
+}
+
+/// How the automatic checkpoints of a database fare (see
+/// [`GrafeoDB::checkpoint_status`](crate::GrafeoDB::checkpoint_status)).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CheckpointStatus {
+    /// The triggers in force.
+    pub triggers: CheckpointTriggers,
+    /// When the last checkpoint of any kind finished (Unix epoch seconds),
+    /// `None` before the first.
+    pub last_checkpoint: Option<u64>,
+    /// Automatic checkpoints that failed since the last one that succeeded.
+    /// A checkpoint the WAL size started is tried again once the WAL has
+    /// grown by one more segment. One the interval started is tried again
+    /// after a pause that doubles from one second to five minutes. The WAL
+    /// keeps the commits meanwhile.
+    pub failures: u64,
+    /// The error of the last failed automatic checkpoint.
+    pub last_error: Option<String>,
+    /// When that one failed (Unix epoch seconds).
+    pub last_failure: Option<u64>,
+    /// Whether automatic checkpoints have stopped: after a commit that did
+    /// not complete, none can succeed until the database is reopened.
+    pub stopped: bool,
+}
+
+/// What the checkpoint thread of a database did since it opened, for tests
+/// (see `GrafeoDB::checkpoint_thread_counts`).
+#[cfg(feature = "testing-crash-injection")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CheckpointThreadCounts {
+    /// The times its thread started: 0 until its first work (it starts the
+    /// first time it has work).
+    pub starts: u64,
+    /// The times it woke: a commit that took the WAL past the mark (the one
+    /// that starts the thread included), or the interval passing. A start
+    /// that finds the WAL already past the mark is no wake.
+    pub wakes: u64,
+    /// The checkpoints it ran, whether they succeeded or not.
+    pub attempts: u64,
+}
+
+/// Holds the checkpoint thread after its next checkpoint, before it sets the
+/// WAL mark that wakes it again, until dropped (see
+/// `GrafeoDB::hold_checkpoint_rearm`). For tests only.
+#[cfg(feature = "testing-crash-injection")]
+#[must_use = "the thread is held only while this lives"]
+pub struct CheckpointRearmHold {
+    pub(crate) gate: std::sync::Arc<crate::database::RearmGate>,
+}
+
+#[cfg(feature = "testing-crash-injection")]
+impl Drop for CheckpointRearmHold {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+/// Validation result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ValidationResult {
+    /// List of validation errors (empty = valid).
+    pub errors: Vec<ValidationError>,
+    /// List of validation warnings.
+    pub warnings: Vec<ValidationWarning>,
+}
+
+impl ValidationResult {
+    /// Returns true if validation passed (no errors).
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+/// A validation error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ValidationError {
+    /// Error code.
+    pub code: String,
+    /// Human-readable error message.
+    pub message: String,
+    /// Optional context (e.g., affected entity ID).
+    pub context: Option<String>,
+}
+
+/// A validation warning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ValidationWarning {
+    /// Warning code.
+    pub code: String,
+    /// Human-readable warning message.
+    pub message: String,
+    /// Optional context.
+    pub context: Option<String>,
+}
+
+/// What an open found that the caller should know, without failing:
+/// [`GrafeoDB::open_warnings`](crate::GrafeoDB::open_warnings). Each is also
+/// logged where a build has a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OpenWarning {
+    /// A node or edge type's rules apply only in graphs bound to the graph
+    /// type that lists it, and a graph not bound to it holds such elements
+    /// (see `GrafeoDB::graph_type_scope_warnings`).
+    GraphTypeScope {
+        /// What holds them, and what to do.
+        message: String,
+        /// The type, as `node_type:<name>` or `edge_type:<name>`.
+        context: Option<String>,
+    },
+    /// The memory this process may use could not be detected: the memory
+    /// limit is `budget` bytes, taken of a 1 GiB fallback.
+    MemoryDetectionFallback {
+        /// The memory limit in force, in bytes.
+        budget: u64,
+    },
+    /// The database holds `used` bytes, past its memory limit of `limit`:
+    /// reads work, and writes that need memory fail with `GRAFEO-S001`
+    /// until the limit is raised. An open never refuses (what the file and
+    /// the WAL hold is loaded whole).
+    OverMemoryLimit {
+        /// The bytes the database holds after the open.
+        used: u64,
+        /// The memory limit, in bytes.
+        limit: u64,
+    },
+}
+
+impl OpenWarning {
+    /// The warning's code: `GRAPH_TYPE_NOT_BOUND`,
+    /// `MEMORY_DETECTION_FALLBACK` or `MEMORY_LIMIT_PASSED`.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::GraphTypeScope { .. } => "GRAPH_TYPE_NOT_BOUND",
+            Self::MemoryDetectionFallback { .. } => "MEMORY_DETECTION_FALLBACK",
+            Self::OverMemoryLimit { .. } => "MEMORY_LIMIT_PASSED",
+        }
+    }
+}
+
+impl std::fmt::Display for OpenWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GraphTypeScope { message, .. } => f.write_str(message),
+            Self::MemoryDetectionFallback { budget } => write!(
+                f,
+                "could not detect the memory this process may use: the memory limit is {} MiB, \
+                 taken of a 1 GiB fallback; set it with Config::with_memory_limit",
+                budget >> 20
+            ),
+            Self::OverMemoryLimit { used, limit } => write!(
+                f,
+                "the database holds {used} bytes, past its memory limit of {limit}: reads work, \
+                 writes that need memory fail with GRAFEO-S001 until Config::with_memory_limit \
+                 is raised"
+            ),
+        }
+    }
+}
+
+/// Dump format for export operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum DumpFormat {
+    /// Apache Parquet format (default for LPG).
+    Parquet,
+    /// RDF Turtle format (default for RDF).
+    Turtle,
+    /// JSON Lines format.
+    Json,
+    /// Arrow IPC stream format (zero-copy interop with DuckDB, Polars, pandas).
+    Arrow,
+    /// GEXF 1.3 format (Gephi, Gephi Lite, NetworkX).
+    Gexf,
+    /// GraphML format (Gephi, Cytoscape, yEd, igraph).
+    GraphMl,
+}
+
+impl Default for DumpFormat {
+    fn default() -> Self {
+        DumpFormat::Parquet
+    }
+}
+
+impl std::fmt::Display for DumpFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DumpFormat::Parquet => write!(f, "parquet"),
+            DumpFormat::Turtle => write!(f, "turtle"),
+            DumpFormat::Json => write!(f, "json"),
+            DumpFormat::Arrow => write!(f, "arrow"),
+            DumpFormat::Gexf => write!(f, "gexf"),
+            DumpFormat::GraphMl => write!(f, "graphml"),
+        }
+    }
+}
+
+impl std::str::FromStr for DumpFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "parquet" => Ok(DumpFormat::Parquet),
+            "turtle" | "ttl" => Ok(DumpFormat::Turtle),
+            "json" | "jsonl" => Ok(DumpFormat::Json),
+            "arrow" | "arrow-ipc" | "ipc" => Ok(DumpFormat::Arrow),
+            "gexf" => Ok(DumpFormat::Gexf),
+            "graphml" => Ok(DumpFormat::GraphMl),
+            _ => Err(format!("Unknown dump format: {}", s)),
+        }
+    }
+}
+
+/// What [`GrafeoDB::compact`](crate::GrafeoDB::compact) did.
+///
+/// `compact()` may take on more work in later releases, and its report then
+/// gains fields, so the struct is `#[non_exhaustive]`: read its fields, and
+/// expect new ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CompactReport {
+    /// Whether a checkpoint of the database file was written: only for a
+    /// persistent database that is not read-only.
+    pub checkpointed: bool,
+    /// The old versions dropped, in every graph: versions no open transaction
+    /// can see any more.
+    pub versions_collected: u64,
+    /// The nodes and edges of the row groups whose property values were
+    /// compressed, in every graph (a report from before 0.6.0 reads as 0).
+    #[serde(default)]
+    pub rows_compressed: u64,
+    /// How long `compact()` took, in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Trait for administrative database operations.
+///
+/// Provides a uniform interface for introspection, validation, and
+/// maintenance operations. Used by the CLI, REST API, and bindings
+/// to inspect and manage a Grafeo database.
+///
+/// Implemented by [`GrafeoDB`](crate::GrafeoDB).
+pub trait AdminService {
+    /// Returns high-level database information (counts, mode, persistence).
+    ///
+    /// # Errors
+    ///
+    /// The error of a read the store cannot do.
+    fn info(&self) -> grafeo_common::utils::error::Result<DatabaseInfo>;
+
+    /// Returns detailed database statistics (memory, disk, indexes).
+    ///
+    /// # Errors
+    ///
+    /// The error of a read the store cannot do.
+    fn detailed_stats(&self) -> grafeo_common::utils::error::Result<DatabaseStats>;
+
+    /// Returns schema information (labels, edge types, property keys).
+    ///
+    /// # Errors
+    ///
+    /// The error of a read the store cannot do.
+    fn schema(&self) -> grafeo_common::utils::error::Result<SchemaInfo>;
+
+    /// Validates database integrity, returning errors and warnings.
+    ///
+    /// # Errors
+    ///
+    /// The error of a read the store cannot do.
+    fn validate(&self) -> grafeo_common::utils::error::Result<ValidationResult>;
+
+    /// Returns WAL (Write-Ahead Log) status.
+    fn wal_status(&self) -> WalStatus;
+
+    /// Forces a WAL checkpoint, flushing pending records to storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint fails.
+    fn wal_checkpoint(&self) -> grafeo_common::utils::error::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- DatabaseMode ----
+
+    #[test]
+    fn test_database_mode_display() {
+        assert_eq!(DatabaseMode::Lpg.to_string(), "lpg");
+        assert_eq!(DatabaseMode::Rdf.to_string(), "rdf");
+    }
+
+    #[test]
+    fn test_database_mode_serde_roundtrip() {
+        let json = serde_json::to_string(&DatabaseMode::Lpg).unwrap();
+        let mode: DatabaseMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(mode, DatabaseMode::Lpg);
+
+        let json = serde_json::to_string(&DatabaseMode::Rdf).unwrap();
+        let mode: DatabaseMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(mode, DatabaseMode::Rdf);
+    }
+
+    #[test]
+    fn test_database_mode_equality() {
+        assert_eq!(DatabaseMode::Lpg, DatabaseMode::Lpg);
+        assert_ne!(DatabaseMode::Lpg, DatabaseMode::Rdf);
+    }
+
+    // ---- DumpFormat ----
+
+    #[test]
+    fn test_dump_format_default() {
+        assert_eq!(DumpFormat::default(), DumpFormat::Parquet);
+    }
+
+    #[test]
+    fn test_dump_format_display() {
+        assert_eq!(DumpFormat::Parquet.to_string(), "parquet");
+        assert_eq!(DumpFormat::Turtle.to_string(), "turtle");
+        assert_eq!(DumpFormat::Json.to_string(), "json");
+        assert_eq!(DumpFormat::Arrow.to_string(), "arrow");
+        assert_eq!(DumpFormat::Gexf.to_string(), "gexf");
+        assert_eq!(DumpFormat::GraphMl.to_string(), "graphml");
+    }
+
+    #[test]
+    fn test_dump_format_from_str() {
+        assert_eq!(
+            "parquet".parse::<DumpFormat>().unwrap(),
+            DumpFormat::Parquet
+        );
+        assert_eq!("turtle".parse::<DumpFormat>().unwrap(), DumpFormat::Turtle);
+        assert_eq!("ttl".parse::<DumpFormat>().unwrap(), DumpFormat::Turtle);
+        assert_eq!("json".parse::<DumpFormat>().unwrap(), DumpFormat::Json);
+        assert_eq!("jsonl".parse::<DumpFormat>().unwrap(), DumpFormat::Json);
+        assert_eq!("arrow".parse::<DumpFormat>().unwrap(), DumpFormat::Arrow);
+        assert_eq!(
+            "arrow-ipc".parse::<DumpFormat>().unwrap(),
+            DumpFormat::Arrow
+        );
+        assert_eq!("ipc".parse::<DumpFormat>().unwrap(), DumpFormat::Arrow);
+        assert_eq!("gexf".parse::<DumpFormat>().unwrap(), DumpFormat::Gexf);
+        assert_eq!(
+            "graphml".parse::<DumpFormat>().unwrap(),
+            DumpFormat::GraphMl
+        );
+        assert_eq!(
+            "PARQUET".parse::<DumpFormat>().unwrap(),
+            DumpFormat::Parquet
+        );
+    }
+
+    #[test]
+    fn test_dump_format_from_str_invalid() {
+        let result = "xml".parse::<DumpFormat>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown dump format"));
+    }
+
+    #[test]
+    fn test_dump_format_serde_roundtrip() {
+        for format in [
+            DumpFormat::Parquet,
+            DumpFormat::Turtle,
+            DumpFormat::Json,
+            DumpFormat::Arrow,
+            DumpFormat::Gexf,
+            DumpFormat::GraphMl,
+        ] {
+            let json = serde_json::to_string(&format).unwrap();
+            let parsed: DumpFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, format);
+        }
+    }
+
+    // ---- ValidationResult ----
+
+    #[test]
+    fn test_validation_result_default_is_valid() {
+        let result = ValidationResult::default();
+        assert!(result.is_valid());
+        assert!(result.errors.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validation_result_with_errors() {
+        let result = ValidationResult {
+            errors: vec![ValidationError {
+                code: "E001".to_string(),
+                message: "Orphaned edge".to_string(),
+                context: Some("edge_42".to_string()),
+            }],
+            warnings: Vec::new(),
+        };
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn test_validation_result_with_warnings_still_valid() {
+        let result = ValidationResult {
+            errors: Vec::new(),
+            warnings: vec![ValidationWarning {
+                code: "W001".to_string(),
+                message: "Unused index".to_string(),
+                context: None,
+            }],
+        };
+        assert!(result.is_valid());
+    }
+
+    // ---- Serde roundtrips for complex types ----
+
+    #[test]
+    fn test_database_info_serde() {
+        let info = DatabaseInfo {
+            mode: DatabaseMode::Lpg,
+            node_count: 100,
+            edge_count: 200,
+            is_persistent: true,
+            path: Some(PathBuf::from("/tmp/db")),
+            wal_enabled: true,
+            version: "0.4.1".to_string(),
+            features: vec!["gql".into(), "cypher".into()],
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: DatabaseInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.node_count, 100);
+        assert_eq!(parsed.edge_count, 200);
+        assert!(parsed.is_persistent);
+    }
+
+    #[test]
+    fn test_database_stats_serde() {
+        let stats = DatabaseStats {
+            node_count: 50,
+            edge_count: 75,
+            label_count: 3,
+            edge_type_count: 2,
+            property_key_count: 10,
+            index_count: 4,
+            memory_bytes: 1024,
+            disk_bytes: Some(2048),
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let parsed: DatabaseStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.node_count, 50);
+        assert_eq!(parsed.disk_bytes, Some(2048));
+    }
+
+    #[test]
+    fn test_schema_info_lpg_serde() {
+        let schema = SchemaInfo::Lpg(LpgSchemaInfo {
+            labels: vec![LabelInfo {
+                name: "Person".to_string(),
+                count: 10,
+                properties: vec![PropertyInfo {
+                    name: "age".to_string(),
+                    types: vec!["INT64".to_string(), "STRING".to_string()],
+                }],
+            }],
+            edge_types: vec![EdgeTypeInfo {
+                name: "KNOWS".to_string(),
+                count: 20,
+                properties: Vec::new(),
+                endpoints: vec![EndpointInfo {
+                    source: "Person".to_string(),
+                    target: "Person".to_string(),
+                    count: 20,
+                }],
+            }],
+            property_keys: vec!["name".to_string(), "age".to_string()],
+        });
+        let json = serde_json::to_string(&schema).unwrap();
+        let parsed: SchemaInfo = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SchemaInfo::Lpg(lpg) => {
+                assert_eq!(lpg.labels.len(), 1);
+                assert_eq!(lpg.labels[0].name, "Person");
+                assert_eq!(lpg.edge_types[0].count, 20);
+                assert_eq!(lpg.labels[0].properties[0].types, ["INT64", "STRING"]);
+                assert_eq!(lpg.edge_types[0].endpoints[0].target, "Person");
+            }
+            SchemaInfo::Rdf(_) => panic!("Expected LPG schema"),
+        }
+    }
+
+    #[test]
+    fn test_schema_info_rdf_serde() {
+        let schema = SchemaInfo::Rdf(RdfSchemaInfo {
+            predicates: vec![PredicateInfo {
+                iri: "http://xmlns.com/foaf/0.1/knows".to_string(),
+                count: 5,
+            }],
+            named_graphs: vec!["default".to_string()],
+            subject_count: 10,
+            object_count: 15,
+        });
+        let json = serde_json::to_string(&schema).unwrap();
+        let parsed: SchemaInfo = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SchemaInfo::Rdf(rdf) => {
+                assert_eq!(rdf.predicates.len(), 1);
+                assert_eq!(rdf.subject_count, 10);
+            }
+            SchemaInfo::Lpg(_) => panic!("Expected RDF schema"),
+        }
+    }
+
+    #[test]
+    fn test_index_info_serde() {
+        let info = IndexInfo {
+            name: "idx_person_name".to_string(),
+            index_type: "btree".to_string(),
+            target: "Person:name".to_string(),
+            unique: true,
+            cardinality: Some(1000),
+            size_bytes: Some(4096),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: IndexInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "idx_person_name");
+        assert!(parsed.unique);
+    }
+
+    #[test]
+    fn test_wal_status_serde() {
+        let status = WalStatus {
+            enabled: true,
+            path: Some(PathBuf::from("/tmp/wal")),
+            size_bytes: 8192,
+            record_count: 42,
+            last_checkpoint: Some(1700000000),
+            current_epoch: 100,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: WalStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.record_count, 42);
+        assert_eq!(parsed.current_epoch, 100);
+    }
+
+    #[test]
+    fn a_compact_report_round_trips_through_json() {
+        let report = CompactReport {
+            checkpointed: true,
+            versions_collected: 19,
+            rows_compressed: 3,
+            duration_ms: 88,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert_eq!(
+            json,
+            r#"{"checkpointed":true,"versions_collected":19,"rows_compressed":3,"duration_ms":88}"#,
+            "the field names the bindings and server clients read"
+        );
+        let parsed: CompactReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, report);
+        let older: CompactReport = serde_json::from_str(
+            r#"{"checkpointed":false,"versions_collected":2,"duration_ms":1}"#,
+        )
+        .unwrap();
+        assert_eq!(older.rows_compressed, 0, "a report without the field");
+    }
+
+    #[test]
+    fn test_validation_error_serde() {
+        let error = ValidationError {
+            code: "E001".to_string(),
+            message: "Broken reference".to_string(),
+            context: Some("node_id=42".to_string()),
+        };
+        let json = serde_json::to_string(&error).unwrap();
+        let parsed: ValidationError = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.code, "E001");
+        assert_eq!(parsed.context, Some("node_id=42".to_string()));
+    }
+
+    #[test]
+    fn test_validation_warning_serde() {
+        let warning = ValidationWarning {
+            code: "W001".to_string(),
+            message: "High memory usage".to_string(),
+            context: None,
+        };
+        let json = serde_json::to_string(&warning).unwrap();
+        let parsed: ValidationWarning = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.code, "W001");
+        assert!(parsed.context.is_none());
+    }
+}
