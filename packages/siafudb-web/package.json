@@ -1,8 +1,14 @@
 {
-  "name": "@siafudb/web",
+  "name": "@bundu/siafudb-web",
   "version": "0.1.0",
   "description": "SiafuDB for the browser: wasm graph engine in a Worker with encrypted OPFS / IndexedDB persistence.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/siafuDB/siafudb.git",
+    "directory": "packages/siafudb-web"
+  },
+  "homepage": "https://siafudb.org",
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -22,6 +28,9 @@
     "dist",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build:wasm": "node scripts/build-wasm.mjs",
     "build:ts": "tsc -p tsconfig.json && node scripts/copy-wasm.mjs",

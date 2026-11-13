@@ -1,0 +1,150 @@
+name: Publish packages
+
+# Publishes what a release ships to the public registries:
+#   - npm:       the browser package in packages/siafudb-web
+#   - crates.io: the engine crates (siafudb-graph*) and siafudb-core
+#
+# Publishing a version is permanent on both registries: it can be deprecated
+# or yanked, never replaced.
+#
+# Runs in two ways:
+#   - called by release.yml after a GitHub release is cut on main;
+#   - by hand from the Actions tab. A manual run is a dry run unless
+#     "dry_run" is unticked.
+#
+# Both jobs skip versions that are already published, so re-running after a
+# partial failure is safe.
+#
+# npm authentication is trusted publishing (OIDC): no long-lived token. On
+# npmjs.com the package lists this repository as a trusted publisher, and
+# npm exchanges the run's OIDC identity for a short-lived publish token.
+# npm validates the workflow that STARTED the run, so the trusted publisher
+# entry must name `release.yml` (and a second entry `publish.yml` if manual
+# runs should be able to publish). Provenance is attached automatically.
+#
+# A trusted publisher can only be added to a package that already exists, so
+# the very first publish of a new package name needs NPM_TOKEN (or a manual
+# publish). After that the secret can be deleted.
+#
+# Secrets:
+#   NPM_TOKEN             optional; bootstrap only, see above.
+#   CARGO_REGISTRY_TOKEN  crates.io API token. While it is not set, the
+#                         crates job reports that and publishes nothing.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref (release tag) to publish from.
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+    secrets:
+      NPM_TOKEN:
+        required: false
+      CARGO_REGISTRY_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and package only; publish nothing.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-packages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  npm:
+    name: npm${{ inputs.dry_run && ' (dry run)' || '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc # 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false # no caches in release builds
+      - name: Rust toolchain for the wasm build
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+          # Must match the `wasm-bindgen` crate version in crates/siafudb-wasm.
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - run: npm ci
+      - name: Set the package version to the release version
+        working-directory: packages/siafudb-web
+        env:
+          REF: ${{ inputs.ref || '' }}
+        run: |
+          # Released from a tag vX.Y.Z: the npm version is X.Y.Z. A manual
+          # run on a branch keeps the version in package.json.
+          if [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            npm version "${REF#v}" --no-git-tag-version --allow-same-version
+          fi
+          echo "name=$(node -p "require('./package.json').name")" >>"$GITHUB_ENV"
+          echo "version=$(node -p "require('./package.json').version")" >>"$GITHUB_ENV"
+      - name: Build wasm and TypeScript
+        run: npm run build --workspace packages/siafudb-web
+      - name: Unit tests
+        run: npm test --workspace packages/siafudb-web
+      - name: Pack (shows exactly what would be published)
+        working-directory: packages/siafudb-web
+        run: npm pack --dry-run
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        working-directory: packages/siafudb-web
+        env:
+          # Empty once trusted publishing is set up: npm then uses OIDC.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Trusted publishing needs npm 11.5.1 or later.
+          npm --version
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "skip $name@$version (already on npm)"
+            exit 0
+          fi
+          npm publish --access public
+
+  crates:
+    name: crates.io${{ inputs.dry_run && ' (dry run)' || '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - run: rustc --version && cargo --version
+      - name: Dry run
+        if: ${{ inputs.dry_run }}
+        run: scripts/ci/publish-crates.sh --dry-run
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN is not set; crates were not published."
+            exit 0
+          fi
+          scripts/ci/publish-crates.sh

@@ -11,8 +11,8 @@ name: Release
 #
 # Both jobs run in one workflow because siafuDB has no RELEASE_BUMP_TOKEN: a
 # tag pushed with GITHUB_TOKEN starts no other workflow. A hand-pushed v* tag
-# still releases through the second trigger. Nothing is published to
-# crates.io yet.
+# still releases through the second trigger. After the GitHub release, the
+# `publish` job sends the packages to npm and crates.io (publish.yml).
 
 # Versioning policy (nyuchi/.github#80): a release to main is the next
 # MINOR above the highest tag, and the version file must say so (the run
@@ -69,3 +69,16 @@ jobs:
       packages: read
       id-token: write
       attestations: write
+
+  publish:
+    needs: [tag, release]
+    if: ${{ always() && needs.release.result == 'success' }}
+    uses: ./.github/workflows/publish.yml
+    with:
+      ref: ${{ needs.tag.outputs.tag || github.ref_name }}
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    permissions:
+      contents: read
+      id-token: write
