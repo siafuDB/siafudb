@@ -4,7 +4,7 @@ SiafuDB's graph engine is a **fork of GrafeoDB (Apache-2.0), frozen at 0.6.2**.
 
 | Item | Value |
 | --- | --- |
-| Upstream | https://github.com/GrafeoDB/grafeo |
+| Upstream | <https://github.com/GrafeoDB/grafeo> |
 | Baseline version | 0.6.2 (published to crates.io 2026-11-08) |
 | Vendored | 2026-11-12, from the crates.io source packages |
 | Upstream policy | **None.** We do not track, merge, or depend on upstream. No automatic bumps; dependabot is disabled for these paths. |

@@ -46,3 +46,47 @@ fn change_log_keeps_params_separate_from_query_text() {
     assert!(!e.query.contains("a'b"));
     assert_eq!(e.params["value"], "a'b");
 }
+
+#[test]
+fn documents_cannot_collide_with_kv_or_spoof_ids() {
+    let db = SiafuDB::in_memory().unwrap();
+    db.kv_set("session:token", "real-secret").unwrap();
+    // A collection named "KV" must not alias the internal KV label.
+    assert!(
+        db.doc_find("KV", &serde_json::Map::new())
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    db.doc_insert(
+        "KV",
+        serde_json::json!({"key": "session:token", "value": "attacker"}),
+    )
+    .unwrap();
+    assert_eq!(
+        db.kv_get("session:token").unwrap().as_deref(),
+        Some("real-secret")
+    );
+    // Reserved keys cannot be set by callers.
+    assert!(
+        db.doc_insert("notes", serde_json::json!({"_id": "spoofed"}))
+            .is_err()
+    );
+}
+
+#[test]
+fn bound_params_reject_ambiguous_types() {
+    let db = SiafuDB::in_memory().unwrap();
+    let mut p = serde_json::Map::new();
+    p.insert("x".into(), serde_json::json!(["admin"]));
+    assert!(
+        db.query_with_params("MATCH (n) WHERE n.a = $x RETURN n", p)
+            .is_err()
+    );
+    let mut p = serde_json::Map::new();
+    p.insert("x".into(), serde_json::json!(u64::MAX));
+    assert!(
+        db.query_with_params("MATCH (n) WHERE n.a = $x RETURN n", p)
+            .is_err()
+    );
+}

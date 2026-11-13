@@ -28,3 +28,7 @@ profile/governance/
 *-lock.yaml
 package-lock.json
 pnpm-lock.yaml
+
+# Vendored engine fork (GrafeoDB 0.6.2): third-party formatting is preserved
+# verbatim so diffs against upstream stay reviewable. See engine/UPSTREAM.md.
+engine/

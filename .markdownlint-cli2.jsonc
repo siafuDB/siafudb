@@ -1,0 +1,3 @@
+{
+  "ignores": ["engine/**", "**/node_modules/**"],
+}

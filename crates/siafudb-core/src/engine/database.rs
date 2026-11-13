@@ -185,7 +185,7 @@ impl SiafuDB {
         query: &str,
         params: serde_json::Map<String, serde_json::Value>,
     ) -> Result<ExecuteResult, SiafuError> {
-        let bound = to_engine_params(&params);
+        let bound = to_engine_params(&params)?;
         let result = self
             .engine
             .execute_with_params(query, bound)
@@ -218,7 +218,7 @@ impl SiafuDB {
     ) -> Result<QueryResult, SiafuError> {
         let result = self
             .engine
-            .execute_with_params(query, to_engine_params(&params))
+            .execute_with_params(query, to_engine_params(&params)?)
             .map_err(|e| SiafuError::QueryError(e.to_string()))?;
 
         let rows: Vec<Vec<serde_json::Value>> = result
@@ -349,11 +349,24 @@ impl SiafuDB {
             bound.insert("_id".into(), doc_id.to_string().into());
             for (i, (k, v)) in map.iter().enumerate() {
                 let k = ident(k)?;
+                if k.starts_with('_') {
+                    return Err(SiafuError::QueryError(format!(
+                        "document keys starting with '_' are reserved: {k:?}"
+                    )));
+                }
                 let p = format!("p{i}");
                 props.push(format!("{k}: ${p}"));
-                bound.insert(p, v.clone());
+                // Nested arrays/objects are stored as JSON text until nested
+                // documents are decomposed into subgraphs.
+                let v = match v {
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                        serde_json::Value::String(v.to_string())
+                    }
+                    other => other.clone(),
+                };
+                bound.insert(p, v);
             }
-            let query = format!("CREATE (:_{label} {{{}}})", props.join(", "));
+            let query = format!("CREATE (:_doc_{label} {{{}}})", props.join(", "));
             self.execute_with_params(&query, bound)?;
         }
 
@@ -378,9 +391,9 @@ impl SiafuDB {
             bound.insert(p, v.clone());
         }
         let query = if conds.is_empty() {
-            format!("MATCH (d:_{label}) RETURN d")
+            format!("MATCH (d:_doc_{label}) RETURN d")
         } else {
-            format!("MATCH (d:_{label} {{{}}}) RETURN d", conds.join(", "))
+            format!("MATCH (d:_doc_{label} {{{}}}) RETURN d", conds.join(", "))
         };
         self.query_with_params(&query, bound)
     }
@@ -425,7 +438,7 @@ fn params<const N: usize>(
 
 fn to_engine_params(
     p: &serde_json::Map<String, serde_json::Value>,
-) -> std::collections::HashMap<String, grafeo::Value> {
+) -> Result<std::collections::HashMap<String, grafeo::Value>, SiafuError> {
     use serde_json::Value as J;
     p.iter()
         .map(|(k, v)| {
@@ -433,13 +446,26 @@ fn to_engine_params(
                 J::Null => grafeo::Value::Null,
                 J::Bool(b) => grafeo::Value::from(*b),
                 J::String(s) => grafeo::Value::from(s.as_str()),
-                J::Number(n) => match n.as_i64() {
-                    Some(i) => grafeo::Value::from(i),
-                    None => grafeo::Value::from(n.as_f64().unwrap_or(f64::NAN)),
+                J::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+                    (Some(i), _, _) => grafeo::Value::from(i),
+                    // u64 above i64::MAX would silently lose precision as f64.
+                    (None, Some(_), _) => {
+                        return Err(SiafuError::QueryError(format!(
+                            "parameter {k:?}: integer out of range (> i64::MAX)"
+                        )));
+                    }
+                    (None, None, Some(f)) => grafeo::Value::from(f),
+                    _ => unreachable!("serde_json numbers are i64, u64 or f64"),
                 },
-                other => grafeo::Value::from(other.to_string()),
+                // No silent coercion: a list/object would otherwise be bound
+                // as text and match a different value than the caller meant.
+                J::Array(_) | J::Object(_) => {
+                    return Err(SiafuError::QueryError(format!(
+                        "parameter {k:?}: arrays and objects are not supported as bound values"
+                    )));
+                }
             };
-            (k.clone(), v)
+            Ok((k.clone(), v))
         })
         .collect()
 }
