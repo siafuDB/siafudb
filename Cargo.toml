@@ -14,6 +14,7 @@ resolver = "2"
 #   siafudb-server  — Optional standalone server mode for development and testing.
 #   siafudb         — The unified crate that re-exports everything. What users depend on.
 
+exclude = ["engine"] # vendored fork: its own workspace (engine/Cargo.toml), published separately
 members = [
     "crates/siafudb",
     "crates/siafudb-core",
@@ -28,7 +29,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/nyuchi/siafudb"
+repository = "https://github.com/siafuDB/siafudb"
 homepage = "https://siafudb.org"
 description = "The embedded graph database for device, edge, and Web3. Replaces SQLite with graph-native storage."
 keywords = ["database", "graph", "embedded", "edge", "web3"]
@@ -40,7 +41,7 @@ categories = ["database", "data-structures"]
 # SiafuDB-specific capabilities on top. If the relationship evolves,
 # we can fork or reimplement — but we start with dependency, not divergence.
 # default-features off: each consumer picks a profile (siafudb-core: `native` or `browser`).
-grafeo = { path = "engine/grafeo", default-features = false, features = ["gql", "cypher"] }
+grafeo = { package = "siafudb-graph", version = "0.1.0", path = "engine/grafeo", default-features = false, features = ["gql", "cypher"] }
 
 # === Serialization & Data ===
 serde = { version = "1", features = ["derive"] }
@@ -79,19 +80,8 @@ tracing-subscriber = "0.3"
 # === Testing ===
 criterion = { version = "0.5", features = ["html_reports"] }
 
-# Engine fork: GrafeoDB 0.6.2 vendored under engine/ (see engine/UPSTREAM.md).
-# [patch] makes the vendored crates replace every crates.io reference so
-# nothing resolves to upstream.
-[patch.crates-io]
-grafeo = { path = "engine/grafeo" }
-grafeo-adapters = { path = "engine/grafeo-adapters" }
-grafeo-common = { path = "engine/grafeo-common" }
-grafeo-core = { path = "engine/grafeo-core" }
-grafeo-engine = { path = "engine/grafeo-engine" }
-grafeo-storage = { path = "engine/grafeo-storage" }
-
-# Smaller build artifacts (the vendored engine is large; disk is finite on CI
-# and in agent sandboxes).
+# Smaller build artifacts (the engine is large; disk is finite on CI and in
+# agent sandboxes).
 [profile.dev]
 debug = "line-tables-only"
 [profile.test]

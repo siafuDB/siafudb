@@ -12,19 +12,20 @@
 [package]
 edition = "2024"
 rust-version = "1.99.0"
-name = "grafeo-core"
-version = "0.6.2"
-authors = ["S.T. Grond"]
+name = "siafudb-graph-core"
+version = "0.1.0"
+authors = ["S.T. Grond", "The Bundu Foundation and SiafuDB contributors"]
 build = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Core graph models, indexes, and execution primitives for Grafeo"
+description = "Core graph models, indexes, and execution primitives for Grafeo (SiafuDB fork of GrafeoDB 0.6.2)"
 readme = false
 license = "Apache-2.0"
-repository = "https://github.com/GrafeoDB/grafeo"
+repository = "https://github.com/siafuDB/siafudb"
+homepage = "https://siafudb.org"
 resolver = "2"
 
 [features]
@@ -119,7 +120,9 @@ optional = true
 version = "6"
 
 [dependencies.grafeo-common]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-common"
+path = "../grafeo-common"
 
 [dependencies.hashbrown]
 version = "0.17"
@@ -183,7 +186,9 @@ version = "4"
 package = "codspeed-criterion-compat"
 
 [dev-dependencies.grafeo-common]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-common"
+path = "../grafeo-common"
 features = ["testing-rdf-terms"]
 
 [dev-dependencies.serde_json]
@@ -193,7 +198,9 @@ version = "1"
 version = "3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.grafeo-common]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-common"
+path = "../grafeo-common"
 features = ["os-entropy"]
 
 [lints.clippy]

@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "SiafuDB core engine — wraps GrafeoDB with fragment, identity, and mutation tracking."
+description = "SiafuDB core: embedded graph database with fragments, bound-parameter queries, change log, and native/browser profiles. Pre-release."
+rust-version = "1.99"
+readme = "README.md"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 # `native` (default): file-backed persistence, full Grafeo profile.

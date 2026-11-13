@@ -92,6 +92,7 @@ done
 # A crate directory under engine/ that is not in the pin list is also drift.
 for d in "$root"/engine/*/; do
   n="$(basename "$d")"
+  [ "$n" = target ] && continue  # build output (gitignored)
   case " ${crates[*]} " in
     *" $n "*) ;;
     *) echo "FAIL engine/${n}: not a pinned crate"; fail=1 ;;

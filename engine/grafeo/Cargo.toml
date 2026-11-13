@@ -12,15 +12,16 @@
 [package]
 edition = "2024"
 rust-version = "1.99.0"
-name = "grafeo"
-version = "0.6.2"
+authors = ["S.T. Grond", "The Bundu Foundation and SiafuDB contributors"]
+name = "siafudb-graph"
+version = "0.1.0"
 build = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "A high-performance, embeddable graph database with a Rust core and no required C dependencies"
+description = "A high-performance, embeddable graph database with a Rust core and no required C dependencies (SiafuDB fork of GrafeoDB 0.6.2)"
 readme = "README.md"
 keywords = [
     "graph",
@@ -34,7 +35,8 @@ categories = [
     "data-structures",
 ]
 license = "Apache-2.0"
-repository = "https://github.com/GrafeoDB/grafeo"
+repository = "https://github.com/siafuDB/siafudb"
+homepage = "https://siafudb.org"
 resolver = "2"
 
 [features]
@@ -170,14 +172,20 @@ name = "main"
 path = "tests/main.rs"
 
 [dependencies.grafeo-common]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-common"
+path = "../grafeo-common"
 
 [dependencies.grafeo-core]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-core"
+path = "../grafeo-core"
 default-features = false
 
 [dependencies.grafeo-engine]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-engine"
+path = "../grafeo-engine"
 default-features = false
 
 [target.'cfg(all(not(target_os = "windows"), not(target_os = "openbsd"), not(target_env = "musl"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies.tikv-jemallocator]

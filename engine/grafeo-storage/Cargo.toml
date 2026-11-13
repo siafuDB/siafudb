@@ -12,19 +12,20 @@
 [package]
 edition = "2024"
 rust-version = "1.99.0"
-name = "grafeo-storage"
-version = "0.6.2"
-authors = ["S.T. Grond"]
+name = "siafudb-graph-storage"
+version = "0.1.0"
+authors = ["S.T. Grond", "The Bundu Foundation and SiafuDB contributors"]
 build = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Persistence layer for Grafeo: WAL, container format, section I/O"
+description = "Persistence layer for Grafeo: WAL, container format, section I/O (SiafuDB fork of GrafeoDB 0.6.2)"
 readme = false
 license = "Apache-2.0"
-repository = "https://github.com/GrafeoDB/grafeo"
+repository = "https://github.com/siafuDB/siafudb"
+homepage = "https://siafudb.org"
 resolver = "2"
 
 [features]
@@ -78,7 +79,9 @@ version = "0.4"
 optional = true
 
 [dependencies.grafeo-common]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-common"
+path = "../grafeo-common"
 
 [dependencies.memmap2]
 version = "0.9"

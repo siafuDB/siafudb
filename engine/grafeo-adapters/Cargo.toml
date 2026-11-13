@@ -12,19 +12,20 @@
 [package]
 edition = "2024"
 rust-version = "1.99.0"
-name = "grafeo-adapters"
-version = "0.6.2"
-authors = ["S.T. Grond"]
+name = "siafudb-graph-adapters"
+version = "0.1.0"
+authors = ["S.T. Grond", "The Bundu Foundation and SiafuDB contributors"]
 build = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Storage, query language, and plugin adapters for Grafeo"
+description = "Storage, query language, and plugin adapters for Grafeo (SiafuDB fork of GrafeoDB 0.6.2)"
 readme = false
 license = "Apache-2.0"
-repository = "https://github.com/GrafeoDB/grafeo"
+repository = "https://github.com/siafuDB/siafudb"
+homepage = "https://siafudb.org"
 resolver = "2"
 
 [features]
@@ -57,10 +58,14 @@ name = "main"
 path = "tests/main.rs"
 
 [dependencies.grafeo-common]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-common"
+path = "../grafeo-common"
 
 [dependencies.grafeo-core]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-core"
+path = "../grafeo-core"
 default-features = false
 
 [dependencies.parking_lot]

@@ -12,19 +12,20 @@
 [package]
 edition = "2024"
 rust-version = "1.99.0"
-name = "grafeo-common"
-version = "0.6.2"
-authors = ["S.T. Grond"]
+name = "siafudb-graph-common"
+version = "0.1.0"
+authors = ["S.T. Grond", "The Bundu Foundation and SiafuDB contributors"]
 build = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Common types, memory allocators, and utilities for Grafeo"
+description = "Common types, memory allocators, and utilities for Grafeo (SiafuDB fork of GrafeoDB 0.6.2)"
 readme = false
 license = "Apache-2.0"
-repository = "https://github.com/GrafeoDB/grafeo"
+repository = "https://github.com/siafuDB/siafudb"
+homepage = "https://siafudb.org"
 resolver = "2"
 
 [features]

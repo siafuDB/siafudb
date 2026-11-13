@@ -12,19 +12,20 @@
 [package]
 edition = "2024"
 rust-version = "1.99.0"
-name = "grafeo-engine"
-version = "0.6.2"
-authors = ["S.T. Grond"]
+name = "siafudb-graph-engine"
+version = "0.1.0"
+authors = ["S.T. Grond", "The Bundu Foundation and SiafuDB contributors"]
 build = "build.rs"
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Query engine and database management for Grafeo"
+description = "Query engine and database management for Grafeo (SiafuDB fork of GrafeoDB 0.6.2)"
 readme = false
 license = "Apache-2.0"
-repository = "https://github.com/GrafeoDB/grafeo"
+repository = "https://github.com/siafuDB/siafudb"
+homepage = "https://siafudb.org"
 resolver = "2"
 
 [features]
@@ -336,18 +337,26 @@ version = "1.5.3"
 optional = true
 
 [dependencies.grafeo-adapters]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-adapters"
+path = "../grafeo-adapters"
 default-features = false
 
 [dependencies.grafeo-common]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-common"
+path = "../grafeo-common"
 
 [dependencies.grafeo-core]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-core"
+path = "../grafeo-core"
 default-features = false
 
 [dependencies.grafeo-storage]
-version = "0.6.2"
+version = "0.1.0"
+package = "siafudb-graph-storage"
+path = "../grafeo-storage"
 optional = true
 default-features = false
 
