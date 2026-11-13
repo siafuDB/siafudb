@@ -26,10 +26,11 @@ members = [
   "crates/siafudb-wasm",
   "crates/siafudb-ffi",
   "crates/siafudb-store",
+  "crates/siafudb-gsp",
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/siafuDB/siafudb"
@@ -48,6 +49,15 @@ grafeo = { package = "siafudb-graph", version = "0.1.0", path = "engine/grafeo",
   "gql",
   "cypher",
 ] }
+
+# === Graph Sync Protocol ===
+# The protocol crates live in their own repository and are pinned by commit.
+# This `rev` is the one source of truth: CI builds the test relay from it.
+# default-features = false leaves out ML-DSA-65: v0 Personal fragments sign
+# with Ed25519 only, and the browser download is smaller without it. A hybrid
+# author's ops are then held as unverifiable rather than applied.
+gsp-sync = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "5455b11f86ddcf27c4bc4b618176a20578b4b726", default-features = false }
+gsp-wire = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "5455b11f86ddcf27c4bc4b618176a20578b4b726", default-features = false }
 
 # === Serialization & Data ===
 serde = { version = "1", features = ["derive"] }

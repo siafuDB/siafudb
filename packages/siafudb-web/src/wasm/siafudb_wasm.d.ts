@@ -4,6 +4,10 @@
 /**
  * An in-memory SiafuDB instance. Persistence is the caller's job:
  * `exportSnapshot()` / `Database.fromSnapshot()`.
+ *
+ * The `sync*` methods implement device-to-device sync (GSP sync v0) without
+ * doing any I/O: they build and read relay frames and the caller moves the
+ * bytes. Methods that take `now_ms` want `Date.now()`.
  */
 export class Database {
     free(): void;
@@ -18,7 +22,9 @@ export class Database {
      */
     execute(query: string, params_json?: string | null): string;
     /**
-     * Serialise the whole database (plaintext; encrypt before storing).
+     * Serialise the whole database (plaintext; encrypt before storing). In a
+     * sync group the bytes also hold the sync state, which includes the
+     * group's secret: one blob, to be written in one step.
      */
     exportSnapshot(): Uint8Array;
     /**
@@ -33,26 +39,153 @@ export class Database {
      * Run a read query. Returns JSON `{"columns": [...], "rows": [[...]]}`.
      */
     query(query: string, params_json?: string | null): string;
+    /**
+     * Set the string returned by `syncMeta`. Persisted by `exportSnapshot`.
+     */
+    setSyncMeta(meta: string): void;
+    /**
+     * Take the relay's `Ack`. Returns how many items left the outbox.
+     */
+    syncAcceptAck(reply: Uint8Array | number[]): number;
+    /**
+     * Call after every `execute` or `query` while in a sync group: queues
+     * what the call wrote for upload. Returns the number of ops queued.
+     */
+    syncCommit(now_ms: number): number;
+    /**
+     * Create a new sync group with this database as its first device.
+     * Returns the pairing code (a secret) to enter on another device. Data
+     * already in the database is queued for upload.
+     */
+    syncCreate(now_ms: number): string;
+    /**
+     * Whether the database is in a sync group.
+     */
+    syncEnabled(): boolean;
+    /**
+     * Take the relay's `Batch` and apply it. Returns JSON `{"items": n,
+     * "ops": n, "changes": n, "more": bool, "relayReset": bool, "queued": n,
+     * "needsResync": bool, "forked": bool}`; `changes` is the number of
+     * changes applied to the graph. Persist when `ops > 0`. With
+     * `relayReset` or `queued > 0` (local writes that were held back until
+     * the relay had been read are now queued), push.
+     */
+    syncIngestBatch(reply: Uint8Array | number[], now_ms: number): string;
+    /**
+     * Join the sync group of a pairing code.
+     */
+    syncJoin(code: string, now_ms: number): void;
+    /**
+     * Leave the sync group. The data stays; the sync state is dropped.
+     */
+    syncLeave(): void;
+    /**
+     * A string the transport keeps with the database (the relay URL).
+     */
+    syncMeta(): string;
+    /**
+     * The group's pairing code (a secret), to add another device.
+     */
+    syncPairingCode(): string | undefined;
+    /**
+     * Apply received changes that were held because their clock was ahead.
+     * Returns the number of changes applied to the graph.
+     */
+    syncPoll(now_ms: number): number;
+    /**
+     * The `Pull` frame for the current cursor, for `POST /v0/pull`.
+     */
+    syncPullFrame(): Uint8Array;
+    /**
+     * The next `Push` frame for `POST /v0/push`, or `undefined` when there
+     * is nothing to push. Pass the reply body to `syncAcceptAck`.
+     */
+    syncPushFrame(): Uint8Array | undefined;
+    /**
+     * Give a device whose status says `forked` (or whose `ownOpsMissing`
+     * stays above 0 after a complete pull) a new identity in the group so
+     * that it can upload again; writes made meanwhile are queued for
+     * upload. Returns the number of ops queued for them. Throws if the
+     * device is in neither state.
+     */
+    syncRejoin(now_ms: number): number;
+    /**
+     * The bearer token (base64url) for `Authorization: Bearer ...` at the
+     * relay with this origin (`scheme://host[:port]`). Every relay has its
+     * own token. Throws if not in a sync group or the origin is not usable.
+     */
+    syncRelayToken(relay_origin: string): string;
+    /**
+     * After `fromSnapshot`, local writes are held back (status
+     * `holdingWrites`) until a `syncIngestBatch` result has `more: false`:
+     * the stored state may be older than what this device last uploaded,
+     * and it must read its own earlier uploads back before it signs
+     * anything new. Call this when the relay cannot be reached, so that
+     * writes are not held for as long as the device is offline. Returns the
+     * number of ops queued. If the state really was old, the device will
+     * report `forked` once it reads the relay.
+     */
+    syncReleaseWrites(now_ms: number): number;
+    /**
+     * Begin a resync: the next pulls read the relay's log from the start.
+     * Call when a `syncIngestBatch` result or the status says
+     * `needsResync`, with a growing delay between attempts.
+     */
+    syncStartResync(): void;
+    /**
+     * JSON: `null` when not in a sync group, else `{"groupId", "outbox",
+     * "cursor", "localOps", "remoteOps", "pending", "devices", "rejected",
+     * "droppedLocal", "skippedRemote", "lastProblem", "unechoed", "forked",
+     * "ownOpsMissing", "holdingWrites", "needsResync", "relayResets",
+     * "deviceList": [{"id", "own",
+     * "appliedSeq", "pending", "gap", "clockLeadMs", "equivocated"}]}`.
+     */
+    syncStatus(): string;
 }
+
+/**
+ * The canonical form of a relay origin (`scheme://host[:port]`), as the
+ * relay token is bound to it. Throws if `origin` is not an http(s) origin.
+ */
+export function canonicalRelayOrigin(origin: string): string;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_database_free: (a: number, b: number) => void;
+    readonly canonicalRelayOrigin: (a: number, b: number) => [number, number, number, number];
     readonly database_changesSince: (a: number, b: number) => [number, number, number, number];
     readonly database_execute: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly database_exportSnapshot: (a: number) => [number, number, number, number];
     readonly database_fromSnapshot: (a: number, b: number) => [number, number, number];
     readonly database_new: () => [number, number, number];
     readonly database_query: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly database_setSyncMeta: (a: number, b: number, c: number) => void;
+    readonly database_syncAcceptAck: (a: number, b: number, c: number) => [number, number, number];
+    readonly database_syncCommit: (a: number, b: number) => [number, number, number];
+    readonly database_syncCreate: (a: number, b: number) => [number, number, number, number];
+    readonly database_syncEnabled: (a: number) => number;
+    readonly database_syncIngestBatch: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly database_syncJoin: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly database_syncLeave: (a: number) => void;
+    readonly database_syncMeta: (a: number) => [number, number];
+    readonly database_syncPairingCode: (a: number) => [number, number];
+    readonly database_syncPoll: (a: number, b: number) => [number, number, number];
+    readonly database_syncPullFrame: (a: number) => [number, number, number, number];
+    readonly database_syncPushFrame: (a: number) => [number, number, number, number];
+    readonly database_syncRejoin: (a: number, b: number) => [number, number, number];
+    readonly database_syncRelayToken: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly database_syncReleaseWrites: (a: number, b: number) => [number, number, number];
+    readonly database_syncStartResync: (a: number) => [number, number];
+    readonly database_syncStatus: (a: number) => [number, number];
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __externref_table_dealloc: (a: number) => void;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
+    readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_start: () => void;
 }
 

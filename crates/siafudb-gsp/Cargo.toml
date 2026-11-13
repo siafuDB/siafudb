@@ -1,0 +1,27 @@
+[package]
+name = "siafudb-gsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Glue between the SiafuDB engine and the Graph Sync Protocol v0 replica: one object that keeps a database and its replica consistent. Used by the language bindings."
+publish = false
+
+[features]
+# Same profiles as siafudb-core.
+default = ["native"]
+native = ["siafudb-core/native"]
+browser = ["siafudb-core/browser"]
+
+[dependencies]
+siafudb-core = { path = "../siafudb-core", default-features = false }
+gsp-sync = { workspace = true }
+gsp-wire = { workspace = true }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.4"
+
+# getrandom 0.4 needs the wasm_js backend on wasm32-unknown-unknown.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }

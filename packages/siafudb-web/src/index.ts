@@ -1,5 +1,5 @@
 export { SiafuDB } from "./client.js";
-export type { OpenOptions, StorageReport } from "./client.js";
+export type { OpenOptions, StorageReport, SyncApi } from "./client.js";
 export type {
   Backend,
   ChangeLogEntry,
@@ -7,6 +7,11 @@ export type {
   JsonValue,
   Params,
   QueryResult,
+  RemoteChangeEvent,
+  SyncDeviceStatus,
+  SyncRegistrationOptions,
+  SyncRelayOptions,
+  SyncStatus,
 } from "./protocol.js";
 export {
   ClosedError,
