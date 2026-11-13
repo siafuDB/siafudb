@@ -16,6 +16,7 @@ use crate::changelog::{ChangeLog, SharedChangeLog};
 use crate::error::SiafuError;
 use crate::fragment::Fragment;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -81,7 +82,7 @@ pub struct SiafuDB {
     /// When true, every write is captured in the mutation log
     /// for the sync protocol to pick up. Enabled by default;
     /// can be disabled for bulk import performance.
-    mutation_tracking: bool,
+    mutation_tracking: AtomicBool,
 
     /// Path to the database file, if persistent.
     /// None for in-memory databases.
@@ -112,7 +113,7 @@ impl SiafuDB {
             engine,
             fragment: Fragment::new_local(),
             instance_id,
-            mutation_tracking: true,
+            mutation_tracking: AtomicBool::new(true),
             path: Some(path.to_path_buf()),
             change_log: Arc::new(Mutex::new(ChangeLog::new())),
         })
@@ -130,7 +131,7 @@ impl SiafuDB {
             engine,
             fragment: Fragment::new_local(),
             instance_id: Uuid::new_v4(),
-            mutation_tracking: true,
+            mutation_tracking: AtomicBool::new(true),
             path: None,
             change_log: Arc::new(Mutex::new(ChangeLog::new())),
         })
@@ -156,7 +157,7 @@ impl SiafuDB {
             engine,
             fragment: Fragment::new_local(),
             instance_id: Uuid::new_v4(),
-            mutation_tracking: true,
+            mutation_tracking: AtomicBool::new(true),
             path: None,
             change_log: Arc::new(Mutex::new(ChangeLog::new())),
         })
@@ -193,7 +194,7 @@ impl SiafuDB {
 
         let rows_affected = result.rows().len();
 
-        if self.mutation_tracking
+        if self.mutation_tracking.load(Ordering::Relaxed)
             && let Ok(mut log) = self.change_log.lock()
         {
             log.append(query.to_string(), rows_affected, params);
@@ -233,6 +234,24 @@ impl SiafuDB {
         })
     }
 
+    /// Read query with bound parameters returning engine-typed cells
+    /// (bytes, temporal values, etc. are preserved instead of being
+    /// flattened to JSON). Used by the FFI layer.
+    pub fn query_typed_with_params(
+        &self,
+        query: &str,
+        params: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<TypedQueryResult, SiafuError> {
+        let result = self
+            .engine
+            .execute_with_params(query, to_engine_params(&params))
+            .map_err(|e| SiafuError::QueryError(e.to_string()))?;
+        Ok(TypedQueryResult {
+            columns: result.columns.clone(),
+            rows: result.rows().iter().map(|r| r.to_vec()).collect(),
+        })
+    }
+
     /// Get the fragment configuration for this instance.
     ///
     /// The fragment describes what this database holds in relation to
@@ -266,8 +285,11 @@ impl SiafuDB {
     /// Disabling tracking is useful during bulk imports where you don't
     /// want every individual INSERT to be logged for sync. Re-enable
     /// after the import completes.
-    pub fn set_mutation_tracking(&mut self, enabled: bool) {
-        self.mutation_tracking = enabled;
+    ///
+    /// Takes `&self` (an atomic flag) so shared handles, such as the
+    /// UniFFI object wrapper, can toggle it.
+    pub fn set_mutation_tracking(&self, enabled: bool) {
+        self.mutation_tracking.store(enabled, Ordering::Relaxed);
     }
 
     /// Borrow the engine-level change log.
@@ -455,4 +477,11 @@ pub struct ExecuteResult {
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+/// Result of a read query with engine-typed cells.
+#[derive(Debug)]
+pub struct TypedQueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<grafeo::Value>>,
 }
