@@ -1,0 +1,2 @@
+-keep class uniffi.siafudb_ffi.** { *; }
+-keep class com.sun.jna.** { *; }

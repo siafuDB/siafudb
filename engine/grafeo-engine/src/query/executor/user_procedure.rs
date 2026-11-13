@@ -1,0 +1,295 @@
+//! Operator for executing user-defined stored procedures.
+//!
+//! `bind_body` translates the stored GQL body, binds the call's arguments to
+//! its parameters and binds it when the call is planned; the operator plans and
+//! executes it as a sub-query when the call runs, with a planner the session
+//! builds as it builds one for the same statement run directly (see
+//! [`StatementPlanning`]).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use grafeo_common::types::Value;
+use grafeo_common::utils::error::{Error, QueryError, Result};
+use grafeo_core::execution::DataChunk;
+use grafeo_core::execution::operators::{
+    Operator, OperatorError, OperatorResult, ReadCounter, WriteCounter,
+};
+
+use crate::database::QueryResult;
+use crate::query::binder::Binder;
+use crate::query::plan::LogicalPlan;
+use crate::query::processor::substitute_params;
+use crate::session::StatementPlanning;
+
+/// How deep stored procedure calls nest at most: the body of a call this
+/// deep that calls a procedure fails (a procedure that calls itself, for
+/// one), and the check of whether a statement writes takes such a call to
+/// write.
+pub(crate) const MAX_CALL_DEPTH: u8 = 16;
+
+/// The body of procedure `name` with the call's arguments bound to its
+/// parameters, as a statement's parameters are (values, never query text),
+/// translated and bound as a statement is, so a mistake in it is found when
+/// the call is planned, before anything runs.
+///
+/// # Errors
+///
+/// Returns the syntax or semantic error of the body (an unbound variable,
+/// or a parameter the procedure does not declare, for one), its message
+/// naming the procedure.
+pub(crate) fn bind_body(
+    name: &str,
+    body: &str,
+    params: &HashMap<String, Value>,
+) -> Result<LogicalPlan> {
+    let in_procedure = |error: Error| match error {
+        Error::Query(mut query) => {
+            query.message = format!("procedure '{name}': {}", query.message);
+            Error::Query(query)
+        }
+        other => other,
+    };
+    let mut plan = crate::query::translators::gql::translate(body).map_err(in_procedure)?;
+    if plan.default_params.is_empty() {
+        substitute_params(&mut plan, params).map_err(in_procedure)?;
+    } else {
+        let mut merged = plan.default_params.clone();
+        merged.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
+        substitute_params(&mut plan, &merged).map_err(in_procedure)?;
+    }
+    Binder::new().bind(&plan).map_err(in_procedure)?;
+    // A pattern through a node or edge bound before is checked, as in a
+    // session's plan (the optimizer's first pass; the body skips the
+    // optimizer).
+    plan.root = crate::query::optimizer::close_cycles(plan.root);
+    Ok(plan)
+}
+
+/// What the body of a stored procedure runs with.
+pub struct ProcedureContext {
+    /// How the body's planner is built: on the graph its `USE` names, else
+    /// on the calling statement's, in the calling statement's transaction
+    /// (see [`SessionPlanning::for_body`](crate::session::SessionPlanning::for_body)).
+    pub(crate) planning: StatementPlanning,
+    /// The calling statement's write counter: the body's writes count there.
+    pub(crate) write_counter: Arc<WriteCounter>,
+    /// The calling statement's read counter: the body's reads count there.
+    pub(crate) read_counter: Arc<ReadCounter>,
+}
+
+/// An operator that executes a user-defined stored procedure.
+///
+/// On first call to `next()`, it:
+/// 1. Plans the bound body (`bind_body`) with the planner of its graph
+/// 2. Executes it
+/// 3. Buffers the results
+/// 4. Returns results in chunks
+pub struct UserProcedureOperator {
+    /// The bound body, with the call's arguments in place.
+    plan: LogicalPlan,
+    /// Return column names (from procedure definition).
+    return_columns: Vec<String>,
+    /// YIELD column filter (if specified by caller).
+    yield_columns: Option<Vec<String>>,
+    /// How the body's planner is built.
+    planning: StatementPlanning,
+    /// The calling statement's write counter.
+    write_counter: Arc<WriteCounter>,
+    /// The calling statement's read counter.
+    read_counter: Arc<ReadCounter>,
+    /// Buffered result rows from execution.
+    result_rows: Option<Vec<Vec<Value>>>,
+    /// Current row index into buffered results.
+    row_index: usize,
+    /// Output column names after YIELD filtering.
+    output_columns: Vec<String>,
+}
+
+impl UserProcedureOperator {
+    /// Creates a new user procedure operator running `plan`, a body
+    /// `bind_body` bound.
+    pub(crate) fn new(
+        plan: LogicalPlan,
+        return_columns: Vec<String>,
+        yield_columns: Option<Vec<String>>,
+        ctx: ProcedureContext,
+    ) -> Self {
+        let output_columns = if let Some(ref yields) = yield_columns {
+            yields.clone()
+        } else {
+            return_columns.clone()
+        };
+        Self {
+            plan,
+            return_columns,
+            yield_columns,
+            planning: ctx.planning,
+            write_counter: ctx.write_counter,
+            read_counter: ctx.read_counter,
+            result_rows: None,
+            row_index: 0,
+            output_columns,
+        }
+    }
+
+    /// Executes the stored procedure body and buffers the results.
+    fn execute_body(&mut self) -> std::result::Result<(), OperatorError> {
+        let logical_plan = &self.plan;
+
+        // The planner the same statement run directly gets, whose writes
+        // and reads count in the calling statement's counters.
+        let planner = self
+            .planning
+            .clone()
+            .body_planner()
+            .map_err(OperatorError::from)?
+            .with_write_counter(Arc::clone(&self.write_counter))
+            .with_read_counter(Arc::clone(&self.read_counter));
+
+        let physical = planner.plan(logical_plan).map_err(OperatorError::from)?;
+        // Checked before the body runs, so a body that does not fit writes
+        // nothing.
+        let column_indices = self.projection(physical.columns())?;
+
+        // Execute
+        let executor = crate::query::executor::Executor::with_columns(physical.columns().to_vec());
+        let mut root_op = physical.into_operator();
+        let result: QueryResult = executor
+            .execute(root_op.as_mut())
+            .map_err(OperatorError::from)?;
+
+        let body_width = result.columns.len();
+        if let Some(row) = result.rows.iter().find(|row| row.len() != body_width) {
+            return Err(semantic(format!(
+                "stored procedure body has {body_width} columns, but a row has {} values",
+                row.len()
+            )));
+        }
+
+        let rows = match column_indices {
+            None => result.rows,
+            Some(indices) => result
+                .rows
+                .into_iter()
+                .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+                .collect(),
+        };
+
+        self.result_rows = Some(rows);
+        Ok(())
+    }
+
+    /// Which body columns give the output columns, in output order, or
+    /// `None` when the body's columns are the output columns as they are.
+    /// The body gives the declared columns by name, or by position when no
+    /// name matches; a YIELD then picks the declared columns it names.
+    ///
+    /// # Errors
+    ///
+    /// A semantic error when the columns found by name, or the body's
+    /// columns by position, are not as many as the declared ones, so a body
+    /// never returns a value without a column or a column without a value,
+    /// and when a YIELD names a column the procedure does not declare.
+    fn projection(
+        &self,
+        body_columns: &[String],
+    ) -> std::result::Result<Option<Vec<usize>>, OperatorError> {
+        let by_name: Vec<usize> = self
+            .return_columns
+            .iter()
+            .filter_map(|r| body_columns.iter().position(|c| c == r))
+            .collect();
+        let declared: Vec<usize> = if by_name.is_empty() {
+            (0..body_columns.len()).collect()
+        } else {
+            by_name
+        };
+        if declared.len() != self.return_columns.len() {
+            return Err(semantic(format!(
+                "stored procedure body gives {} of its columns, but it declares {}",
+                declared.len(),
+                self.return_columns.len()
+            )));
+        }
+        let indices =
+            match &self.yield_columns {
+                None => declared,
+                Some(yields) => {
+                    yields
+                        .iter()
+                        .map(|y| {
+                            let at = self.return_columns.iter().position(|r| r == y).ok_or_else(|| {
+                        semantic(format!(
+                            "YIELD names '{y}', which the stored procedure does not declare"
+                        ))
+                    })?;
+                            Ok(declared[at])
+                        })
+                        .collect::<std::result::Result<Vec<usize>, OperatorError>>()?
+                }
+            };
+        let as_they_are = indices.len() == body_columns.len()
+            && indices.iter().enumerate().all(|(i, &at)| i == at);
+        Ok((!as_they_are).then_some(indices))
+    }
+}
+
+/// A semantic error from the operator.
+fn semantic(message: String) -> OperatorError {
+    Error::from(QueryError::semantic(message)).into()
+}
+
+impl Operator for UserProcedureOperator {
+    fn next(&mut self) -> OperatorResult {
+        // Execute on first call
+        if self.result_rows.is_none() {
+            self.execute_body()?;
+        }
+
+        let rows = self
+            .result_rows
+            .as_ref()
+            .expect("result_rows populated by execute_body");
+        if self.row_index >= rows.len() {
+            return Ok(None);
+        }
+
+        // Return up to CHUNK_SIZE rows
+        const CHUNK_SIZE: usize = 1024;
+        let end = (self.row_index + CHUNK_SIZE).min(rows.len());
+        let chunk_rows = end - self.row_index;
+
+        let col_count = self.output_columns.len();
+
+        let types: Vec<grafeo_common::types::LogicalType> =
+            vec![grafeo_common::types::LogicalType::Any; col_count];
+        let mut chunk = DataChunk::with_capacity(&types, chunk_rows);
+
+        for row_idx in self.row_index..end {
+            let row = &rows[row_idx];
+            for (col_idx, val) in row.iter().enumerate() {
+                if let Some(col) = chunk.column_mut(col_idx) {
+                    col.push_value(val.clone());
+                }
+            }
+        }
+        chunk.set_count(chunk_rows);
+
+        self.row_index = end;
+        Ok(Some(chunk))
+    }
+
+    fn reset(&mut self) {
+        self.row_index = 0;
+        self.result_rows = None;
+    }
+
+    fn name(&self) -> &'static str {
+        "UserProcedure"
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+}

@@ -1,0 +1,464 @@
+//! PROFILE statement: per-operator execution metrics.
+//!
+//! After a profiled query executes, the results are collected into a
+//! [`ProfileNode`] tree that mirrors the physical operator tree, annotated
+//! with actual row counts, timing, and call counts. The result of `PROFILE`
+//! holds it twice: as text in its one cell, and as a [`QueryProfile`] in
+//! [`QueryResult::profile`].
+
+use std::fmt::Write;
+use std::sync::Arc;
+
+use grafeo_common::types::{LogicalType, Value};
+use grafeo_core::execution::profile::{ProfileStats, SharedProfileStats};
+use parking_lot::Mutex;
+
+use super::plan::LogicalOperator;
+use crate::database::QueryResult;
+
+/// A node in the profile output tree, corresponding to one physical operator.
+#[derive(Debug)]
+pub struct ProfileNode {
+    /// Operator name (e.g., "NodeScan", "Filter", "Expand").
+    pub name: String,
+    /// Display label (e.g., "(n:Person)", "(n.age > 25) [label-first]").
+    pub label: String,
+    /// Shared stats handle, populated during execution.
+    pub stats: SharedProfileStats,
+    /// Child nodes.
+    pub children: Vec<ProfileNode>,
+    /// Whether a fast path of the operator above absorbed this one: it ran
+    /// as part of that operator, which the tree shows instead.
+    pub absorbed: bool,
+}
+
+/// The profile of a statement run with `PROFILE`: the operators that ran, as
+/// a tree, with the rows each one produced and the time it took.
+///
+/// # Stability: Experimental
+///
+/// New in 0.6.0; operators and fields may still change in any release, with a
+/// CHANGELOG entry (see <https://grafeo.dev/stability/>).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[non_exhaustive]
+pub struct QueryProfile {
+    /// The operator that produces the statement's result.
+    pub root: OperatorProfile,
+    /// The time of the profiled run, in milliseconds; the result's
+    /// `execution_time_ms` adds parsing, planning and the commit.
+    pub total_time_ms: f64,
+}
+
+/// One operator of a [`QueryProfile`].
+///
+/// # Stability: Experimental
+///
+/// See [`QueryProfile`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[non_exhaustive]
+pub struct OperatorProfile {
+    /// The operator, for example `NodeScan`, `Filter` or `Expand`.
+    pub operator: String,
+    /// What it works on, for example `n:Person` or the index it reads.
+    pub detail: String,
+    /// The rows it produced.
+    pub rows: u64,
+    /// How often it was asked for a chunk of rows.
+    pub calls: u64,
+    /// Its own time, without the operators below it, in milliseconds.
+    pub self_time_ms: f64,
+    /// Its time with the operators below it, in milliseconds.
+    pub time_ms: f64,
+    /// The operators it reads from.
+    pub children: Vec<OperatorProfile>,
+}
+
+impl OperatorProfile {
+    /// The profile of `node` and the operators below it.
+    fn of(node: &ProfileNode) -> Self {
+        let stats = node.stats.lock().clone();
+        Self {
+            operator: node.name.clone(),
+            detail: node.label.clone(),
+            rows: stats.rows_out,
+            calls: stats.calls,
+            self_time_ms: nanos_to_ms(self_time_ns(node)),
+            time_ms: nanos_to_ms(stats.time_ns),
+            children: node.children.iter().map(Self::of).collect(),
+        }
+    }
+}
+
+/// Nanoseconds as milliseconds.
+fn nanos_to_ms(nanos: u64) -> f64 {
+    nanos as f64 / 1_000_000.0
+}
+
+/// An entry collected during physical planning, used to build the profile tree.
+pub struct ProfileEntry {
+    /// Operator name from `Operator::name()`.
+    pub name: String,
+    /// Human-readable label from the logical operator.
+    pub label: String,
+    /// Shared stats handle passed to the `ProfiledOperator` wrapper.
+    pub stats: SharedProfileStats,
+    /// Whether a fast path of the operator above absorbed this one (see
+    /// [`absorbed`](Self::absorbed)).
+    pub absorbed: bool,
+    /// Whether the operator was planned as its input (see
+    /// [`folded`](Self::folded)).
+    pub folded: bool,
+}
+
+impl ProfileEntry {
+    /// Creates a new profile entry with fresh (empty) stats.
+    pub fn new(name: &str, label: String) -> (Self, SharedProfileStats) {
+        let stats = Arc::new(Mutex::new(ProfileStats::default()));
+        let entry = Self {
+            name: name.to_string(),
+            label,
+            stats: Arc::clone(&stats),
+            absorbed: false,
+            folded: false,
+        };
+        (entry, stats)
+    }
+
+    /// The entry of a logical operator that a fast path of the operator
+    /// above absorbed (a scan an index lookup replaced, say): the profile
+    /// tree leaves it out and names it in that operator's detail.
+    #[must_use]
+    pub fn absorbed(name: &str, label: String) -> Self {
+        let (mut entry, _stats) = Self::new(name, label);
+        entry.absorbed = true;
+        entry
+    }
+
+    /// The entry of a logical operator planned as its one input, as it is
+    /// (a projection of the input's columns in their order): it runs
+    /// nothing, and the profile tree shows the input in its place.
+    #[must_use]
+    pub fn folded(label: String) -> Self {
+        let (mut entry, _stats) = Self::new("", label);
+        entry.folded = true;
+        entry
+    }
+}
+
+/// Builds a `ProfileNode` tree from the logical plan and the
+/// [`ProfileEntry`] items collected during physical planning, one for each
+/// logical operator.
+///
+/// The entries must be in **post-order** (children before parents),
+/// matching the order in which `plan_operator()` processes operators.
+///
+/// # Errors
+///
+/// An internal error when the entries are fewer or more than the logical
+/// operators: a planner path that replaced operators without recording
+/// their entries (or recorded too many). Such a profile would put each
+/// operator's numbers on the wrong line, so none is shown. An error, not a
+/// panic: PROFILE runs inside a library call, which must not unwind into
+/// the caller over a profile.
+pub fn build_profile_tree(
+    logical: &LogicalOperator,
+    entries: Vec<ProfileEntry>,
+) -> grafeo_common::utils::error::Result<ProfileNode> {
+    let count = entries.len();
+    let mut entries = entries.into_iter();
+    let tree = tree_of(logical, &mut entries, count)?;
+    let left = entries.len();
+    if left > 0 {
+        return Err(mismatch(format!(
+            "{left} of the {count} profile entries are left over once each logical \
+             operator has one"
+        )));
+    }
+    Ok(tree)
+}
+
+/// The internal error of a profile whose entries do not match the plan.
+fn mismatch(detail: String) -> grafeo_common::utils::error::Error {
+    grafeo_common::utils::error::Error::Internal(format!(
+        "PROFILE cannot match the operators that ran to the plan ({detail}): please \
+         report this query"
+    ))
+}
+
+/// The tree of `logical` from `entries` (see [`build_profile_tree`]), of
+/// `count` entries in all.
+fn tree_of(
+    logical: &LogicalOperator,
+    entries: &mut std::vec::IntoIter<ProfileEntry>,
+    count: usize,
+) -> grafeo_common::utils::error::Result<ProfileNode> {
+    // Recurse into children first (post-order)
+    let built = logical
+        .children()
+        .into_iter()
+        .map(|child| tree_of(child, entries, count))
+        .collect::<grafeo_common::utils::error::Result<Vec<ProfileNode>>>()?;
+
+    // Consume the entry for this node
+    let entry = entries.next().ok_or_else(|| {
+        mismatch(format!(
+            "the {count} profile entries ran out at the operator '{}'",
+            logical.display_label()
+        ))
+    })?;
+
+    // An operator planned as its input has no line: the input takes its
+    // place.
+    if entry.folded && built.len() == 1 {
+        return Ok(built.into_iter().next().expect("one child"));
+    }
+
+    // An absorbed child ran as part of this operator: its children become
+    // this one's, and this operator's detail names it.
+    let mut label = entry.label;
+    let mut children = Vec::with_capacity(built.len());
+    for child in built {
+        if child.absorbed {
+            let taken = if child.label.is_empty() {
+                child.name
+            } else {
+                format!("{} {}", child.name, child.label)
+            };
+            label = if label.is_empty() {
+                taken
+            } else {
+                format!("{label}, {taken}")
+            };
+            children.extend(child.children);
+        } else {
+            children.push(child);
+        }
+    }
+
+    Ok(ProfileNode {
+        name: entry.name,
+        label,
+        stats: entry.stats,
+        children,
+        absorbed: entry.absorbed,
+    })
+}
+
+/// Formats a `ProfileNode` tree into a human-readable text representation
+/// and wraps it in a `QueryResult` with a single "profile" column.
+pub fn profile_result(root: &ProfileNode, total_time_ms: f64) -> QueryResult {
+    let mut output = String::new();
+    format_node(&mut output, root, 0);
+    let _ = writeln!(output);
+    let _ = write!(output, "Total time: {total_time_ms:.2}ms");
+
+    QueryResult {
+        columns: vec!["profile".to_string()],
+        column_types: vec![LogicalType::String],
+        rows: vec![vec![Value::String(output.into())]],
+        execution_time_ms: Some(total_time_ms),
+        rows_scanned: None,
+        status_message: None,
+        gql_status: grafeo_common::utils::GqlStatus::SUCCESS,
+        counters: Default::default(),
+        profile: Some(QueryProfile {
+            root: OperatorProfile::of(root),
+            total_time_ms,
+        }),
+        kind: crate::database::ResultKind::Rows,
+        warnings: Vec::new(),
+    }
+}
+
+/// Recursively formats a profile node with indentation.
+fn format_node(out: &mut String, node: &ProfileNode, depth: usize) {
+    let indent = "  ".repeat(depth);
+
+    // Compute self-time before locking stats (self_time_ns also locks).
+    let self_time_ms = nanos_to_ms(self_time_ns(node));
+
+    let rows_out = node.stats.lock().rows_out;
+
+    let _ = writeln!(
+        out,
+        "{indent}{name} ({label})  rows={rows}  time={time:.2}ms",
+        name = node.name,
+        label = node.label,
+        rows = rows_out,
+        time = self_time_ms,
+    );
+
+    for child in &node.children {
+        format_node(out, child, depth + 1);
+    }
+}
+
+/// Computes self-time: wall time minus children's wall time.
+fn self_time_ns(node: &ProfileNode) -> u64 {
+    let own_time = node.stats.lock().time_ns;
+    let child_time: u64 = node.children.iter().map(|c| c.stats.lock().time_ns).sum();
+    own_time.saturating_sub(child_time)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::plan::{
+        FilterOp, LogicalExpression, LogicalOperator, NodeScanOp, ReturnItem, ReturnOp,
+    };
+
+    /// Builds a simple `Return(Filter(NodeScan))` tree for profile-tree tests.
+    fn three_level_plan() -> LogicalOperator {
+        LogicalOperator::Return(ReturnOp {
+            items: vec![ReturnItem {
+                expression: LogicalExpression::Variable("n".to_string()),
+                alias: None,
+            }],
+            distinct: false,
+            input: Box::new(LogicalOperator::Filter(FilterOp {
+                predicate: LogicalExpression::Literal(grafeo_common::types::Value::Bool(true)),
+                input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "n".to_string(),
+                    label: Some("Person".to_string()),
+                    input: None,
+                })),
+                pushdown_hint: None,
+            })),
+        })
+    }
+
+    /// Verifies the builder walks in post-order: children must be consumed
+    /// before their parent. Also checks that self-time subtracts child time.
+    #[test]
+    fn test_profile_tree_post_order() {
+        let plan = three_level_plan();
+
+        // Provide three entries, ordered post-order: NodeScan, Filter, Return.
+        // Pre-set distinct wall-times on each so we can check self_time subtraction.
+        let (scan_entry, scan_stats) = ProfileEntry::new("NodeScan", "n:Person".to_string());
+        let (filter_entry, filter_stats) = ProfileEntry::new("Filter", "true".to_string());
+        let (return_entry, return_stats) = ProfileEntry::new("Return", "n".to_string());
+
+        scan_stats.lock().time_ns = 100;
+        scan_stats.lock().rows_out = 10;
+        filter_stats.lock().time_ns = 250; // Includes child (100) + 150 own
+        filter_stats.lock().rows_out = 10;
+        return_stats.lock().time_ns = 400; // Includes child (250) + 150 own
+        return_stats.lock().rows_out = 10;
+
+        let root = build_profile_tree(&plan, vec![scan_entry, filter_entry, return_entry]).unwrap();
+
+        // Root is Return, its child is Filter, whose child is NodeScan.
+        assert_eq!(root.name, "Return");
+        assert_eq!(root.children.len(), 1);
+        let filter = &root.children[0];
+        assert_eq!(filter.name, "Filter");
+        assert_eq!(filter.children.len(), 1);
+        let scan = &filter.children[0];
+        assert_eq!(scan.name, "NodeScan");
+        assert!(scan.children.is_empty());
+
+        // Self-time subtracts children: Return = 400 - 250 = 150; Filter = 250 - 100 = 150.
+        assert_eq!(self_time_ns(&root), 150);
+        assert_eq!(self_time_ns(filter), 150);
+        // Leaf has no children, so self = own time.
+        assert_eq!(self_time_ns(scan), 100);
+    }
+
+    /// An operator planned as its input has no node: its input takes its
+    /// place under the operator above, with the input's own stats.
+    #[test]
+    fn a_folded_operator_leaves_its_input_in_its_place() {
+        let plan = three_level_plan();
+        let (scan_entry, scan_stats) = ProfileEntry::new("NodeScan", "n:Person".to_string());
+        let (return_entry, _) = ProfileEntry::new("Return", "n".to_string());
+        scan_stats.lock().rows_out = 10;
+
+        let root = build_profile_tree(
+            &plan,
+            vec![
+                scan_entry,
+                ProfileEntry::folded("true".to_string()),
+                return_entry,
+            ],
+        )
+        .expect("every entry is read, and one for each operator");
+
+        assert_eq!(root.name, "Return");
+        assert_eq!(root.children.len(), 1);
+        let scan = &root.children[0];
+        assert_eq!(scan.name, "NodeScan");
+        assert_eq!(scan.stats.lock().rows_out, 10);
+    }
+
+    /// Fewer entries than operators (a planner path that records none for
+    /// the operators it replaces) or more is an internal error naming the
+    /// mismatch, not a panic: PROFILE runs inside a library call.
+    #[test]
+    fn entries_that_do_not_match_the_operators_are_an_internal_error() {
+        let plan = three_level_plan();
+        let (scan_entry, _) = ProfileEntry::new("NodeScan", "n:Person".to_string());
+        let (return_entry, _) = ProfileEntry::new("Return", "n".to_string());
+        let error = build_profile_tree(&plan, vec![scan_entry, return_entry])
+            .expect_err("two entries for three operators");
+        assert!(
+            matches!(&error, grafeo_common::utils::error::Error::Internal(_)),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("the 2 profile entries ran out at the operator 'n'"),
+            "{message}"
+        );
+
+        let entries = ["NodeScan", "Filter", "Return", "Return"]
+            .into_iter()
+            .map(|name| ProfileEntry::new(name, String::new()).0)
+            .collect();
+        let error = build_profile_tree(&plan, entries).expect_err("four entries for three");
+        assert!(
+            matches!(&error, grafeo_common::utils::error::Error::Internal(_)),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("1 of the 4 profile entries are left over"),
+            "{message}"
+        );
+    }
+
+    /// Sanity check for the formatted output produced by `profile_result`.
+    #[test]
+    fn test_profile_result_formatting_and_saturating_self_time() {
+        // Build a tree where child time exceeds parent time: saturating_sub
+        // should produce 0 rather than underflowing.
+        let plan = LogicalOperator::Filter(FilterOp {
+            predicate: LogicalExpression::Literal(grafeo_common::types::Value::Bool(true)),
+            input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                variable: "n".to_string(),
+                label: None,
+                input: None,
+            })),
+            pushdown_hint: None,
+        });
+        let (scan_entry, scan_stats) = ProfileEntry::new("NodeScan", "n:*".to_string());
+        let (filter_entry, filter_stats) = ProfileEntry::new("Filter", "true".to_string());
+        // Child dwarfs parent: child=500, parent=100 -> self should saturate at 0.
+        scan_stats.lock().time_ns = 500;
+        filter_stats.lock().time_ns = 100;
+        filter_stats.lock().rows_out = 3;
+
+        let root = build_profile_tree(&plan, vec![scan_entry, filter_entry]).unwrap();
+        assert_eq!(self_time_ns(&root), 0);
+
+        let result = profile_result(&root, 1.23);
+        assert_eq!(result.columns, vec!["profile".to_string()]);
+        let text = match &result.rows[0][0] {
+            grafeo_common::types::Value::String(s) => s.to_string(),
+            other => panic!("expected String, got {other:?}"),
+        };
+        assert!(text.contains("Filter"));
+        assert!(text.contains("NodeScan"));
+        assert!(text.contains("Total time: 1.23ms"));
+    }
+}

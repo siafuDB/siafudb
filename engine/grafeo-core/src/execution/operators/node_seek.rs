@@ -1,0 +1,439 @@
+//! Node seek: the nodes an input row's key selects, found by ID or through a
+//! property index instead of a scan (an index nested-loop join).
+
+use std::sync::Arc;
+
+use grafeo_common::types::{LogicalType, NodeId, ReadView, Value};
+
+use super::value_utils::{EqualAcrossKinds, ValueKinds};
+use super::{ExpressionPredicate, Operator, OperatorError, OperatorResult, ReadCounter};
+use crate::execution::DataChunk;
+use crate::graph::GraphStore;
+
+/// What a seek key selects nodes by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeekKey {
+    /// The node ID: `id(n) = key`.
+    Id,
+    /// A property value, through the property index: `n.property = key`.
+    Property(String),
+}
+
+/// For each input row, finds the nodes its key selects and emits the row
+/// joined with each of them.
+///
+/// The key is evaluated per row, so it may come from the row itself (an
+/// `UNWIND` element, a variable of an earlier `MATCH`) as well as from a
+/// constant. With `list` set the key is a list and each element is looked up
+/// (`IN`). A NULL or NaN key selects nothing.
+///
+/// Only nodes visible to the query that carry the scan's label are emitted.
+/// The seek produces candidates for the filter it replaces, which stays on top
+/// and decides: a candidate whose value no longer matches (the index holds the
+/// latest value) is dropped there, so results equal those of a scan. The
+/// index finds every value `=` may find equal to the key, across types and
+/// spellings (`1 = 1.0`, `42 = '042'`, see
+/// [`GraphStore::find_nodes_maybe_equal`](crate::graph::GraphStore::find_nodes_maybe_equal));
+/// a store that cannot look a key up that way gives every node.
+pub struct NodeSeekOperator {
+    store: Arc<dyn GraphStore>,
+    input: Box<dyn Operator>,
+    key: SeekKey,
+    /// Evaluates the key for an input row.
+    key_expression: ExpressionPredicate,
+    list: bool,
+    label: Option<String>,
+    /// The labels whose indexes together hold every result; none: the key's on every label.
+    index_labels: Vec<String>,
+    /// What the statement's `=` gives across kinds, which decides whether an index answers.
+    equal: EqualAcrossKinds,
+    /// Who reads: the seek finds the nodes this view sees.
+    view: ReadView,
+    chunk_capacity: usize,
+    /// The input chunk being joined, its next row, and the row whose
+    /// matches are being emitted.
+    current_input: Option<DataChunk>,
+    next_row: usize,
+    current_row: usize,
+    matches: Vec<NodeId>,
+    next_match: usize,
+    /// Counts the node IDs the lookups return.
+    reads: Option<Arc<ReadCounter>>,
+}
+
+/// The nodes whose `property` may be equal to `value` under `=`, through the indexes on `labels`
+/// (one read each: a node with two of them comes twice), or with no label the index on every
+/// label. The caller's labels hold every result, and it checks them. `None` when one of the
+/// indexes is not there, or cannot answer as a statement whose `=` gives `equal` across kinds
+/// compares (see [`find_indexed_as_compared`]).
+///
+/// # Errors
+///
+/// The error of a read the store cannot do.
+pub fn find_through_label_indexes(
+    store: &dyn GraphStore,
+    labels: &[String],
+    property: &str,
+    value: &Value,
+    view: ReadView,
+    equal: EqualAcrossKinds,
+) -> grafeo_common::utils::error::Result<Option<Vec<NodeId>>> {
+    let Some((first, rest)) = labels.split_first() else {
+        return find_indexed_as_compared(store, &[], property, value, view, equal);
+    };
+    let Some(mut found) = find_indexed_as_compared(store, &[first], property, value, view, equal)?
+    else {
+        return Ok(None);
+    };
+    for label in rest {
+        match find_indexed_as_compared(store, &[label], property, value, view, equal)? {
+            Some(nodes) => found.extend(nodes),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(found))
+}
+
+/// [`GraphStore::find_indexed_maybe_equal`] for a statement whose `=` gives `equal` across
+/// kinds: where `=` raises (SQL/PGQ), only an index that has held no value of another kind than
+/// `value`'s answers, as only the values themselves can say whether the statement raises; `None`
+/// otherwise, for the caller to read them.
+///
+/// # Errors
+///
+/// The error of a read the store cannot do.
+pub fn find_indexed_as_compared(
+    store: &dyn GraphStore,
+    labels: &[&str],
+    property: &str,
+    value: &Value,
+    view: ReadView,
+    equal: EqualAcrossKinds,
+) -> grafeo_common::utils::error::Result<Option<Vec<NodeId>>> {
+    if equal == EqualAcrossKinds::Raises
+        && !value.is_null()
+        && !store
+            .index_kinds(labels, property)
+            .is_some_and(|held| held.within(ValueKinds::of(value)))
+    {
+        return Ok(None);
+    }
+    store.find_indexed_maybe_equal(labels, property, value, view)
+}
+
+impl NodeSeekOperator {
+    /// Creates a seek of `key` (evaluated by `key_expression` over the input
+    /// rows) for nodes with `label` that `view` sees.
+    #[must_use]
+    pub fn new(
+        store: Arc<dyn GraphStore>,
+        input: Box<dyn Operator>,
+        key: SeekKey,
+        key_expression: ExpressionPredicate,
+        label: Option<String>,
+        view: ReadView,
+    ) -> Self {
+        Self {
+            store,
+            input,
+            key,
+            key_expression,
+            list: false,
+            label,
+            index_labels: Vec::new(),
+            equal: EqualAcrossKinds::False,
+            view,
+            chunk_capacity: 2048,
+            current_input: None,
+            next_row: 0,
+            current_row: 0,
+            matches: Vec::new(),
+            next_match: 0,
+            reads: None,
+        }
+    }
+
+    /// Looks a key up through the indexes of these labels, which together hold every result
+    /// (see [`find_through_label_indexes`]), rather than the key's index on every label.
+    #[must_use]
+    pub fn with_index_labels(mut self, labels: Vec<String>) -> Self {
+        self.index_labels = labels;
+        self
+    }
+
+    /// Reads an index only where it answers as a statement whose `=` gives `equal` across kinds
+    /// compares (see [`find_indexed_as_compared`]).
+    #[must_use]
+    pub fn with_equal_across_kinds(mut self, equal: EqualAcrossKinds) -> Self {
+        self.equal = equal;
+        self
+    }
+
+    /// Looks up each element of a list key (`n.p IN key`).
+    #[must_use]
+    pub fn with_list_key(mut self) -> Self {
+        self.list = true;
+        self
+    }
+
+    /// Counts the node IDs the lookups return in `reads`, before the
+    /// visibility and label checks.
+    #[must_use]
+    pub fn with_read_counter(mut self, reads: Arc<ReadCounter>) -> Self {
+        self.reads = Some(reads);
+        self
+    }
+
+    /// The visible nodes with the label that the key of `row` selects, in ID
+    /// order.
+    fn find(&self, chunk: &DataChunk, row: usize) -> Result<Vec<NodeId>, OperatorError> {
+        let Some(key) = self.key_expression.eval_at(chunk, row)? else {
+            return Ok(Vec::new());
+        };
+        let keys = if self.list {
+            match key {
+                Value::List(items) => items.iter().cloned().collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            vec![key]
+        };
+        let mut found = Vec::new();
+        for key in &keys {
+            match &self.key {
+                SeekKey::Id => found.extend(node_ids(key)),
+                SeekKey::Property(property) => {
+                    match find_through_label_indexes(
+                        self.store.as_ref(),
+                        &self.index_labels,
+                        property,
+                        key,
+                        self.view,
+                        self.equal,
+                    )? {
+                        Some(nodes) => found.extend(nodes),
+                        // The store cannot look the key up: every node is a
+                        // candidate, as for the scan the seek replaces.
+                        None => found.extend(self.store.node_ids(self.view)?),
+                    }
+                }
+            }
+        }
+        super::read_counter::count(self.reads.as_deref(), found.len());
+        found.sort_unstable();
+        found.dedup();
+        let mut seen = Vec::with_capacity(found.len());
+        for id in found {
+            if self.visible_with_label(id)? {
+                seen.push(id);
+            }
+        }
+        Ok(seen)
+    }
+
+    /// Whether the query sees node `id` with the scan's label: a label check
+    /// at the view, without building the node.
+    fn visible_with_label(&self, id: NodeId) -> Result<bool, OperatorError> {
+        Ok(match self.label.as_deref() {
+            Some(label) => self.store.node_has_label(id, label, self.view)? == Some(true),
+            None => self.store.is_node_visible(id, self.view)?,
+        })
+    }
+
+    /// Joins rows of `chunk`, from `next_row` on, with their matches until
+    /// the output is full or the chunk is done.
+    fn fill(&mut self, chunk: &DataChunk) -> Result<Option<DataChunk>, OperatorError> {
+        let columns = chunk.column_count();
+        let mut schema: Vec<LogicalType> = (0..columns)
+            .map(|i| {
+                chunk
+                    .column(i)
+                    .map_or(LogicalType::Any, |c| c.data_type().clone())
+            })
+            .collect();
+        schema.push(LogicalType::Node);
+        let mut output = DataChunk::with_capacity(&schema, self.chunk_capacity);
+        let mut count = 0;
+        while count < self.chunk_capacity {
+            if self.next_match >= self.matches.len() {
+                if self.next_row >= chunk.row_count() {
+                    break;
+                }
+                self.current_row = self.next_row;
+                self.next_row += 1;
+                self.matches = self.find(chunk, self.current_row)?;
+                self.next_match = 0;
+                continue;
+            }
+            for column in 0..columns {
+                if let (Some(source), Some(target)) =
+                    (chunk.column(column), output.column_mut(column))
+                {
+                    source.copy_row_to(self.current_row, target);
+                }
+            }
+            if let Some(target) = output.column_mut(columns) {
+                target.push_node_id(self.matches[self.next_match]);
+            }
+            self.next_match += 1;
+            count += 1;
+        }
+        Ok((count > 0).then(|| {
+            output.set_count(count);
+            output
+        }))
+    }
+}
+
+impl Operator for NodeSeekOperator {
+    fn next(&mut self) -> OperatorResult {
+        loop {
+            let chunk = match self.current_input.take() {
+                Some(chunk) => chunk,
+                None => {
+                    let Some(mut chunk) = self.input.next()? else {
+                        return Ok(None);
+                    };
+                    chunk.flatten();
+                    self.next_row = 0;
+                    self.matches.clear();
+                    self.next_match = 0;
+                    chunk
+                }
+            };
+            let output = self.fill(&chunk)?;
+            let done = self.next_row >= chunk.row_count() && self.next_match >= self.matches.len();
+            if !done {
+                self.current_input = Some(chunk);
+            }
+            if output.is_some() {
+                return Ok(output);
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.input.reset();
+        self.current_input = None;
+        self.next_row = 0;
+        self.current_row = 0;
+        self.matches.clear();
+        self.next_match = 0;
+    }
+
+    fn name(&self) -> &'static str {
+        "NodeSeek"
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+}
+
+/// The node IDs `=` finds equal to a key, as the filter `id(n) = key`
+/// compares an ID (an integer) with it: the integer itself, a float of
+/// exactly its value, or a whole decimal of its value. A string is not a
+/// number, so it finds none.
+pub(super) fn node_ids(key: &Value) -> Vec<NodeId> {
+    let id = match key {
+        Value::Int64(id) => Some(*id),
+        Value::Float64(f) => exact_integer(*f),
+        Value::Decimal(d) if d.floor() == *d => d.trunc_to_i64(),
+        _ => None,
+    };
+    id.and_then(|id| u64::try_from(id).ok())
+        .map(NodeId::new)
+        .into_iter()
+        .collect()
+}
+
+/// The integer `=` finds equal to a float: the float's own value, when it is
+/// whole and within the `i64` range.
+fn exact_integer(f: f64) -> Option<i64> {
+    // 2^63 as f64 is exact; every integral float in [-2^63, 2^63) fits i64.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if f.fract() != 0.0 || !(-LIMIT..LIMIT).contains(&f) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "f is integral and within [-2^63, 2^63), checked above, so the cast is exact"
+    )]
+    Some(f as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::operators::{FilterExpression, SingleRowOperator};
+    use crate::graph::rowgroup::RowGroupStore;
+    use std::collections::HashMap;
+
+    fn seek(
+        store: &Arc<RowGroupStore>,
+        key: SeekKey,
+        value: Value,
+        label: Option<&str>,
+    ) -> Vec<NodeId> {
+        let dyn_store: Arc<dyn GraphStore> = Arc::clone(store) as Arc<dyn GraphStore>;
+        let key_expression = ExpressionPredicate::new(
+            FilterExpression::Literal(value),
+            HashMap::new(),
+            Arc::clone(&dyn_store),
+            ReadView::latest(),
+        );
+        let mut op = NodeSeekOperator::new(
+            dyn_store,
+            Box::new(SingleRowOperator::new()),
+            key,
+            key_expression,
+            label.map(ToString::to_string),
+            ReadView::latest(),
+        );
+        let mut found = Vec::new();
+        while let Some(chunk) = op.next().unwrap() {
+            let column = chunk.column(chunk.column_count() - 1).unwrap();
+            found.extend((0..chunk.row_count()).filter_map(|row| column.get_node_id(row)));
+        }
+        found
+    }
+
+    #[test]
+    fn seeks_by_id_and_label() {
+        let store = Arc::new(RowGroupStore::new());
+        let alix = store.create_node(&["Person"]);
+        let city = store.create_node(&["City"]);
+        let id = |node: NodeId| Value::Int64(node.as_u64().cast_signed());
+
+        assert_eq!(seek(&store, SeekKey::Id, id(alix), None), [alix]);
+        assert_eq!(seek(&store, SeekKey::Id, id(city), Some("Person")), []);
+        assert_eq!(seek(&store, SeekKey::Id, Value::Int64(-1), None), []);
+        assert_eq!(seek(&store, SeekKey::Id, Value::Null, None), []);
+        store.delete_node(alix);
+        assert_eq!(seek(&store, SeekKey::Id, id(alix), None), []);
+    }
+
+    #[test]
+    fn seeks_the_equal_forms_of_a_property_value() {
+        let store = Arc::new(RowGroupStore::new());
+        store.create_property_index("id");
+        let as_int = store.create_node(&["Doc"]);
+        store.set_node_property(as_int, "id", Value::Int64(42));
+        let as_float = store.create_node(&["Doc"]);
+        store.set_node_property(as_float, "id", Value::Float64(42.0));
+        let as_string = store.create_node(&["Doc"]);
+        store.set_node_property(as_string, "id", Value::from("42"));
+        let other = store.create_node(&["Doc"]);
+        store.set_node_property(other, "id", Value::Int64(7));
+
+        let id = || SeekKey::Property("id".to_string());
+        // The numbers of one value; the string is text, not a number.
+        let numbers = vec![as_int, as_float];
+        assert_eq!(seek(&store, id(), Value::Int64(42), None), numbers);
+        assert_eq!(seek(&store, id(), Value::Float64(42.0), None), numbers);
+        assert_eq!(seek(&store, id(), Value::from("42"), None), vec![as_string]);
+        assert_eq!(seek(&store, id(), Value::from("042"), None), []);
+        assert_eq!(seek(&store, id(), Value::Float64(f64::NAN), None), []);
+        assert_eq!(seek(&store, id(), Value::Null, None), []);
+    }
+}

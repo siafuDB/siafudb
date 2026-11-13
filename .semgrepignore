@@ -1,0 +1,6 @@
+# Rust is checked with cargo (fmt, clippy -D warnings, nextest, audit, deny),
+# not semgrep: the generic Rust rules flag every `unsafe`, `temp_dir` and
+# `current_exe` including in tests and the vendored engine, which cargo-native
+# tooling handles with better context. Owner decision, 2026-11-13.
+*.rs
+engine/

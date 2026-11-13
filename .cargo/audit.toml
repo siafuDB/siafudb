@@ -1,0 +1,12 @@
+# cargo-audit policy. Every ignore needs a reason and a review-by date.
+[advisories]
+ignore = [
+  # bincode 2.x: "unmaintained" notice, no patched release exists. Used by the
+  # vendored engine for snapshot and WAL encoding. Plan: replace with a
+  # depth/size-limited decoder in the engine fork (see docs/adr/0001).
+  # Review by 2027-02-01.
+  "RUSTSEC-2025-0141",
+  # paste: "unmaintained" notice, no patched release exists; proc-macro only
+  # (build time), pulled in by the engine's dependencies. Review by 2027-02-01.
+  "RUSTSEC-2024-0436",
+]

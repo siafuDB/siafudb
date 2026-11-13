@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["grafeo", "grafeo-common", "grafeo-core", "grafeo-adapters", "grafeo-storage", "grafeo-engine"]
