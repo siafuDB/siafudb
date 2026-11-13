@@ -57,8 +57,42 @@ export interface InitResult {
 
 /** Options for `db.sync.create` and `db.sync.join`. */
 export interface SyncRelayOptions {
-  /** Base URL of a GSP relay (`https://...`; `http://` for localhost). */
+  /**
+   * Base URL of a GSP relay. `https://` only, except `http://` for
+   * `localhost`, `127.0.0.1` and `[::1]`.
+   */
   relayUrl: string;
+}
+
+/** For relays that only accept new sync groups from holders of a registration secret. */
+export interface SyncRegistrationOptions {
+  /**
+   * The relay's registration secret. It is sent to the relay when the group
+   * is first uploaded and is kept in memory only: never stored, never logged.
+   */
+  registrationToken?: string;
+}
+
+/** What this device knows about one device of the sync group. */
+export interface SyncDeviceStatus {
+  /** Stable id of the device within the group (hex). Not a secret. */
+  id: string;
+  /** This device itself. */
+  own: boolean;
+  /** Number of that device's commits applied here. */
+  appliedSeq: number;
+  /** Commits of that device received here but not applicable yet. */
+  pending: number;
+  /** Some of that device's commits were dropped for lack of room; its later ones wait for a resync. */
+  gap: boolean;
+  /**
+   * By how many ms that device's latest commit was ahead of this device's
+   * clock when that kept it from being applied (0: it was not). Over 24
+   * hours its commits are refused: that device's clock (or this one's) is wrong.
+   */
+  clockLeadMs: number;
+  /** That device published two different histories (its storage was rolled back); devices may disagree about what it wrote. */
+  equivocated: boolean;
 }
 
 /** Result of `db.sync.status()`. */
@@ -84,6 +118,18 @@ export interface SyncStatus {
   notApplied: number;
   /** The latest reason for `notUploaded` / `notApplied`. */
   lastProblem: string | null;
+  /**
+   * This device's stored state was rolled back (restored from a backup) and
+   * conflicts with what it had already uploaded. Its writes stay local until
+   * `db.sync.rejoinAsNewDevice()` is called. Downloads continue.
+   */
+  needsRejoin: boolean;
+  /** Received commits were dropped for lack of room; the relay's log will be read again (automatic, with growing delays). */
+  needsResync: boolean;
+  /** Times the relay was found to have lost its data. History that only the relay held is gone. */
+  relayResets: number;
+  /** Every device known in the group, this one included. */
+  deviceList: SyncDeviceStatus[];
 }
 
 /** Passed to `db.sync.onRemoteChange` listeners. */
@@ -101,7 +147,12 @@ export type Request =
     }
   | { id: number; op: "changesSince"; args: { seq: number } }
   | { id: number; op: "flush" | "close" }
-  | { id: number; op: "syncCreate"; args: { relayUrl: string } }
+  | {
+      id: number;
+      op: "syncCreate";
+      args: { relayUrl: string; registrationToken?: string };
+    }
+  | { id: number; op: "syncStart"; args: { registrationToken?: string } }
   | { id: number; op: "syncJoin"; args: { relayUrl: string; code: string } }
   | {
       id: number;
@@ -109,8 +160,8 @@ export type Request =
         | "syncStatus"
         | "syncNow"
         | "syncStop"
-        | "syncStart"
         | "syncLeave"
+        | "syncRejoin"
         | "syncPairingCode";
     }
   | { id: number; op: "destroy"; args: { name: string } };

@@ -64,9 +64,10 @@ export class Database {
     syncEnabled(): boolean;
     /**
      * Take the relay's `Batch` and apply it. Returns JSON `{"items": n,
-     * "ops": n, "changes": n, "more": bool, "stalled": bool}`; `changes` is
-     * the number of changes applied to the graph. Persist when `items > 0`.
-     * With `stalled`, wait before pulling again.
+     * "ops": n, "changes": n, "more": bool, "relayReset": bool,
+     * "needsResync": bool, "forked": bool}`; `changes` is the number of
+     * changes applied to the graph. Persist when `ops > 0`. With
+     * `relayReset`, push again: what was in flight is back in the outbox.
      */
     syncIngestBatch(reply: Uint8Array | number[], now_ms: number): string;
     /**
@@ -100,22 +101,46 @@ export class Database {
      */
     syncPushFrame(): Uint8Array | undefined;
     /**
-     * The relay bearer token (base64url) for `Authorization: Bearer ...`.
+     * Give a device whose status says `forked` a new identity in the group
+     * so that it can upload again; writes made while forked are queued for
+     * upload. Returns the number of ops queued for them. Throws if the
+     * device is not forked.
      */
-    syncRelayToken(): string | undefined;
+    syncRejoin(now_ms: number): number;
+    /**
+     * The bearer token (base64url) for `Authorization: Bearer ...` at the
+     * relay with this origin (`scheme://host[:port]`). Every relay has its
+     * own token. Throws if not in a sync group or the origin is not usable.
+     */
+    syncRelayToken(relay_origin: string): string;
+    /**
+     * Begin a resync: the next pulls read the relay's log from the start.
+     * Call when a `syncIngestBatch` result or the status says
+     * `needsResync`, with a growing delay between attempts.
+     */
+    syncStartResync(): void;
     /**
      * JSON: `null` when not in a sync group, else `{"groupId", "outbox",
      * "cursor", "localOps", "remoteOps", "pending", "devices", "rejected",
-     * "droppedLocal", "skippedRemote", "lastProblem"}`.
+     * "droppedLocal", "skippedRemote", "lastProblem", "unechoed", "forked",
+     * "needsResync", "relayResets", "deviceList": [{"id", "own",
+     * "appliedSeq", "pending", "gap", "clockLeadMs", "equivocated"}]}`.
      */
     syncStatus(): string;
 }
+
+/**
+ * The canonical form of a relay origin (`scheme://host[:port]`), as the
+ * relay token is bound to it. Throws if `origin` is not an http(s) origin.
+ */
+export function canonicalRelayOrigin(origin: string): string;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_database_free: (a: number, b: number) => void;
+    readonly canonicalRelayOrigin: (a: number, b: number) => [number, number, number, number];
     readonly database_changesSince: (a: number, b: number) => [number, number, number, number];
     readonly database_execute: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly database_exportSnapshot: (a: number) => [number, number, number, number];
@@ -135,15 +160,17 @@ export interface InitOutput {
     readonly database_syncPoll: (a: number, b: number) => [number, number, number];
     readonly database_syncPullFrame: (a: number) => [number, number, number, number];
     readonly database_syncPushFrame: (a: number) => [number, number, number, number];
-    readonly database_syncRelayToken: (a: number) => [number, number];
+    readonly database_syncRejoin: (a: number, b: number) => [number, number, number];
+    readonly database_syncRelayToken: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly database_syncStartResync: (a: number) => [number, number];
     readonly database_syncStatus: (a: number) => [number, number];
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __externref_table_dealloc: (a: number) => void;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
+    readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_start: () => void;
 }
 

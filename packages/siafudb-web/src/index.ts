@@ -8,6 +8,8 @@ export type {
   Params,
   QueryResult,
   RemoteChangeEvent,
+  SyncDeviceStatus,
+  SyncRegistrationOptions,
   SyncRelayOptions,
   SyncStatus,
 } from "./protocol.js";

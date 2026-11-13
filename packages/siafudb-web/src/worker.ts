@@ -3,7 +3,10 @@
  * Lock, the encrypted snapshot store and the debounced autosave. The main
  * thread talks to it through `client.ts`; do not import this file directly.
  */
-import init, { Database } from "./wasm/siafudb_wasm.js";
+import init, {
+  canonicalRelayOrigin,
+  Database,
+} from "./wasm/siafudb_wasm.js";
 import { chooseBackend, IdbBackend, OpfsBackend } from "./backends.js";
 import { DatabaseLockedError, SiafuError, serializeError } from "./errors.js";
 import type {
@@ -16,7 +19,7 @@ import type {
   WorkerEvent,
 } from "./protocol.js";
 import { EncryptedSnapshotStore } from "./store.js";
-import { normalizeRelayUrl, SyncLoop } from "./sync.js";
+import { parseRelayUrl, RelayError, SyncLoop } from "./sync.js";
 import { IdbKeyVault } from "./vault.js";
 
 interface Scope {
@@ -161,11 +164,18 @@ class Session {
   }
 
   /** Start the transport if this database is in a group and was not stopped. */
-  startSync(): void {
+  startSync(registrationToken?: string): void {
     if (this.closed || this.sync || !this.db.syncEnabled()) return;
     const { relayUrl, stopped } = this.meta();
     if (stopped || typeof relayUrl !== "string") return;
     const w = self as unknown as WorkerScope;
+    try {
+      parseRelayUrl(relayUrl);
+    } catch {
+      // A stored address this build no longer accepts: stay stopped rather
+      // than fail to open. `status()` shows `running: false`.
+      return;
+    }
     this.sync = new SyncLoop(
       this.db,
       {
@@ -187,7 +197,9 @@ class Session {
         touched: () => this.markDirty(),
         applied: (changes) => emit({ type: "sync-applied", changes }),
       },
-      { relayUrl },
+      registrationToken === undefined
+        ? { relayUrl }
+        : { relayUrl, registrationToken },
     );
     this.sync.start();
   }
@@ -199,8 +211,21 @@ class Session {
   }
 
   /** Create (`code` undefined) or join a group, persist it, then start syncing. */
-  async syncSetup(relayUrl: string, code?: string): Promise<string> {
-    const url = normalizeRelayUrl(relayUrl);
+  async syncSetup(
+    relayUrl: string,
+    code?: string,
+    registrationToken?: string,
+  ): Promise<string> {
+    const relay = parseRelayUrl(relayUrl);
+    try {
+      // The token is bound to the origin: it must be one the engine accepts.
+      canonicalRelayOrigin(relay.origin);
+    } catch {
+      throw new SiafuError(
+        "sync",
+        "relayUrl is not usable as a relay address: the host must be a plain host name or IP address",
+      );
+    }
     if (this.db.syncEnabled())
       throw new SiafuError(
         "sync",
@@ -222,11 +247,45 @@ class Session {
           : "the pairing code is not valid",
       );
     }
-    this.db.setSyncMeta(JSON.stringify({ relayUrl: url } satisfies SyncMeta));
+    this.db.setSyncMeta(
+      JSON.stringify({ relayUrl: relay.url } satisfies SyncMeta),
+    );
     this.dirty = true;
     await this.flush();
-    this.startSync();
+    this.startSync(registrationToken);
+    if (code === undefined && this.sync) {
+      // Register the new group on the relay now, so that a relay that
+      // refuses it is an error of this call and not a surprise later. A
+      // relay that cannot be reached is not an error: the upload waits.
+      try {
+        await this.sync.pushNow();
+      } catch (e) {
+        if (e instanceof RelayError && e.status === 403) {
+          await this.syncLeave();
+          throw new SiafuError(
+            "sync",
+            registrationToken === undefined
+              ? "this relay requires a registration token to create a sync group; pass registrationToken to sync.create()"
+              : "the relay did not accept the registration token; no sync group was created",
+          );
+        }
+      }
+    }
     return made;
+  }
+
+  /** Give a forked device a new identity; what it wrote meanwhile is queued for upload. */
+  async syncRejoin(): Promise<void> {
+    this.needGroup();
+    if (!this.syncStatus().needsRejoin)
+      throw new SiafuError(
+        "sync",
+        "this device does not need to rejoin (status().needsRejoin is false)",
+      );
+    this.db.syncRejoin(Date.now());
+    this.dirty = true;
+    await this.flush();
+    this.sync?.notifyLocalWrite();
   }
 
   syncStatus(): SyncStatus {
@@ -237,6 +296,10 @@ class Session {
       droppedLocal: number;
       skippedRemote: number;
       lastProblem: string | null;
+      forked: boolean;
+      needsResync: boolean;
+      relayResets: number;
+      deviceList: SyncStatus["deviceList"];
     } | null;
     const loop = this.sync?.state();
     return {
@@ -251,6 +314,10 @@ class Session {
       notUploaded: engine?.droppedLocal ?? 0,
       notApplied: (engine?.skippedRemote ?? 0) + (engine?.rejected ?? 0),
       lastProblem: engine?.lastProblem ?? null,
+      needsRejoin: engine?.forked ?? false,
+      needsResync: engine?.needsResync ?? false,
+      relayResets: engine?.relayResets ?? 0,
+      deviceList: engine?.deviceList ?? [],
     };
   }
 
@@ -266,7 +333,7 @@ class Session {
   }
 
   /** Stop or resume the transport and remember the choice. */
-  async syncPause(stopped: boolean): Promise<void> {
+  async syncPause(stopped: boolean, registrationToken?: string): Promise<void> {
     this.needGroup();
     const meta = this.meta();
     if (stopped) await this.stopSync();
@@ -278,7 +345,11 @@ class Session {
       this.dirty = true;
       await this.flush();
     }
-    if (!stopped) this.startSync();
+    if (!stopped) {
+      // A new secret needs a new transport: the running one has none or another.
+      if (registrationToken !== undefined) await this.stopSync();
+      this.startSync(registrationToken);
+    }
   }
 
   async syncLeave(): Promise<void> {
@@ -320,8 +391,18 @@ async function doInit(a: InitArgs): Promise<InitResult> {
       new IdbKeyVault(),
     );
     const snap = await store.load();
-    const db = snap ? Database.fromSnapshot(snap) : new Database();
-    snap?.fill(0);
+    let db: Database;
+    try {
+      db = snap ? Database.fromSnapshot(snap) : new Database();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      // The one engine error an app has to tell apart: see errors.ts.
+      throw message.startsWith("stored sync state version")
+        ? new SiafuError("sync-state-version", message)
+        : e;
+    } finally {
+      snap?.fill(0);
+    }
     session = new Session(db, store, release, a.autosaveMs);
     // Writes captured before the last save but not yet queued for upload.
     session.afterQuery(false);
@@ -401,7 +482,11 @@ async function handle(req: Request): Promise<unknown> {
     case "destroy":
       return doDestroy(req.args.name);
     case "syncCreate":
-      return need().syncSetup(req.args.relayUrl);
+      return need().syncSetup(
+        req.args.relayUrl,
+        undefined,
+        req.args.registrationToken,
+      );
     case "syncJoin":
       return need()
         .syncSetup(req.args.relayUrl, req.args.code)
@@ -413,7 +498,9 @@ async function handle(req: Request): Promise<unknown> {
     case "syncStop":
       return need().syncPause(true);
     case "syncStart":
-      return need().syncPause(false);
+      return need().syncPause(false, req.args.registrationToken);
+    case "syncRejoin":
+      return need().syncRejoin();
     case "syncLeave":
       return need().syncLeave();
     case "syncPairingCode":

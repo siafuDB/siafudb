@@ -436,6 +436,17 @@ export class SyncLoop {
               ? Math.min(seconds * 1000, this.maxBackoffMs)
               : 1_000;
         }
+        if (
+          res.status === 403 &&
+          path === "/v0/push" &&
+          !registering &&
+          this.registrationToken !== undefined
+        ) {
+          // The relay no longer knows the group (it lost its data): the
+          // next push registers it again.
+          this.register = true;
+          throw new RelayError(refusal(403), false, 403);
+        }
         throw new RelayError(
           refusal(res.status),
           !retry,
@@ -561,7 +572,7 @@ export class SyncLoop {
         this.succeeded();
         failures = 0;
         // "More" with nothing in the frame would spin; a relay does not say that.
-        more = out.more && out.items > 0;
+        more = (out.more && out.items > 0) || out.relayReset;
         // Cursor and data are one blob: save before asking for more, so a
         // reload continues from here. A frame that only echoed this
         // device's own items moved nothing but the cursor; the next
