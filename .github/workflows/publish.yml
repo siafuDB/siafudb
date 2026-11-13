@@ -15,9 +15,19 @@ name: Publish packages
 # Both jobs skip versions that are already published, so re-running after a
 # partial failure is safe.
 #
+# npm authentication is trusted publishing (OIDC): no long-lived token. On
+# npmjs.com the package lists this repository as a trusted publisher, and
+# npm exchanges the run's OIDC identity for a short-lived publish token.
+# npm validates the workflow that STARTED the run, so the trusted publisher
+# entry must name `release.yml` (and a second entry `publish.yml` if manual
+# runs should be able to publish). Provenance is attached automatically.
+#
+# A trusted publisher can only be added to a package that already exists, so
+# the very first publish of a new package name needs NPM_TOKEN (or a manual
+# publish). After that the secret can be deleted.
+#
 # Secrets:
-#   NPM_TOKEN             npm automation token with publish rights on the
-#                         package's scope.
+#   NPM_TOKEN             optional; bootstrap only, see above.
 #   CARGO_REGISTRY_TOKEN  crates.io API token. While it is not set, the
 #                         crates job reports that and publishes nothing.
 
@@ -61,7 +71,7 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
-      id-token: write # npm provenance
+      id-token: write # npm trusted publishing (OIDC) and provenance
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -70,8 +80,8 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version-file: .nvmrc # 24
-          cache: npm
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false # no caches in release builds
       - name: Rust toolchain for the wasm build
         run: |
           rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
@@ -102,17 +112,16 @@ jobs:
         if: ${{ !inputs.dry_run }}
         working-directory: packages/siafudb-web
         env:
+          # Empty once trusted publishing is set up: npm then uses OIDC.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [[ -z "$NODE_AUTH_TOKEN" ]]; then
-            echo "::error::NPM_TOKEN is not available to this repository."
-            exit 1
-          fi
+          # Trusted publishing needs npm 11.5.1 or later.
+          npm --version
           if npm view "$name@$version" version >/dev/null 2>&1; then
             echo "skip $name@$version (already on npm)"
             exit 0
           fi
-          npm publish --access public --provenance
+          npm publish --access public
 
   crates:
     name: crates.io${{ inputs.dry_run && ' (dry run)' || '' }}
