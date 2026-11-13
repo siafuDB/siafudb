@@ -20,6 +20,7 @@ members = [
     "crates/siafudb-sync",
     "crates/siafudb-access",
     "crates/siafudb-server",
+    "crates/siafudb-wasm",
 ]
 
 [workspace.package]
@@ -94,3 +95,12 @@ grafeo-storage = { path = "engine/grafeo-storage" }
 debug = "line-tables-only"
 [profile.test]
 debug = "line-tables-only"
+
+# Size-optimised profile for the browser wasm build (packages/siafudb-web/scripts/build-wasm.mjs).
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
