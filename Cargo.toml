@@ -50,6 +50,14 @@ grafeo = { package = "siafudb-graph", version = "0.1.0", path = "engine/grafeo",
   "cypher",
 ] }
 
+# === Graph Sync Protocol ===
+# The protocol crates live in their own repository and are pinned by commit.
+# This `rev` is the one source of truth: CI builds the test relay from it.
+# To build without ML-DSA once gsp-sync has that feature, add
+# `default-features = false` (plus the features wanted) to the gsp-sync line.
+gsp-sync = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "3538711cea7c085e599b46cf6029cc8eedee76d6" }
+gsp-wire = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "3538711cea7c085e599b46cf6029cc8eedee76d6" }
+
 # === Serialization & Data ===
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -15,8 +15,8 @@ browser = ["siafudb-core/browser"]
 
 [dependencies]
 siafudb-core = { path = "../siafudb-core", default-features = false }
-gsp-sync = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "2f739f6bea00e33e402c590beb6fe6a1f1412489" }
-gsp-wire = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "2f739f6bea00e33e402c590beb6fe6a1f1412489" }
+gsp-sync = { workspace = true }
+gsp-wire = { workspace = true }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

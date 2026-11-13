@@ -34,4 +34,8 @@ mod convert;
 mod synced;
 
 pub use convert::{ConvertError, change_from_wire, change_to_wire, value_from_wire, value_to_wire};
-pub use synced::{BatchOutcome, Error, SyncStatus, SyncedDb};
+pub use gsp_sync::{OriginError, canonical_origin};
+pub use synced::{
+    BatchOutcome, DeviceStatus, Error, SYNC_STATE_VERSION, SYNC_STATE_VERSION_PREFIX, SyncStatus,
+    SyncedDb,
+};

@@ -23,4 +23,4 @@ serde_json = { workspace = true }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
-gsp-wire = { git = "https://github.com/siafuDB/siafudb-gsp", rev = "2f739f6bea00e33e402c590beb6fe6a1f1412489" }
+gsp-wire = { workspace = true }

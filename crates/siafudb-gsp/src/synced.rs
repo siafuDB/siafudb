@@ -3,7 +3,7 @@
 use crate::blob;
 use crate::convert::{change_from_wire, change_to_wire};
 use gsp_sync::{
-    Change, Config, IngestStatus, MAX_CHANGES, MAX_PAYLOAD_BYTES, Pairing, PairingError, Replica,
+    Change, Config, MAX_CHANGES, MAX_PAYLOAD_BYTES, OriginError, Pairing, PairingError, Replica,
     base64url, encode_payload,
 };
 use gsp_wire::{Message, SealedOp};
@@ -28,6 +28,17 @@ pub enum Error {
     Replica(gsp_sync::Error),
     /// The pairing code is not well formed. Never carries the code.
     Pairing(PairingError),
+    /// The relay origin is not `http(s)://host[:port]`.
+    Origin(OriginError),
+    /// The stored sync state is in a format version this build does not
+    /// read (`found`; this build reads [`SYNC_STATE_VERSION`]).
+    SyncStateVersion {
+        /// The version the stored state declares.
+        found: u64,
+    },
+    /// [`SyncedDb::rejoin_as_new_device`] was called on a device that is not
+    /// forked.
+    NotForked,
     /// The operating system gave no random bytes.
     Random,
     /// Bytes from the relay are not the frame expected here (what was wrong).
@@ -46,6 +57,14 @@ impl core::fmt::Display for Error {
             Error::Db(e) => write!(f, "{e}"),
             Error::Replica(e) => write!(f, "{e}"),
             Error::Pairing(e) => write!(f, "{e}"),
+            Error::Origin(e) => write!(f, "the relay address is not usable: {e}"),
+            Error::SyncStateVersion { found } => write!(
+                f,
+                "{SYNC_STATE_VERSION_PREFIX} {found} is not supported: this build reads version \
+                 {SYNC_STATE_VERSION} only and there is no migration from pre-release formats. \
+                 The database cannot be opened by this build"
+            ),
+            Error::NotForked => write!(f, "this device does not need to rejoin"),
             Error::Random => write!(f, "no random bytes available"),
             Error::Frame(what) => write!(f, "unexpected reply from the relay: {what}"),
             Error::Blob(what) => write!(f, "stored database is not readable: {what}"),
@@ -67,6 +86,12 @@ impl From<gsp_sync::Error> for Error {
     }
 }
 
+/// The replica state version this build reads and writes.
+pub const SYNC_STATE_VERSION: u64 = 1;
+/// How the message of [`Error::SyncStateVersion`] starts, for callers that
+/// only get the text.
+pub const SYNC_STATE_VERSION_PREFIX: &str = "stored sync state version";
+
 /// What [`SyncedDb::ingest_batch`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BatchOutcome {
@@ -79,10 +104,33 @@ pub struct BatchOutcome {
     pub changes: usize,
     /// The relay has more after this frame: pull again without waiting.
     pub more: bool,
-    /// An item could not be taken because too many received ops are already
-    /// waiting for earlier ones; the cursor stays before it. Pulling again
-    /// at once would return the same item: wait before retrying.
-    pub stalled: bool,
+    /// The relay was seen to hold fewer items than this device had read
+    /// from it: it lost its log. The cursor is back at 0 and what was in
+    /// flight is in the outbox again; push and pull.
+    pub relay_reset: bool,
+}
+
+/// What this device knows about one device of the group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceStatus {
+    /// The device's author id (hash algorithm id and digest).
+    pub id: Vec<u8>,
+    /// This device's own current identity.
+    pub own: bool,
+    /// Sequence number of the device's latest op applied here.
+    pub applied_seq: u64,
+    /// Ops of the device received here and not applicable yet.
+    pub pending: usize,
+    /// An op of the device was dropped for lack of room; its later ops wait
+    /// until a resync fetches it again.
+    pub gap: bool,
+    /// By how much the device's latest op was ahead of this device's clock
+    /// when that kept it from applying (0: not). Over 24 hours the ops are
+    /// rejected. That device's clock, or this one's, is wrong.
+    pub clock_lead_ms: u64,
+    /// The device signed two different ops at one position (its state was
+    /// rolled back). Devices may disagree about what it wrote after that.
+    pub equivocated: bool,
 }
 
 /// Sizes and counters of a database in a sync group.
@@ -103,7 +151,8 @@ pub struct SyncStatus {
     /// Devices known in the group, this one included.
     pub devices: usize,
     /// Received items dropped: failed authentication, invalid, unsupported,
-    /// or equivocating.
+    /// equivocating, stamped more than 24 hours ahead, from a device over
+    /// the device limit, or dropped for lack of room.
     pub rejected: u64,
     /// Local changes that could not be handed to the protocol (for example a
     /// property over the 64 KiB op limit) and so stay on this device only.
@@ -112,6 +161,18 @@ pub struct SyncStatus {
     pub skipped_remote: u64,
     /// The latest such problem, in words. Never holds a secret.
     pub last_problem: Option<String>,
+    /// Acknowledged items the relay has not handed back yet.
+    pub unechoed: usize,
+    /// This device's state was rolled back: local writes stay local until
+    /// [`SyncedDb::rejoin_as_new_device`].
+    pub forked: bool,
+    /// Received ops were dropped for lack of room: the transport should
+    /// [`SyncedDb::start_resync`], with a growing delay.
+    pub needs_resync: bool,
+    /// Times the relay was seen to have lost its log.
+    pub relay_resets: u64,
+    /// Every device known in the group.
+    pub device_list: Vec<DeviceStatus>,
 }
 
 /// A [`SiafuDB`] with an optional GSP replica. See the crate documentation.
@@ -267,7 +328,12 @@ impl SyncedDb {
         let mut synced = SyncedDb::new(SiafuDB::from_snapshot(parts.engine)?);
         synced.meta = parts.meta.to_vec();
         if !parts.replica.is_empty() {
-            synced.replica = Some(Replica::from_bytes(parts.replica, Config::default())?);
+            synced.replica = Some(
+                Replica::from_bytes(parts.replica, Config::default()).map_err(|e| match e {
+                    gsp_sync::Error::StateVersion(found) => Error::SyncStateVersion { found },
+                    other => Error::Replica(other),
+                })?,
+            );
             synced.db.enable_change_capture()?;
         }
         Ok(synced)
@@ -321,7 +387,7 @@ impl SyncedDb {
         let graph = self.take(|db| db.take_graph_as_changes())?;
         self.replica = Some(replica);
         self.in_flight = 0;
-        self.commit(graph, now_ms);
+        self.commit(graph, now_ms, false);
         Ok(())
     }
 
@@ -338,12 +404,13 @@ impl SyncedDb {
         self.replica.as_ref().map(|r| r.pairing().to_text())
     }
 
-    /// The relay bearer token (unpadded base64url), for the `Authorization`
-    /// header of push and pull.
-    pub fn relay_token(&self) -> Option<Zeroizing<String>> {
-        self.replica
-            .as_ref()
-            .map(|r| Zeroizing::new(base64url(&r.relay_token()[..])))
+    /// The bearer token (unpadded base64url) for the relay at `relay_origin`
+    /// (`scheme://host[:port]`), for the `Authorization` header of push and
+    /// pull. Every relay has its own token.
+    pub fn relay_token(&self, relay_origin: &str) -> Result<Zeroizing<String>, Error> {
+        let replica = self.replica.as_ref().ok_or(Error::NotEnabled)?;
+        let token = replica.relay_token(relay_origin).map_err(Error::Origin)?;
+        Ok(Zeroizing::new(base64url(&token[..])))
     }
 
     /// Sizes and counters; `None` when not in a sync group.
@@ -358,7 +425,34 @@ impl SyncedDb {
             remote_ops: stats.applied,
             pending: stats.pending,
             devices: stats.authors,
-            rejected: stats.invalid + stats.undecryptable + stats.unsupported + stats.equivocations,
+            rejected: stats.invalid
+                + stats.undecryptable
+                + stats.unsupported
+                + stats.equivocations
+                + stats.clock_rejected
+                + stats.authors_refused
+                + stats.refused,
+            unechoed: stats.unechoed,
+            forked: stats.forked,
+            needs_resync: stats.needs_resync,
+            relay_resets: stats.relay_resets,
+            device_list: replica
+                .authors()
+                .into_iter()
+                .map(|a| {
+                    let mut id = a.author.alg.to_be_bytes().to_vec();
+                    id.extend_from_slice(&a.author.digest);
+                    DeviceStatus {
+                        id,
+                        own: a.own,
+                        applied_seq: a.applied_seq,
+                        pending: a.pending,
+                        gap: a.gap,
+                        clock_lead_ms: a.clock_lead_ms,
+                        equivocated: a.equivocated,
+                    }
+                })
+                .collect(),
             dropped_local: self.dropped_local,
             skipped_remote: self.skipped_remote,
             last_problem: self.last_problem.clone(),
@@ -405,13 +499,57 @@ impl SyncedDb {
             }
             return Ok(0);
         }
+        if self.forked() {
+            // The replica refuses to sign. What was written stays in the
+            // engine's capture queue (which the snapshot persists) and is
+            // committed by `rejoin_as_new_device`.
+            return Ok(0);
+        }
         let changes = self.take(|db| db.take_changes())?;
-        Ok(self.commit(changes, now_ms))
+        Ok(self.commit(changes, now_ms, false))
+    }
+
+    /// Whether this device's sync state was rolled back (see
+    /// [`SyncStatus::forked`]).
+    pub fn forked(&self) -> bool {
+        self.replica.as_ref().is_some_and(Replica::forked)
+    }
+
+    /// Give a forked device a new identity in the group, so that it can
+    /// upload again. To the other devices this is a new device joining.
+    ///
+    /// What the device wrote while forked is not lost: writes it had already
+    /// queued for upload are issued again under the new identity by the
+    /// replica, and writes made after the fork was noticed (which waited in
+    /// the engine) are committed now. Both get new stamps, so they count as
+    /// written now and win over what other devices wrote in between.
+    ///
+    /// Returns the number of ops queued for the writes that waited in the
+    /// engine. Not done automatically: the application decides.
+    pub fn rejoin_as_new_device(&mut self, now_ms: u64) -> Result<usize, Error> {
+        let replica = self.replica.as_mut().ok_or(Error::NotEnabled)?;
+        if !replica.forked() {
+            return Err(Error::NotForked);
+        }
+        let seed = random::<32>()?;
+        let nonce = random::<24>()?;
+        let effects = replica.reset_identity(*seed, *nonce)?;
+        self.in_flight = 0;
+        self.apply(&effects);
+        let waiting = self.take(|db| db.take_changes())?;
+        // Remote effects reached the engine while these waited, so the
+        // engine may show an older remote value where the replica now holds
+        // the local one: write them to the engine again.
+        Ok(self.commit(waiting, now_ms, true))
     }
 
     /// Local commits for `changes`, split into as many ops as their size
     /// needs. Returns the number of ops made.
-    fn commit(&mut self, changes: Vec<GraphChange>, now_ms: u64) -> usize {
+    ///
+    /// `reassert`: the engine may no longer show these changes (see
+    /// [`rejoin_as_new_device`](Self::rejoin_as_new_device)), so each op's
+    /// changes are written to it again before the op's corrections.
+    fn commit(&mut self, changes: Vec<GraphChange>, now_ms: u64, reassert: bool) -> usize {
         // Convert and measure every change on its own; what cannot be an op
         // payload is dropped here, so a chunk can only fail as a whole for
         // reasons that have nothing to do with its content.
@@ -459,7 +597,7 @@ impl SyncedDb {
                 None => true,
             };
             if full {
-                ops += self.commit_op(&chunk, now_ms);
+                ops += self.commit_op(&chunk, now_ms, reassert);
                 chunk.clear();
                 bytes = 0;
             }
@@ -473,7 +611,7 @@ impl SyncedDb {
     }
 
     /// One op. Returns 1 if it was made.
-    fn commit_op(&mut self, changes: &[Change], now_ms: u64) -> usize {
+    fn commit_op(&mut self, changes: &[Change], now_ms: u64, reassert: bool) -> usize {
         let Some(replica) = self.replica.as_mut() else {
             return 0;
         };
@@ -484,6 +622,9 @@ impl SyncedDb {
         });
         match made {
             Ok(corrections) => {
+                if reassert {
+                    self.reassert(changes);
+                }
                 self.apply(&corrections);
                 1
             }
@@ -523,6 +664,17 @@ impl SyncedDb {
             }
         }
         applied
+    }
+
+    /// Write local changes to the engine again, one by one. One that no
+    /// longer applies (its node was deleted by another device meanwhile) is
+    /// left out without being counted: the op's corrections say the same.
+    fn reassert(&mut self, changes: &[Change]) {
+        for change in changes {
+            if let Ok(change) = change_from_wire(change) {
+                let _ = self.db.apply_changes(core::slice::from_ref(&change));
+            }
+        }
     }
 
     fn skip_remote(&mut self, why: &dyn core::fmt::Display) {
@@ -593,9 +745,11 @@ impl SyncedDb {
     /// Take the relay's `Batch`: commit pending local changes first, then
     /// hand every item to the replica and apply its effects to the engine.
     ///
-    /// Items the replica rejects (not from this group, damaged, invalid) are
-    /// skipped; they do not fail the call. Persist after a call that
-    /// returned `items > 0`, so the cursor and the data move together.
+    /// Items the replica cannot use (not from this group, damaged, invalid,
+    /// no room) are skipped; they do not fail the call and the cursor moves
+    /// past them. Persist after a call that applied ops, so the cursor and
+    /// the data move together. Afterwards check [`SyncStatus::needs_resync`]
+    /// and [`SyncStatus::forked`].
     pub fn ingest_batch(&mut self, reply: &[u8], now_ms: u64) -> Result<BatchOutcome, Error> {
         let Some(replica) = self.replica.as_ref() else {
             return Err(Error::NotEnabled);
@@ -620,6 +774,16 @@ impl SyncedDb {
             more,
             ..BatchOutcome::default()
         };
+        // A relay that holds less than this device has read lost its log:
+        // the replica goes back to cursor 0 and refills the outbox with what
+        // the relay never handed back.
+        if let Some(replica) = self.replica.as_mut() {
+            outcome.relay_reset = replica.observe_relay_head(next);
+            if outcome.relay_reset {
+                self.in_flight = 0;
+                outcome.more = next > 0;
+            }
+        }
         // Items are in cursor order and `next` is the position of the last.
         let count = sealed.len() as u64;
         let first = next.checked_sub(count).map(|before| before + 1);
@@ -631,31 +795,33 @@ impl SyncedDb {
             let Some(replica) = self.replica.as_mut() else {
                 break;
             };
+            // Whatever the item's status, the cursor moves past it and the
+            // rest of the frame is still taken (SYNC-V0 section 6.1).
             let ingested = replica.ingest(&bytes, relay_seq, now_ms);
             outcome.ops += ingested.applied;
             outcome.changes += self.apply(&ingested.effects);
-            if ingested.status == IngestStatus::PendingFull {
-                // Not kept and the cursor stays before it: do not go on, or
-                // later items would be applied without it.
-                self.problem("too many received changes are waiting for earlier ones");
-                outcome.more = false;
-                outcome.stalled = true;
-                break;
-            }
         }
-        if let Some(replica) = self.replica.as_mut() {
-            if count == 0 && next < replica.cursor() {
-                // The relay holds less than this device has seen (it lost
-                // its data or is another relay): read it from the start.
-                // Ingesting an item again changes nothing.
-                replica.set_cursor(0);
-                outcome.more = next > 0;
-            } else if first.is_none() && count > 0 {
-                // A `next` that cannot be right; trust it only as a cursor.
-                replica.set_cursor(next.max(replica.cursor()));
-            }
+        if let Some(replica) = self.replica.as_mut()
+            && first.is_none()
+            && count > 0
+        {
+            // A `next` that cannot be right; trust it only as a cursor.
+            replica.set_cursor(next.max(replica.cursor()));
         }
         Ok(outcome)
+    }
+
+    /// Begin a resync: the pull cursor goes back to 0, so the next pulls
+    /// read the relay's log from the start (which changes nothing for items
+    /// already applied). Call it when [`SyncStatus::needs_resync`] is set,
+    /// with a growing delay between attempts: a device whose ops cannot
+    /// apply raises the flag again after every resync.
+    pub fn start_resync(&mut self) -> Result<(), Error> {
+        self.replica
+            .as_mut()
+            .ok_or(Error::NotEnabled)?
+            .start_resync();
+        Ok(())
     }
 
     /// Without receiving anything: commit pending local changes, and apply
