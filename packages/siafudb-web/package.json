@@ -40,9 +40,9 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
   "devDependencies": {
-    "@types/node": "^24",
-    "playwright": "1.63.0",
-    "typescript": "^6",
-    "vitest": "^4"
+    "@types/node": "^26",
+    "playwright": "1.65.0",
+    "typescript": "^7",
+    "vitest": "^5"
   }
 }
