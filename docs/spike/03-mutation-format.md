@@ -83,8 +83,9 @@ Rules:
 1. **Canonical bytes** = deterministic CBOR (RFC 8949 section 4.2) of `body`.
    JSON is not canonical (`serde_json::Map` ordering, float formatting), so the
    current `serde_json` bodies cannot be signed safely.
-2. **Signed message** = `"siafudb/mutation/v1" || format || hash_alg || id ||
-author`. Domain separation stops cross-protocol signature reuse.
+2. **Signed message** is the concatenation of a domain label
+   (`"siafudb/mutation/v1"`), `format`, `hash_alg`, `id` and `author`.
+   Domain separation stops cross-protocol signature reuse.
 3. **Downgrade resistance.** The author's key set (DID document) declares which
    suites are acceptable and from when. A verifier requires _every signature the
    author's policy demands_, so an attacker cannot strip the ML-DSA signature and

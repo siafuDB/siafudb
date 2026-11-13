@@ -38,8 +38,8 @@ page-level work is Phase 2 (below), and 0.6 makes it more feasible than the
   right call, and why we test ciphertext rather than trust a feature flag
   (the browser probe asserts the secret is absent from the stored bytes).
 - **0.6 has a real `encryption` feature on the `grafeo` facade crate**
-  (`engine/grafeo/Cargo.toml`: `encryption = ["grafeo-engine/encryption",
-"grafeo-common/encryption", ...]`), so SiafuDB can enable it without
+  (declared in `engine/grafeo/Cargo.toml`, enabling the `encryption` feature
+  of `grafeo-engine` and `grafeo-common`), so SiafuDB can enable it without
   depending on `grafeo-engine` directly. The 0.5.43 gap is closed.
 - Still limiting, checked in the 0.6.2 source: the cipher is AES-256-GCM with
   no cipher id (no XChaCha20, no agility), and `KeyProvider::provide_root_key`
