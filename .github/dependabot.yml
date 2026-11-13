@@ -70,6 +70,7 @@ updates:
   # JavaScript/TypeScript workspaces (packages/*, apps/*). Node >= 24 only.
   # The root package.json owns the workspace lockfile, so "/" covers both.
   - package-ecosystem: "npm"
+    target-branch: "staging"
     directory: "/"
     cooldown:
       default-days: 7
