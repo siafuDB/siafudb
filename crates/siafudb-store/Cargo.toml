@@ -1,0 +1,29 @@
+[package]
+name = "siafudb-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SiafuDB storage layer: page stores, page encryption, and a crash-safe container (snapshot blobs + append-only log)."
+
+[features]
+# `native`: std::fs-backed `FilePageStore` with advisory locks (desktop, server,
+# iOS/Android app sandbox). Off for wasm32-unknown-unknown, where the host
+# supplies pages through `CallbackPageStore` (OPFS / IndexedDB in TypeScript).
+default = ["native"]
+native = []
+
+[dependencies]
+thiserror = { workspace = true }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["zeroize"] }
+blake3 = { version = "1.8", default-features = false, features = ["pure"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
+getrandom = "0.4"
+
+# wasm32-unknown-unknown has no OS RNG; take entropy from crypto.getRandomValues.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+proptest = "1"

@@ -20,6 +20,7 @@ members = [
     "crates/siafudb-sync",
     "crates/siafudb-access",
     "crates/siafudb-server",
+    "crates/siafudb-store",
 ]
 
 [workspace.package]
