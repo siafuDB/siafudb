@@ -1,0 +1,1309 @@
+//! Error types for Grafeo operations.
+//!
+//! [`Error`] is the main error type you'll encounter. For query-specific errors,
+//! [`QueryError`] includes source location and hints to help users fix issues.
+//!
+//! Every error carries a machine-readable [`ErrorCode`] (e.g. `GRAFEO-Q001`)
+//! for programmatic handling across the ecosystem (core, server, web, bindings).
+
+use std::fmt;
+
+/// Machine-readable error code for programmatic error handling.
+///
+/// Error codes follow the pattern `GRAFEO-{category}{number}`:
+/// - **Q**: Query errors (parse, semantic, timeout)
+/// - **T**: Transaction errors (conflict, timeout, state)
+/// - **S**: Storage errors (full, corruption)
+/// - **V**: Validation errors (not found, type mismatch, invalid input)
+/// - **X**: Internal errors (should not happen)
+///
+/// Clients can match on these codes without parsing error messages.
+///
+/// # Examples
+///
+/// ```
+/// use grafeo_common::utils::error::{Error, ErrorCode};
+///
+/// let err = Error::Internal("something broke".into());
+/// assert_eq!(err.error_code().as_str(), "GRAFEO-X001");
+/// assert!(!err.error_code().is_retryable());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorCode {
+    // Query errors (Q)
+    /// Query failed to parse.
+    QuerySyntax,
+    /// Query parsed but is invalid (unknown label, type mismatch, etc.).
+    QuerySemantic,
+    /// Query exceeded timeout.
+    QueryTimeout,
+    /// Feature not supported for this query language.
+    QueryUnsupported,
+    /// Query optimization failed.
+    QueryOptimization,
+    /// Query execution failed.
+    QueryExecution,
+    /// The session may not do what the statement does: its role or its
+    /// graph grants refuse it.
+    QueryPermissionDenied,
+    /// The statement reaches outside the database (a file, a URL, a model)
+    /// and the session has no external access.
+    QueryExternalAccessDenied,
+
+    // Transaction errors (T)
+    /// Write-write conflict (retry possible).
+    TransactionConflict,
+    /// Transaction exceeded TTL.
+    TransactionTimeout,
+    /// Transaction is read-only but attempted a write.
+    TransactionReadOnly,
+    /// Invalid transaction state.
+    TransactionInvalidState,
+    /// Serialization failure (SSI violation).
+    TransactionSerialization,
+    /// Deadlock detected.
+    TransactionDeadlock,
+    /// The database is closed: it takes no more writes.
+    DatabaseClosed,
+    /// A commit did not complete: nothing commits, checkpoints or saves until
+    /// the database is reopened.
+    IncompleteCommit,
+    /// A commit could not be written to the write-ahead log and was rolled
+    /// back (retry possible).
+    LogWriteFailed,
+    /// A commit was written to the write-ahead log, but the log could not be
+    /// made durable: whether the commit exists is known after a reopen.
+    CommitOutcomeUnknown,
+    /// The write-ahead log takes no more writes until the database is
+    /// reopened.
+    LogUnavailable,
+
+    // Storage errors (S)
+    /// Memory or disk limit reached.
+    StorageFull,
+    /// WAL or data corruption detected.
+    StorageCorrupted,
+    /// Recovery from WAL failed.
+    StorageRecoveryFailed,
+    /// The database file is open elsewhere: in another handle of this
+    /// process, or in another process.
+    DatabaseLocked,
+    /// An incremental backup cannot continue its chain: the log it starts
+    /// from was removed. A new full backup starts a new chain.
+    BackupChainBroken,
+
+    // Validation errors (V)
+    /// Request validation failed.
+    InvalidInput,
+    /// Node not found.
+    NodeNotFound,
+    /// Edge not found.
+    EdgeNotFound,
+    /// Property key not found.
+    PropertyNotFound,
+    /// Label not found.
+    LabelNotFound,
+    /// Type mismatch.
+    TypeMismatch,
+
+    // Internal errors (X)
+    /// Unexpected internal error.
+    Internal,
+    /// Serialization/deserialization error.
+    SerializationError,
+    /// I/O error.
+    IoError,
+}
+
+impl ErrorCode {
+    /// Returns the string code (e.g. `"GRAFEO-Q001"`).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::QuerySyntax => "GRAFEO-Q001",
+            Self::QuerySemantic => "GRAFEO-Q002",
+            Self::QueryTimeout => "GRAFEO-Q003",
+            Self::QueryUnsupported => "GRAFEO-Q004",
+            Self::QueryOptimization => "GRAFEO-Q005",
+            Self::QueryExecution => "GRAFEO-Q006",
+            Self::QueryPermissionDenied => "GRAFEO-Q007",
+            Self::QueryExternalAccessDenied => "GRAFEO-Q008",
+
+            Self::TransactionConflict => "GRAFEO-T001",
+            Self::TransactionTimeout => "GRAFEO-T002",
+            Self::TransactionReadOnly => "GRAFEO-T003",
+            Self::TransactionInvalidState => "GRAFEO-T004",
+            Self::TransactionSerialization => "GRAFEO-T005",
+            Self::TransactionDeadlock => "GRAFEO-T006",
+            Self::DatabaseClosed => "GRAFEO-T007",
+            Self::IncompleteCommit => "GRAFEO-T008",
+            Self::LogWriteFailed => "GRAFEO-T009",
+            Self::CommitOutcomeUnknown => "GRAFEO-T010",
+            Self::LogUnavailable => "GRAFEO-T011",
+
+            Self::StorageFull => "GRAFEO-S001",
+            Self::StorageCorrupted => "GRAFEO-S002",
+            Self::StorageRecoveryFailed => "GRAFEO-S003",
+            Self::DatabaseLocked => "GRAFEO-S004",
+            Self::BackupChainBroken => "GRAFEO-S005",
+
+            Self::InvalidInput => "GRAFEO-V001",
+            Self::NodeNotFound => "GRAFEO-V002",
+            Self::EdgeNotFound => "GRAFEO-V003",
+            Self::PropertyNotFound => "GRAFEO-V004",
+            Self::LabelNotFound => "GRAFEO-V005",
+            Self::TypeMismatch => "GRAFEO-V006",
+
+            Self::Internal => "GRAFEO-X001",
+            Self::SerializationError => "GRAFEO-X002",
+            Self::IoError => "GRAFEO-X003",
+        }
+    }
+
+    /// Whether this error is retryable (client should retry the operation).
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::TransactionConflict
+                | Self::TransactionTimeout
+                | Self::TransactionDeadlock
+                | Self::LogWriteFailed
+                | Self::QueryTimeout
+        )
+    }
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The main error type - covers everything that can go wrong in Grafeo.
+///
+/// Most methods return `Result<T, Error>`. Use pattern matching to handle
+/// specific cases, or just propagate with `?`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// A node was not found.
+    NodeNotFound(crate::types::NodeId),
+
+    /// An edge was not found.
+    EdgeNotFound(crate::types::EdgeId),
+
+    /// A property key was not found.
+    PropertyNotFound(String),
+
+    /// A label was not found.
+    LabelNotFound(String),
+
+    /// Type mismatch error. Boxed so the error stays small; build one with
+    /// [`Error::type_mismatch`].
+    TypeMismatch(Box<TypeMismatch>),
+
+    /// Invalid value error.
+    InvalidValue(String),
+
+    /// A write the graph's schema or a database rule refuses (see
+    /// [`ConstraintKind`]); displayed as an invalid value, with its own
+    /// GQLSTATUS.
+    Constraint {
+        /// What the write breaks, which decides the GQLSTATUS.
+        kind: ConstraintKind,
+        /// What was refused and why (a boxed `str`, so the error stays
+        /// small).
+        message: Box<str>,
+    },
+
+    /// Transaction error.
+    Transaction(TransactionError),
+
+    /// Storage error. Boxed so the error stays small: build one with
+    /// `Error::from(storage_error)`.
+    Storage(Box<StorageError>),
+
+    /// Query error. Boxed so the error stays small: build one with
+    /// `Error::from(query_error)` (or `?` on a `Result<_, QueryError>`).
+    Query(Box<QueryError>),
+
+    /// Serialization error: input that does not decode as expected (query
+    /// parameters, JSON, imports, snapshots), or a value a file cannot hold.
+    Serialization(String),
+
+    /// A file Grafeo wrote is damaged: its bytes do not read back as Grafeo
+    /// writes them (a checksum, a header, a section or a record that does
+    /// not decode). Boxed so the error stays small.
+    Corruption(Box<Corruption>),
+
+    /// I/O error.
+    Io(std::io::Error),
+
+    /// Internal error (should not happen in normal operation).
+    Internal(String),
+}
+
+// Every `Result` the engine, the stores and the bindings return carries an
+// `Error`: its large payloads are boxed so a `Result` of a small value stays
+// small (32 bytes on 64-bit targets, so a read's `Result<Option<Value>>`
+// is no larger than the value itself needs).
+const _: () = assert!(
+    std::mem::size_of::<Error>() <= 32,
+    "Error grew past 32 bytes: box the payload that grew it"
+);
+
+/// The types of a [`Error::TypeMismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeMismatch {
+    /// The expected type.
+    pub expected: String,
+    /// The actual type found.
+    pub found: String,
+}
+
+/// What is damaged in a file Grafeo wrote, and where (see
+/// [`Error::Corruption`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Corruption {
+    /// What is damaged and how.
+    pub what: String,
+    /// The file, when the reader knows it.
+    pub file: Option<std::path::PathBuf>,
+    /// The byte offset in the file, when the reader knows it.
+    pub offset: Option<u64>,
+}
+
+impl Corruption {
+    /// Damage described by `what`, in no file and at no offset yet.
+    #[must_use]
+    pub fn new(what: impl Into<String>) -> Self {
+        Self {
+            what: what.into(),
+            file: None,
+            offset: None,
+        }
+    }
+
+    /// The same damage at byte `offset` of the file.
+    #[must_use]
+    pub fn at(self, offset: u64) -> Self {
+        Self {
+            offset: Some(offset),
+            ..self
+        }
+    }
+}
+
+impl fmt::Display for Corruption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the file ")?;
+        if let Some(file) = &self.file {
+            write!(f, "{} ", file.display())?;
+        }
+        f.write_str("is damaged")?;
+        if let Some(offset) = self.offset {
+            write!(f, " at byte {offset}")?;
+        }
+        write!(f, ": {}", self.what)
+    }
+}
+
+impl Error {
+    /// The refusal inside a [`StorageError::LimitReached`], for tests and bindings.
+    #[must_use]
+    pub fn limit_refusal(&self) -> Option<&LimitRefusal> {
+        match self {
+            Error::Storage(storage) => match &**storage {
+                StorageError::LimitReached(refusal) => Some(refusal),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A [`TypeMismatch`]: `expected` was wanted, `found` was given.
+    #[must_use]
+    pub fn type_mismatch(expected: impl Into<String>, found: impl Into<String>) -> Self {
+        Self::TypeMismatch(Box::new(TypeMismatch {
+            expected: expected.into(),
+            found: found.into(),
+        }))
+    }
+
+    /// A [`Corruption`] described by `what`.
+    #[must_use]
+    pub fn corruption(what: impl Into<String>) -> Self {
+        Self::Corruption(Box::new(Corruption::new(what)))
+    }
+
+    /// A [`Corruption`] described by `what`, at byte `offset` of the file.
+    #[must_use]
+    pub fn corruption_at(what: impl Into<String>, offset: u64) -> Self {
+        Self::Corruption(Box::new(Corruption::new(what).at(offset)))
+    }
+
+    /// This error with `context` in front of its message, as a reader
+    /// reports what failed under it. It keeps its kind: a [`Corruption`]
+    /// keeps its file and offset, an I/O error its kind. Errors without a
+    /// free-form message come back as they are.
+    #[must_use]
+    pub fn wrapped(self, context: impl fmt::Display) -> Self {
+        match self {
+            Self::Corruption(mut corruption) => {
+                corruption.what = format!("{context}: {}", corruption.what);
+                Self::Corruption(corruption)
+            }
+            Self::Serialization(message) => Self::Serialization(format!("{context}: {message}")),
+            Self::Internal(message) => Self::Internal(format!("{context}: {message}")),
+            Self::Io(error) => Self::Io(std::io::Error::new(
+                error.kind(),
+                format!("{context}: {error}"),
+            )),
+            other => other,
+        }
+    }
+
+    /// This error, at byte `offset` of its file when it is a [`Corruption`]
+    /// that names no offset yet; any other error comes back as it is.
+    #[must_use]
+    pub fn at(self, offset: u64) -> Self {
+        match self {
+            Self::Corruption(mut corruption) if corruption.offset.is_none() => {
+                corruption.offset = Some(offset);
+                Self::Corruption(corruption)
+            }
+            other => other,
+        }
+    }
+
+    /// This error, naming `file` when it is a [`Corruption`] that names no
+    /// file yet; any other error comes back as it is.
+    #[must_use]
+    pub fn in_file(self, file: &std::path::Path) -> Self {
+        match self {
+            Self::Corruption(mut corruption) if corruption.file.is_none() => {
+                corruption.file = Some(file.to_path_buf());
+                Self::Corruption(corruption)
+            }
+            other => other,
+        }
+    }
+
+    /// Returns the machine-readable error code for this error.
+    #[must_use]
+    pub fn error_code(&self) -> ErrorCode {
+        match self {
+            Error::NodeNotFound(_) => ErrorCode::NodeNotFound,
+            Error::EdgeNotFound(_) => ErrorCode::EdgeNotFound,
+            Error::PropertyNotFound(_) => ErrorCode::PropertyNotFound,
+            Error::LabelNotFound(_) => ErrorCode::LabelNotFound,
+            Error::TypeMismatch(_) => ErrorCode::TypeMismatch,
+            Error::InvalidValue(_) | Error::Constraint { .. } => ErrorCode::InvalidInput,
+            Error::Transaction(e) => e.error_code(),
+            Error::Storage(e) => e.error_code(),
+            Error::Query(e) => e.error_code(),
+            Error::Serialization(_) => ErrorCode::SerializationError,
+            Error::Corruption(_) => ErrorCode::StorageCorrupted,
+            Error::Io(_) => ErrorCode::IoError,
+            Error::Internal(_) => ErrorCode::Internal,
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = self.error_code();
+        match self {
+            Error::NodeNotFound(id) => write!(f, "{code}: Node not found: {id}"),
+            Error::EdgeNotFound(id) => write!(f, "{code}: Edge not found: {id}"),
+            Error::PropertyNotFound(key) => write!(f, "{code}: Property not found: {key}"),
+            Error::LabelNotFound(label) => write!(f, "{code}: Label not found: {label}"),
+            Error::TypeMismatch(mismatch) => {
+                write!(
+                    f,
+                    "{code}: Type mismatch: expected {}, found {}",
+                    mismatch.expected, mismatch.found
+                )
+            }
+            Error::InvalidValue(msg) => write!(f, "{code}: Invalid value: {msg}"),
+            Error::Constraint { message, .. } => {
+                write!(f, "{code}: Invalid value: Constraint violation: {message}")
+            }
+            Error::Transaction(e) => write!(f, "{code}: {e}"),
+            Error::Storage(e) => write!(f, "{code}: {e}"),
+            Error::Query(e) => write!(f, "{code}: {e}"),
+            Error::Serialization(msg) => write!(f, "{code}: Serialization error: {msg}"),
+            Error::Corruption(corruption) => write!(f, "{code}: {corruption}"),
+            Error::Io(e) => write!(f, "{code}: I/O error: {e}"),
+            Error::Internal(msg) => write!(f, "{code}: Internal error: {msg}"),
+        }
+    }
+}
+
+/// A copy of the error with the same variant, code and message. An I/O error
+/// is copied as a new one of the same kind and message: `std::io::Error` has
+/// no clone, so the copy drops the error it wraps, if any.
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        match self {
+            Error::NodeNotFound(id) => Error::NodeNotFound(*id),
+            Error::EdgeNotFound(id) => Error::EdgeNotFound(*id),
+            Error::PropertyNotFound(key) => Error::PropertyNotFound(key.clone()),
+            Error::LabelNotFound(label) => Error::LabelNotFound(label.clone()),
+            Error::TypeMismatch(mismatch) => Error::TypeMismatch(mismatch.clone()),
+            Error::InvalidValue(message) => Error::InvalidValue(message.clone()),
+            Error::Constraint { kind, message } => Error::Constraint {
+                kind: *kind,
+                message: message.clone(),
+            },
+            Error::Transaction(error) => Error::Transaction(error.clone()),
+            Error::Storage(error) => Error::Storage(error.clone()),
+            Error::Query(error) => Error::Query(error.clone()),
+            Error::Serialization(message) => Error::Serialization(message.clone()),
+            Error::Corruption(corruption) => Error::Corruption(corruption.clone()),
+            Error::Io(error) => Error::Io(std::io::Error::new(error.kind(), error.to_string())),
+            Error::Internal(message) => Error::Internal(message.clone()),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Transaction(e) => Some(e),
+            Error::Storage(e) => Some(&**e),
+            Error::Query(e) => Some(&**e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+/// Transaction-specific errors.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum TransactionError {
+    /// Transaction was aborted.
+    Aborted,
+
+    /// Transaction commit failed due to conflict.
+    Conflict,
+
+    /// Write-write conflict with another transaction.
+    WriteConflict(String),
+
+    /// Serialization failure (SSI violation).
+    ///
+    /// Occurs when running at Serializable isolation level and a read-write
+    /// conflict is detected (we read data that another committed transaction wrote).
+    /// Not raised yet: a session refuses Serializable until queries record their
+    /// reads (#400).
+    SerializationFailure(String),
+
+    /// Deadlock detected.
+    Deadlock,
+
+    /// Transaction timed out.
+    Timeout,
+
+    /// Transaction is read-only but attempted a write.
+    ReadOnly,
+
+    /// Invalid transaction state.
+    InvalidState(String),
+
+    /// A statement that cannot run while a transaction is open (GQLSTATUS 25G01). The
+    /// transaction goes on.
+    ActiveTransaction(String),
+
+    /// The database is closed: `close()` of a persistent database started,
+    /// so it takes no more writes. Open it again to write.
+    DatabaseClosed,
+
+    /// An earlier commit did not complete (it panicked between its commit
+    /// epoch and its completion), so the store may hold part of it: no
+    /// transaction commits and nothing is checkpointed, saved or copied
+    /// until the database is reopened. Reads still see every commit
+    /// published before it.
+    IncompleteCommit,
+
+    /// The commit could not be written to the write-ahead log (the reason
+    /// follows), and was rolled back: nothing of it is in the log or the
+    /// database, and the same changes can be committed again.
+    LogWriteFailed(String),
+
+    /// The commit was written to the write-ahead log, but the log could not
+    /// be made durable (the reason follows), so the commit may or may not
+    /// survive: nobody sees it now, and a reopen finds it or not. Nothing
+    /// commits until the database is reopened.
+    CommitOutcomeUnknown(String),
+
+    /// The write-ahead log takes no more writes (the reason follows): an
+    /// earlier write or sync of it failed. Nothing of this commit was
+    /// written, and nothing commits until the database is reopened.
+    LogUnavailable(String),
+}
+
+impl TransactionError {
+    /// Returns the machine-readable error code for this transaction error.
+    #[must_use]
+    pub const fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::Aborted | Self::Conflict | Self::WriteConflict(_) => {
+                ErrorCode::TransactionConflict
+            }
+            Self::SerializationFailure(_) => ErrorCode::TransactionSerialization,
+            Self::Deadlock => ErrorCode::TransactionDeadlock,
+            Self::Timeout => ErrorCode::TransactionTimeout,
+            Self::ReadOnly => ErrorCode::TransactionReadOnly,
+            Self::InvalidState(_) | Self::ActiveTransaction(_) => {
+                ErrorCode::TransactionInvalidState
+            }
+            Self::DatabaseClosed => ErrorCode::DatabaseClosed,
+            Self::IncompleteCommit => ErrorCode::IncompleteCommit,
+            Self::LogWriteFailed(_) => ErrorCode::LogWriteFailed,
+            Self::CommitOutcomeUnknown(_) => ErrorCode::CommitOutcomeUnknown,
+            Self::LogUnavailable(_) => ErrorCode::LogUnavailable,
+        }
+    }
+}
+
+impl fmt::Display for TransactionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TransactionError::Aborted => write!(f, "Transaction aborted"),
+            TransactionError::Conflict => write!(f, "Transaction conflict"),
+            TransactionError::WriteConflict(msg) => write!(f, "Write conflict: {msg}"),
+            TransactionError::SerializationFailure(msg) => {
+                write!(f, "Serialization failure (SSI): {msg}")
+            }
+            TransactionError::Deadlock => write!(f, "Deadlock detected"),
+            TransactionError::Timeout => write!(f, "Transaction timeout"),
+            TransactionError::ReadOnly => write!(f, "Cannot write in read-only transaction"),
+            TransactionError::InvalidState(msg) => write!(f, "Invalid transaction state: {msg}"),
+            TransactionError::ActiveTransaction(msg) => {
+                write!(f, "Invalid in an active transaction: {msg}")
+            }
+            TransactionError::DatabaseClosed => write!(
+                f,
+                "the database is closed, so it takes no more writes: open it again to write"
+            ),
+            TransactionError::IncompleteCommit => write!(
+                f,
+                "an earlier commit did not complete, so no transaction can commit and nothing \
+                 can be checkpointed, saved or copied: reopen the database (reads still see \
+                 every commit published before it)"
+            ),
+            TransactionError::LogWriteFailed(reason) => write!(
+                f,
+                "the commit could not be written to the write-ahead log and was rolled back, \
+                 so nothing of it remains and it can be retried: {reason}"
+            ),
+            TransactionError::CommitOutcomeUnknown(reason) => write!(
+                f,
+                "the commit was written to the write-ahead log, but the log could not be made \
+                 durable, so whether the commit exists is known only after the database is \
+                 reopened; nothing commits until then: {reason}"
+            ),
+            TransactionError::LogUnavailable(reason) => write!(
+                f,
+                "the write-ahead log takes no more writes, so nothing was written and nothing \
+                 commits until the database is reopened: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TransactionError {}
+
+impl From<TransactionError> for Error {
+    fn from(e: TransactionError) -> Self {
+        Error::Transaction(e)
+    }
+}
+
+/// Storage-specific errors. A damaged file is an [`Error::Corruption`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum StorageError {
+    /// Storage is full.
+    Full,
+
+    /// Invalid WAL entry.
+    InvalidWalEntry(String),
+
+    /// Recovery failed.
+    RecoveryFailed(String),
+
+    /// Checkpoint failed.
+    CheckpointFailed(String),
+
+    /// The database file is open elsewhere, so it cannot be opened here
+    /// (what holds it follows): another handle of this process, or another
+    /// process.
+    Locked(String),
+
+    /// An incremental backup cannot continue its chain (what is missing
+    /// follows): only a new full backup helps, not a retry.
+    BackupChainBroken(String),
+
+    /// One of the database's bounds refused memory or spill space; nothing changed.
+    LimitReached(Box<LimitRefusal>),
+}
+
+impl StorageError {
+    /// Returns the machine-readable error code for this storage error.
+    #[must_use]
+    pub const fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::Full | Self::LimitReached(_) => ErrorCode::StorageFull,
+            Self::InvalidWalEntry(_) | Self::CheckpointFailed(_) => ErrorCode::StorageCorrupted,
+            Self::RecoveryFailed(_) => ErrorCode::StorageRecoveryFailed,
+            Self::Locked(_) => ErrorCode::DatabaseLocked,
+            Self::BackupChainBroken(_) => ErrorCode::BackupChainBroken,
+        }
+    }
+}
+
+impl fmt::Display for StorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StorageError::Full => write!(f, "Storage is full"),
+            StorageError::InvalidWalEntry(msg) => write!(f, "Invalid WAL entry: {msg}"),
+            StorageError::RecoveryFailed(msg) => write!(f, "Recovery failed: {msg}"),
+            StorageError::CheckpointFailed(msg) => write!(f, "Checkpoint failed: {msg}"),
+            StorageError::Locked(msg) => write!(f, "Database locked: {msg}"),
+            StorageError::BackupChainBroken(msg) => write!(f, "Backup chain broken: {msg}"),
+            StorageError::LimitReached(refusal) => write!(f, "{refusal}"),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+impl From<StorageError> for Error {
+    fn from(e: StorageError) -> Self {
+        Error::Storage(Box::new(e))
+    }
+}
+
+/// Which of the database's bounds refused a reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LimitBound {
+    /// The database's memory limit.
+    MemoryLimit,
+    /// The memory one query may hold.
+    QueryMemoryLimit,
+    /// The disk space spilled queries may hold.
+    SpillLimit,
+    /// The free space the database keeps on the spill volume for its next checkpoint.
+    CheckpointRoom,
+}
+
+impl LimitBound {
+    /// The bound's name in messages: "memory limit", "query memory limit", "spill limit",
+    /// "checkpoint room".
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MemoryLimit => "memory limit",
+            Self::QueryMemoryLimit => "query memory limit",
+            Self::SpillLimit => "spill limit",
+            Self::CheckpointRoom => "checkpoint room",
+        }
+    }
+
+    /// The setting that moves the bound, with the bindings' names.
+    #[must_use]
+    pub const fn setting(self) -> &'static str {
+        match self {
+            Self::MemoryLimit => {
+                "Config::with_memory_limit (Python memory_limit, Node memoryLimit)"
+            }
+            Self::QueryMemoryLimit => {
+                "Config::with_query_memory_limit (Python query_memory_limit, Node queryMemoryLimit)"
+            }
+            Self::SpillLimit => "Config::with_spill_limit (Python spill_limit, Node spillLimit)",
+            Self::CheckpointRoom => "Config::with_spill_path",
+        }
+    }
+}
+
+/// A reservation one of the database's bounds refused: nothing changed. Figures are bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LimitRefusal {
+    /// The memory limit or the query memory limit refused `requested` more bytes, with `used`
+    /// of `limit` in use.
+    Memory {
+        /// [`LimitBound::MemoryLimit`] or [`LimitBound::QueryMemoryLimit`].
+        bound: LimitBound,
+        /// The bytes asked for.
+        requested: u64,
+        /// The bytes in use under the bound.
+        used: u64,
+        /// The bound as set.
+        limit: u64,
+    },
+    /// The spill limit refused `requested` more bytes, with `used` of `limit` spilled.
+    Spill {
+        /// The bytes asked for.
+        requested: u64,
+        /// The bytes spilled.
+        used: u64,
+        /// The spill limit.
+        limit: u64,
+    },
+    /// Spilling `requested` more bytes would leave less than `needed` of the `free` bytes on
+    /// `volume` for the next checkpoint.
+    Room {
+        /// The bytes asked for.
+        requested: u64,
+        /// The free bytes on the volume.
+        free: u64,
+        /// The free bytes the database needs for its next checkpoint.
+        needed: u64,
+        /// The spill volume (the spill directory).
+        volume: std::path::PathBuf,
+    },
+}
+
+impl LimitRefusal {
+    /// The bound that refused.
+    #[must_use]
+    pub fn bound(&self) -> LimitBound {
+        match self {
+            Self::Memory { bound, .. } => *bound,
+            Self::Spill { .. } => LimitBound::SpillLimit,
+            Self::Room { .. } => LimitBound::CheckpointRoom,
+        }
+    }
+}
+
+impl fmt::Display for LimitRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory {
+                bound,
+                requested,
+                used,
+                limit,
+            } => write!(
+                f,
+                "the statement needs {requested} more bytes: {used} bytes of the {} of {limit} \
+                 are in use; raise it with {}",
+                bound.name(),
+                bound.setting()
+            ),
+            Self::Spill {
+                requested,
+                used,
+                limit,
+            } => write!(
+                f,
+                "spilling {requested} more bytes would pass the spill limit of {limit} bytes \
+                 ({used} spilled); raise it with {}",
+                LimitBound::SpillLimit.setting()
+            ),
+            Self::Room {
+                requested,
+                free,
+                needed,
+                volume,
+            } => write!(
+                f,
+                "spilling {requested} more bytes would leave {} bytes free on {}, and the \
+                 database's checkpoint room needs {needed} bytes for its next checkpoint",
+                free.saturating_sub(*requested),
+                volume.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LimitRefusal {}
+
+impl From<LimitRefusal> for Error {
+    fn from(refusal: LimitRefusal) -> Self {
+        Error::from(StorageError::LimitReached(Box::new(refusal)))
+    }
+}
+
+/// A query error with source location and helpful hints.
+///
+/// When something goes wrong in a query (syntax error, unknown label, type
+/// mismatch), you get one of these. The error message includes the location
+/// in your query and often a suggestion for fixing it.
+#[derive(Debug, Clone)]
+pub struct QueryError {
+    /// What category of error (lexer, syntax, semantic, etc.)
+    pub kind: QueryErrorKind,
+    /// Human-readable explanation of what went wrong.
+    pub message: String,
+    /// Where in the query the error occurred.
+    pub span: Option<SourceSpan>,
+    /// The original query text (for showing context).
+    pub source_query: Option<String>,
+    /// A suggestion for fixing the error.
+    pub hint: Option<String>,
+}
+
+impl QueryError {
+    /// Creates a new query error.
+    pub fn new(kind: QueryErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            span: None,
+            source_query: None,
+            hint: None,
+        }
+    }
+
+    /// A semantic error (`GRAFEO-Q002`, GQLSTATUS 42000): the query text
+    /// breaks a rule beyond the grammar, such as a call with another number
+    /// of arguments.
+    #[must_use]
+    pub fn semantic(message: impl Into<String>) -> Self {
+        Self::new(QueryErrorKind::Semantic, message)
+    }
+
+    /// An invalid reference (`GRAFEO-Q002`, GQLSTATUS 42002): a name that
+    /// resolves to nothing, such as an undefined variable or an unknown
+    /// procedure.
+    #[must_use]
+    pub fn invalid_reference(message: impl Into<String>) -> Self {
+        Self::new(QueryErrorKind::InvalidReference, message)
+    }
+
+    /// The database or the build cannot run the statement
+    /// (`GRAFEO-Q004`): a feature not built in, or a language of another
+    /// graph model.
+    #[must_use]
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::new(QueryErrorKind::Unsupported, message)
+    }
+
+    /// A refused permission (`GRAFEO-Q007`, GQLSTATUS 42501): the session's
+    /// role or its graph grants do not allow what the statement does.
+    #[must_use]
+    pub fn permission_denied(message: impl Into<String>) -> Self {
+        Self::new(QueryErrorKind::PermissionDenied, message)
+    }
+
+    /// Refused external access (`GRAFEO-Q008`, GQLSTATUS 42501): the
+    /// statement reaches outside the database and the session may not.
+    #[must_use]
+    pub fn external_access_denied(message: impl Into<String>) -> Self {
+        Self::new(QueryErrorKind::ExternalAccessDenied, message)
+    }
+
+    /// Creates a query timeout error.
+    #[must_use]
+    pub fn timeout() -> Self {
+        Self::new(QueryErrorKind::Timeout, "Query exceeded timeout")
+    }
+
+    /// Creates a query timeout error that includes the configured limit.
+    #[must_use]
+    pub fn timeout_with_limit(limit: std::time::Duration) -> Self {
+        let millis = limit.as_millis();
+        let timeout_display = if millis >= 1000 && millis.is_multiple_of(1000) {
+            format!("{}s", millis / 1000)
+        } else {
+            format!("{millis}ms")
+        };
+        Self::new(
+            QueryErrorKind::Timeout,
+            format!("Query exceeded the {timeout_display} timeout"),
+        )
+        .with_hint(
+            "Increase the query timeout in the database configuration, or disable it".to_string(),
+        )
+    }
+
+    /// Returns the machine-readable error code for this query error.
+    #[must_use]
+    pub const fn error_code(&self) -> ErrorCode {
+        match self.kind {
+            QueryErrorKind::Lexer | QueryErrorKind::Syntax => ErrorCode::QuerySyntax,
+            QueryErrorKind::Semantic | QueryErrorKind::InvalidReference => ErrorCode::QuerySemantic,
+            QueryErrorKind::Optimization => ErrorCode::QueryOptimization,
+            QueryErrorKind::Execution
+            | QueryErrorKind::NumericOutOfRange
+            | QueryErrorKind::InvalidCharacterValueForCast
+            | QueryErrorKind::DivisionByZero
+            | QueryErrorKind::NegativeLimit
+            | QueryErrorKind::InvalidValueType
+            | QueryErrorKind::WrongKind
+            | QueryErrorKind::InvalidTimeZoneDisplacement
+            | QueryErrorKind::ValuesNotComparable
+            | QueryErrorKind::InvalidParameterValue => ErrorCode::QueryExecution,
+            QueryErrorKind::Timeout => ErrorCode::QueryTimeout,
+            QueryErrorKind::Unsupported => ErrorCode::QueryUnsupported,
+            QueryErrorKind::PermissionDenied => ErrorCode::QueryPermissionDenied,
+            QueryErrorKind::ExternalAccessDenied => ErrorCode::QueryExternalAccessDenied,
+        }
+    }
+
+    /// Adds a source span to the error.
+    #[must_use]
+    pub fn with_span(mut self, span: SourceSpan) -> Self {
+        self.span = Some(span);
+        self
+    }
+
+    /// Adds the source query to the error.
+    #[must_use]
+    pub fn with_source(mut self, query: impl Into<String>) -> Self {
+        self.source_query = Some(query.into());
+        self
+    }
+
+    /// Adds a hint to the error.
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.kind, self.message)?;
+
+        if let (Some(span), Some(query)) = (&self.span, &self.source_query) {
+            write!(f, "\n  --> query:{}:{}", span.line, span.column)?;
+
+            // Extract and display the relevant line
+            if let Some(line) = query.lines().nth(span.line.saturating_sub(1) as usize) {
+                write!(f, "\n   |")?;
+                write!(f, "\n {} | {}", span.line, line)?;
+                write!(f, "\n   | ")?;
+
+                // Add caret markers
+                for _ in 0..span.column.saturating_sub(1) {
+                    write!(f, " ")?;
+                }
+                for _ in span.start..span.end {
+                    write!(f, "^")?;
+                }
+            }
+        }
+
+        if let Some(hint) = &self.hint {
+            write!(f, "\n   |\n  help: {hint}")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl std::error::Error for QueryError {}
+
+impl From<QueryError> for Error {
+    fn from(e: QueryError) -> Self {
+        Error::Query(Box::new(e))
+    }
+}
+
+/// What a refused write breaks (see [`Error::Constraint`]), which decides
+/// its GQLSTATUS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConstraintKind {
+    /// The data does not conform to the graph's schema: its graph type (a
+    /// property of another type, a missing NOT NULL property, a label, edge
+    /// type, property or endpoint a closed graph type does not allow) or a
+    /// constraint on its labels (NOT NULL, UNIQUE, PRIMARY KEY, CHECK).
+    /// GQLSTATUS G2000, graph type violation.
+    Schema,
+    /// A node to delete without DETACH still has edges. GQLSTATUS G1001,
+    /// dependent object error: edges still exist.
+    EdgesStillExist,
+    /// A value past a limit of the database rather than of the schema: a
+    /// vector of another size than its index, a property value too large or
+    /// nested too deep. GQLSTATUS 22000, data exception; the engine reports
+    /// it as the [`Error::InvalidValue`] it is.
+    Limit,
+}
+
+/// The kind of query error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum QueryErrorKind {
+    /// Lexical error (invalid token).
+    Lexer,
+    /// Syntax error (parse failure).
+    Syntax,
+    /// The statement breaks a rule beyond the grammar: an aggregate where
+    /// none may stand, a wrong number of arguments, a pattern MERGE or
+    /// CREATE cannot take, a name declared twice (GQLSTATUS 42000, the code
+    /// ISO/IEC 39075 gives a violated syntax or access rule that names no
+    /// condition of its own).
+    Semantic,
+    /// A name that resolves to nothing: an undefined or out-of-scope
+    /// variable, or an unknown function, procedure, parameter, graph, type,
+    /// index or constraint (GQLSTATUS 42002, invalid reference).
+    InvalidReference,
+    /// Optimization error.
+    Optimization,
+    /// Execution error.
+    Execution,
+    /// Timeout error (query exceeded configured time limit).
+    Timeout,
+    /// The database or the build cannot run the statement: a feature not
+    /// built in, or a language of another graph model.
+    Unsupported,
+    /// A computation left the range of its type: an integer overflow, or a
+    /// decimal of more than 38 digits (GQLSTATUS 22003).
+    NumericOutOfRange,
+    /// Text a cast cannot read as a value of its target type, such as
+    /// `CAST('Alix' AS INT64)` (GQLSTATUS 22018).
+    InvalidCharacterValueForCast,
+    /// An integer or decimal division or modulo by zero (GQLSTATUS 22012).
+    DivisionByZero,
+    /// A negative `SKIP`, `OFFSET` or `LIMIT` value (GQLSTATUS 22G02).
+    NegativeLimit,
+    /// A value of another type than the statement needs where it is used,
+    /// such as a parameter or a procedure argument (GQLSTATUS 22G03).
+    InvalidValueType,
+    /// An operand of a kind its operator does not take, found as the
+    /// statement runs, such as `true + 1` or `[1, 2][1.5]` (GQLSTATUS 22G12:
+    /// ISO/IEC 39075 4.14.4, the type test of a dynamically typed operand).
+    WrongKind,
+    /// A time zone that is not a UTC offset (`+01:00`, `Z`, `UTC`), or one
+    /// past 14 hours (GQLSTATUS 22009).
+    InvalidTimeZoneDisplacement,
+    /// Two values a comparison cannot compare, such as a node and a number
+    /// in GQL (GQLSTATUS 22G04).
+    ValuesNotComparable,
+    /// An argument of a procedure, or a value it reads as one (an edge's
+    /// weight), outside the values the procedure allows, such as a damping
+    /// of 2.0 (GQLSTATUS 22023: ISO/IEC 9075-2 13.3 General Rule 7, which GQL
+    /// takes as a code of another International Standard).
+    InvalidParameterValue,
+    /// The session's role or its graph grants refuse what the statement
+    /// does, such as a write on a read-only session (GQLSTATUS 42501,
+    /// insufficient privilege: ISO/IEC 9075-2, which GQL's class 42 for an
+    /// access rule violation leaves without a subclass of its own).
+    PermissionDenied,
+    /// The statement reaches outside the database (a file, a URL, a model)
+    /// on a session without external access (GQLSTATUS 42501).
+    ExternalAccessDenied,
+}
+
+impl fmt::Display for QueryErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QueryErrorKind::Lexer => write!(f, "lexer error"),
+            QueryErrorKind::Syntax => write!(f, "syntax error"),
+            QueryErrorKind::Semantic | QueryErrorKind::InvalidReference => {
+                write!(f, "semantic error")
+            }
+            QueryErrorKind::Optimization => write!(f, "optimization error"),
+            QueryErrorKind::Execution => write!(f, "execution error"),
+            QueryErrorKind::Timeout => write!(f, "timeout error"),
+            QueryErrorKind::Unsupported => write!(f, "unsupported"),
+            QueryErrorKind::NumericOutOfRange => write!(f, "numeric value out of range"),
+            QueryErrorKind::InvalidCharacterValueForCast => {
+                write!(f, "invalid character value for cast")
+            }
+            QueryErrorKind::DivisionByZero => write!(f, "division by zero"),
+            QueryErrorKind::NegativeLimit => write!(f, "negative limit value"),
+            QueryErrorKind::InvalidValueType | QueryErrorKind::WrongKind => {
+                write!(f, "invalid value type")
+            }
+            QueryErrorKind::InvalidTimeZoneDisplacement => {
+                write!(f, "invalid time zone displacement value")
+            }
+            QueryErrorKind::ValuesNotComparable => write!(f, "values not comparable"),
+            QueryErrorKind::InvalidParameterValue => write!(f, "invalid parameter value"),
+            QueryErrorKind::PermissionDenied | QueryErrorKind::ExternalAccessDenied => {
+                write!(f, "permission denied")
+            }
+        }
+    }
+}
+
+/// A span in the source code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSpan {
+    /// Byte offset of the start.
+    pub start: usize,
+    /// Byte offset of the end.
+    pub end: usize,
+    /// Line number (1-indexed).
+    pub line: u32,
+    /// Column number (1-indexed).
+    pub column: u32,
+}
+
+impl SourceSpan {
+    /// Creates a new source span.
+    pub const fn new(start: usize, end: usize, line: u32, column: u32) -> Self {
+        Self {
+            start,
+            end,
+            line,
+            column,
+        }
+    }
+}
+
+/// A type alias for `Result<T, Error>`.
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_display() {
+        let err = Error::NodeNotFound(crate::types::NodeId::new(42));
+        assert_eq!(err.to_string(), "GRAFEO-V002: Node not found: 42");
+
+        let err = Error::type_mismatch("INT64", "STRING");
+        assert_eq!(
+            err.to_string(),
+            "GRAFEO-V006: Type mismatch: expected INT64, found STRING"
+        );
+    }
+
+    #[test]
+    fn database_closed_has_its_own_code_and_is_not_retryable() {
+        let err = Error::Transaction(TransactionError::DatabaseClosed);
+        assert_eq!(err.error_code(), ErrorCode::DatabaseClosed);
+        assert_eq!(err.error_code().as_str(), "GRAFEO-T007");
+        assert!(!err.error_code().is_retryable());
+        assert_eq!(
+            err.to_string(),
+            "GRAFEO-T007: the database is closed, so it takes no more writes: open it again to write"
+        );
+    }
+
+    /// A commit whose log write failed was rolled back and can be retried; one
+    /// whose log write may or may not be on disk, and a log that takes no more
+    /// writes, need a reopen. Each has its own code, so a caller can tell
+    /// "retry", "may exist" and "reopen" apart.
+    #[test]
+    fn the_commit_log_errors_have_their_own_codes() {
+        let failed = Error::Transaction(TransactionError::LogWriteFailed("disk full".into()));
+        assert_eq!(failed.error_code(), ErrorCode::LogWriteFailed);
+        assert_eq!(failed.error_code().as_str(), "GRAFEO-T009");
+        assert!(failed.error_code().is_retryable(), "nothing of it remains");
+        assert_eq!(
+            failed.to_string(),
+            "GRAFEO-T009: the commit could not be written to the write-ahead log and was \
+             rolled back, so nothing of it remains and it can be retried: disk full"
+        );
+
+        let unknown = Error::Transaction(TransactionError::CommitOutcomeUnknown(
+            "fsync failed".into(),
+        ));
+        assert_eq!(unknown.error_code(), ErrorCode::CommitOutcomeUnknown);
+        assert_eq!(unknown.error_code().as_str(), "GRAFEO-T010");
+        assert!(!unknown.error_code().is_retryable(), "it may exist already");
+        assert_eq!(
+            unknown.to_string(),
+            "GRAFEO-T010: the commit was written to the write-ahead log, but the log could not \
+             be made durable, so whether the commit exists is known only after the database is \
+             reopened; nothing commits until then: fsync failed"
+        );
+
+        let unavailable = Error::Transaction(TransactionError::LogUnavailable(
+            "an earlier sync failed".into(),
+        ));
+        assert_eq!(unavailable.error_code(), ErrorCode::LogUnavailable);
+        assert_eq!(unavailable.error_code().as_str(), "GRAFEO-T011");
+        assert!(!unavailable.error_code().is_retryable());
+        assert_eq!(
+            unavailable.to_string(),
+            "GRAFEO-T011: the write-ahead log takes no more writes, so nothing was written and \
+             nothing commits until the database is reopened: an earlier sync failed"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_commit_has_its_own_code_and_is_not_retryable() {
+        let err = Error::Transaction(TransactionError::IncompleteCommit);
+        assert_eq!(err.error_code(), ErrorCode::IncompleteCommit);
+        assert_eq!(err.error_code().as_str(), "GRAFEO-T008");
+        assert!(
+            !err.error_code().is_retryable(),
+            "only a reopen helps, never a retry"
+        );
+        assert_eq!(
+            err.to_string(),
+            "GRAFEO-T008: an earlier commit did not complete, so no transaction can commit and \
+             nothing can be checkpointed, saved or copied: reopen the database (reads still see \
+             every commit published before it)"
+        );
+    }
+
+    #[test]
+    fn test_error_codes() {
+        assert_eq!(
+            Error::Internal("x".into()).error_code(),
+            ErrorCode::Internal
+        );
+        assert_eq!(ErrorCode::Internal.as_str(), "GRAFEO-X001");
+        assert!(!ErrorCode::Internal.is_retryable());
+
+        assert_eq!(
+            Error::Transaction(TransactionError::Conflict).error_code(),
+            ErrorCode::TransactionConflict
+        );
+        assert!(ErrorCode::TransactionConflict.is_retryable());
+        assert!(ErrorCode::QueryTimeout.is_retryable());
+        assert!(!ErrorCode::StorageFull.is_retryable());
+    }
+
+    #[test]
+    fn test_query_timeout() {
+        let err = QueryError::timeout();
+        assert_eq!(err.kind, QueryErrorKind::Timeout);
+        assert_eq!(err.error_code(), ErrorCode::QueryTimeout);
+        assert!(err.error_code().is_retryable());
+        assert!(err.message.contains("timeout"));
+    }
+
+    #[test]
+    fn test_query_error_formatting() {
+        let query = "MATCH (n:Peron) RETURN n";
+        let err = QueryError::new(QueryErrorKind::Semantic, "Unknown label 'Peron'")
+            .with_span(SourceSpan::new(9, 14, 1, 10))
+            .with_source(query)
+            .with_hint("Did you mean 'Person'?");
+
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown label 'Peron'"));
+        assert!(msg.contains("query:1:10"));
+        assert!(msg.contains("Did you mean 'Person'?"));
+    }
+
+    #[test]
+    fn test_transaction_error() {
+        let err: Error = TransactionError::Conflict.into();
+        assert!(matches!(
+            err,
+            Error::Transaction(TransactionError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn test_io_error_conversion() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err: Error = io_err.into();
+        assert!(matches!(err, Error::Io(_)));
+    }
+}

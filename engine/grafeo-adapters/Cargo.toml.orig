@@ -1,0 +1,45 @@
+[package]
+name = "grafeo-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Storage, query language, and plugin adapters for Grafeo"
+autotests = false
+
+[dependencies]
+grafeo-common.workspace = true
+grafeo-core.workspace = true
+
+# Concurrency
+parking_lot.workspace = true
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json = "1"
+
+[features]
+default = ["gql", "parallel"]
+lpg = []  # Deprecated: the LPG store is always built, so this enables nothing. Removed in 0.7.0.
+gql = []                      # GQL parser (ISO/IEC 39075:2024)
+cypher = []                   # Cypher parser (openCypher 9.0)
+sparql = []                   # SPARQL parser (W3C SPARQL 1.1)
+gremlin = []                  # Gremlin parser (Apache TinkerPop)
+graphql = []                  # GraphQL parser (spec-compliant)
+sql-pgq = ["gql"]             # SQL/PGQ parser (SQL:2023 GRAPH_TABLE)
+triple-store = ["grafeo-core/triple-store"]  # RDF triple store model
+rdf = ["triple-store"]                      # Deprecated: use triple-store
+parallel = ["rayon", "grafeo-core/parallel"]  # Parallel algorithms (rayon)
+algos = []  # Graph algorithm plugin (SSSP, PageRank, centrality, community detection, etc.)
+testing-deadline-probe = ["grafeo-core/testing-deadline-probe"]  # Test only: see grafeo-core
+
+[lints]
+workspace = true
+
+# One integration test binary (tests/main.rs declares each test file as a module).
+[[test]]
+name = "main"
+path = "tests/main.rs"

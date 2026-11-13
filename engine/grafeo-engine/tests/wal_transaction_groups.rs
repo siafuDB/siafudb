@@ -1,0 +1,690 @@
+//! Each transaction's WAL records form one group, written at commit (#411).
+//!
+//! Records of concurrent transactions used to interleave in the shared log,
+//! so on replay one session's abort cleared another's pending records and one
+//! session's commit committed another's uncommitted ones. These tests crash a
+//! child process (it exits without `close()`) after interleaving sessions,
+//! then reopen and check exactly which writes survived.
+//!
+//! ```bash
+//! cargo test -p grafeo-engine --features full --test main wal_transaction_groups::
+//! ```
+
+#![allow(missing_docs)]
+
+#[cfg(all(feature = "wal", feature = "grafeo-file"))]
+mod tests {
+    use grafeo_common::testing::child_process;
+    use grafeo_common::types::{NodeId, TransactionId, Value};
+    use grafeo_engine::config::StorageFormat;
+    use grafeo_engine::session::Session;
+    use grafeo_engine::{Config, GrafeoDB};
+    use grafeo_storage::wal::{WalManager, WalRecord};
+    use std::path::{Path, PathBuf};
+
+    const SCENARIO_VAR: &str = "GRAFEO_WAL_GROUP_SCENARIO";
+    const PATH_VAR: &str = "GRAFEO_WAL_GROUP_PATH";
+
+    /// The database file of a test.
+    fn db_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("single.grafeo")
+    }
+
+    fn config(path: &Path) -> Config {
+        Config::persistent(path).with_storage_format(StorageFormat::Auto)
+    }
+
+    fn open(path: &Path) -> GrafeoDB {
+        GrafeoDB::with_config(config(path)).unwrap()
+    }
+
+    /// Directory holding the WAL files for a database: its sidecar WAL.
+    fn wal_dir(path: &Path) -> PathBuf {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(".wal");
+        PathBuf::from(sidecar)
+    }
+
+    /// Runs `scenario` in a child process that exits without closing the
+    /// database, like a crash.
+    fn crash_after(scenario: &str, path: &Path) {
+        let status = child_process::run(
+            grafeo_common::child_test!("crash_child")
+                .env(SCENARIO_VAR, scenario)
+                .env(PATH_VAR, path),
+        )
+        .unwrap();
+        assert!(status.success(), "scenario {scenario} failed");
+    }
+
+    /// Sorted `n.name` of every `:Person` in the session's current graph.
+    fn names_in(session: &Session) -> Vec<String> {
+        let result = session
+            .execute("MATCH (n:Person) RETURN n.name ORDER BY n.name")
+            .unwrap();
+        result
+            .rows()
+            .iter()
+            .map(|row| match &row[0] {
+                Value::String(s) => s.to_string(),
+                other => panic!("unexpected name {other:?}"),
+            })
+            .collect()
+    }
+
+    fn names(db: &GrafeoDB) -> Vec<String> {
+        names_in(&db.session())
+    }
+
+    fn names_in_graph(db: &GrafeoDB, graph: &str) -> Vec<String> {
+        let session = db.session();
+        session.use_graph(graph);
+        names_in(&session)
+    }
+
+    fn insert(session: &Session, name: &str) {
+        session
+            .execute(&format!("INSERT (:Person {{name: '{name}'}})"))
+            .unwrap();
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // ------------------------------------------------------------------
+    // Scenarios, run in the child process
+    // ------------------------------------------------------------------
+
+    fn run_scenario(scenario: &str, db: &GrafeoDB) {
+        match scenario {
+            // The issue: B's rollback must not clear A's pending records.
+            "abort_between" => {
+                let mut a = db.session();
+                let mut b = db.session();
+                a.begin_transaction().unwrap();
+                insert(&a, "Alix");
+                b.begin_transaction().unwrap();
+                insert(&b, "Gus");
+                b.rollback().unwrap();
+                a.commit().unwrap();
+                // B's rolled-back records must not come back with its next write.
+                insert(&b, "Jules");
+            }
+            // The mirror: B's commit must not commit A's uncommitted records.
+            "commit_between" => {
+                let mut a = db.session();
+                let mut b = db.session();
+                a.begin_transaction().unwrap();
+                insert(&a, "Alix");
+                b.begin_transaction().unwrap();
+                insert(&b, "Gus");
+                b.commit().unwrap();
+                a.rollback().unwrap();
+            }
+            // Writes after a savepoint that was rolled back to are gone.
+            "savepoint" => {
+                let mut a = db.session();
+                a.begin_transaction().unwrap();
+                insert(&a, "Alix");
+                a.savepoint("sp").unwrap();
+                insert(&a, "Gus");
+                a.rollback_to_savepoint("sp").unwrap();
+                insert(&a, "Vincent");
+                a.commit().unwrap();
+            }
+            // One transaction writes a named graph and the default graph,
+            // while another session commits to the default graph in between.
+            "named_graphs" => {
+                db.session().execute("CREATE GRAPH g").unwrap();
+                let mut a = db.session();
+                a.begin_transaction().unwrap();
+                a.use_graph("g");
+                insert(&a, "Mia");
+                a.use_graph("default");
+                insert(&a, "Alix");
+                // Commits while A is still open. (Inserting before A's default
+                // graph write would reuse node id 0, which conflict detection
+                // confuses with Mia's id in graph g.)
+                insert(&db.session(), "Gus");
+                a.commit().unwrap();
+                insert(&db.session(), "Jules");
+            }
+            // Direct writes outside a transaction, including a named graph.
+            "direct_writes" => {
+                db.session().execute("CREATE GRAPH g").unwrap();
+                let session = db.session();
+                session
+                    .create_node_with_props(&["Person"], [("name", Value::from("Django"))])
+                    .unwrap();
+                session.use_graph("g");
+                session
+                    .create_node_with_props(&["Person"], [("name", Value::from("Hans"))])
+                    .unwrap();
+                // The group above ended in graph g; this one is in the
+                // default graph and must replay there.
+                insert(&db.session(), "Jules");
+            }
+            // A direct write after `use_graph` named a graph that does not
+            // exist lands in the default graph, like a query does.
+            "direct_write_to_unknown_graph" => {
+                let session = db.session();
+                session.use_graph("missing");
+                let error = session
+                    .create_node_with_props(&["Person"], [("name", Value::from("Vincent"))])
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("does not exist"), "{error}");
+                db.create_node_with_props(&["Person"], [("name", Value::from("Butch"))])
+                    .unwrap();
+                assert_eq!(names(db), strings(&["Butch"]));
+            }
+            // Same interleaving as "abort_between", through SPARQL updates.
+            #[cfg(all(feature = "sparql", feature = "triple-store"))]
+            "rdf_abort_between" => {
+                let mut a = db.session();
+                let mut b = db.session();
+                a.begin_transaction().unwrap();
+                a.execute_sparql(r#"INSERT DATA { <http://ex.org/alix> <http://ex.org/p> "1" . }"#)
+                    .unwrap();
+                b.begin_transaction().unwrap();
+                b.execute_sparql(r#"INSERT DATA { <http://ex.org/gus> <http://ex.org/p> "2" . }"#)
+                    .unwrap();
+                b.rollback().unwrap();
+                a.commit().unwrap();
+            }
+            // Schema changes outside a transaction, with nothing committed after.
+            "ddl_only" => {
+                db.session().execute("CREATE GRAPH g").unwrap();
+            }
+            // Schema changes inside a transaction that is rolled back.
+            "ddl_in_rolled_back_tx" => {
+                let mut a = db.session();
+                a.begin_transaction().unwrap();
+                a.execute("CREATE GRAPH h").unwrap();
+                a.execute("CREATE NODE TYPE Robot (name STRING)").unwrap();
+                a.rollback().unwrap();
+            }
+            // A database-level SPARQL update, with nothing committed after.
+            #[cfg(all(feature = "sparql", feature = "triple-store"))]
+            "rdf_db_level" => {
+                db.execute_sparql(r#"INSERT DATA { <http://ex.org/mia> <http://ex.org/p> "3" . }"#)
+                    .unwrap();
+            }
+            // #395: a database-level write, then `wal_checkpoint()`, no close.
+            "db_write_then_checkpoint" => {
+                db.create_node_with_props(&["Document"], [("title", Value::from("test"))])
+                    .unwrap();
+                db.wal_checkpoint().unwrap();
+            }
+            // The same write without the checkpoint.
+            "db_write" => {
+                db.create_node_with_props(&["Document"], [("title", Value::from("test"))])
+                    .unwrap();
+            }
+            // Every database-level write call, outside any transaction.
+            "db_crud" => {
+                let alix = db.create_node(&["Person"]).unwrap();
+                db.set_node_property(alix, "name", Value::from("Alix"))
+                    .unwrap();
+                let gus = db
+                    .create_node_with_props(
+                        &["Person"],
+                        [("name", Value::from("Gus")), ("age", Value::from(40_i64))],
+                    )
+                    .unwrap();
+                db.add_node_label(alix, "Employee").unwrap();
+                db.add_node_label(gus, "Temp").unwrap();
+                db.remove_node_label(gus, "Temp").unwrap();
+                db.remove_node_property(gus, "age").unwrap();
+                let knows = db.create_edge(alix, gus, "KNOWS").unwrap();
+                db.set_edge_property(knows, "since", Value::from(2020_i64))
+                    .unwrap();
+                let likes = db
+                    .create_edge_with_props(
+                        gus,
+                        alix,
+                        "LIKES",
+                        [("w", Value::from(1_i64)), ("x", Value::from(2_i64))],
+                    )
+                    .unwrap();
+                db.remove_edge_property(likes, "x").unwrap();
+                let vincent = db.create_node(&["Person"]).unwrap();
+                db.delete_node(vincent).unwrap();
+                let temp = db.create_edge(alix, gus, "TEMP").unwrap();
+                db.delete_edge(temp).unwrap();
+                db.batch_create_nodes("Vec", "v", vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+                    .unwrap();
+                db.batch_create_nodes_with_props(
+                    "Doc",
+                    ["a", "b"]
+                        .iter()
+                        .map(|title| {
+                            std::iter::once(("title".into(), Value::from(*title))).collect()
+                        })
+                        .collect(),
+                )
+                .unwrap();
+            }
+            // A database-level write while a session transaction is open.
+            "db_write_during_session_tx" => {
+                let mut a = db.session();
+                a.begin_transaction().unwrap();
+                insert(&a, "Mia");
+                db.create_node_with_props(&["Person"], [("name", Value::from("Django"))])
+                    .unwrap();
+            }
+            // Graphs created and dropped through the API, not by a query.
+            "api_graphs" => {
+                db.create_graph("empty").unwrap();
+                db.execute("CREATE GRAPH doomed").unwrap();
+                let session = db.session();
+                session.use_graph("doomed");
+                insert(&session, "Hans");
+                assert!(db.drop_graph("doomed").unwrap());
+                assert_eq!(db.list_graphs(), strings(&["empty"]));
+            }
+            // A transaction still open when the process exits, while another
+            // session commits.
+            "open_transaction" => {
+                let mut open_tx = db.session();
+                open_tx.begin_transaction().unwrap();
+                insert(&open_tx, "Vincent");
+                insert(&db.session(), "Gus");
+                // Still open when the process exits.
+                std::mem::forget(open_tx);
+            }
+            "seed_alix" => insert(&db.session(), "Alix"),
+            "insert_torn" => insert(&db.session(), "Torn"),
+            "insert_gus" => insert(&db.session(), "Gus"),
+            other => panic!("unknown scenario {other}"),
+        }
+    }
+
+    /// Child-process entry for [`crash_after`]; a no-op when run directly.
+    #[test]
+    fn crash_child() {
+        let Ok(scenario) = std::env::var(SCENARIO_VAR) else {
+            return;
+        };
+        let path = PathBuf::from(std::env::var_os(PATH_VAR).unwrap());
+        let mut config = config(&path);
+        #[cfg(feature = "triple-store")]
+        if scenario.starts_with("rdf_") {
+            config = config.with_graph_model(grafeo_engine::GraphModel::Rdf);
+        }
+        let db = GrafeoDB::with_config(config).unwrap();
+        run_scenario(&scenario, &db);
+        // Crash: no close(), no destructors.
+        std::process::exit(0);
+    }
+
+    // ------------------------------------------------------------------
+    // Tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rollback_does_not_discard_another_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("abort_between", &path);
+        assert_eq!(names(&open(&path)), strings(&["Alix", "Jules"]));
+    }
+
+    #[test]
+    fn commit_does_not_commit_another_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("commit_between", &path);
+        assert_eq!(names(&open(&path)), strings(&["Gus"]));
+    }
+
+    #[test]
+    fn rollback_to_savepoint_is_not_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("savepoint", &path);
+        assert_eq!(names(&open(&path)), strings(&["Alix", "Vincent"]));
+    }
+
+    #[test]
+    fn named_graph_writes_replay_into_their_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("named_graphs", &path);
+        let db = open(&path);
+        assert_eq!(
+            names(&db),
+            strings(&["Alix", "Gus", "Jules"]),
+            "default graph"
+        );
+        assert_eq!(names_in_graph(&db, "g"), strings(&["Mia"]), "graph g");
+    }
+
+    #[test]
+    fn direct_writes_outside_a_transaction_are_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("direct_writes", &path);
+        let db = open(&path);
+        assert_eq!(names(&db), strings(&["Django", "Jules"]), "default graph");
+        assert_eq!(names_in_graph(&db, "g"), strings(&["Hans"]), "graph g");
+    }
+
+    /// A direct write to a graph that does not exist fails and logs nothing:
+    /// replay must not create that graph, and only the later write to the
+    /// default graph comes back.
+    #[test]
+    fn direct_write_to_an_unknown_graph_leaves_no_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("direct_write_to_unknown_graph", &path);
+        let db = open(&path);
+        assert_eq!(names(&db), strings(&["Butch"]), "default graph");
+        assert_eq!(db.list_graphs(), Vec::<String>::new());
+    }
+
+    /// `create_graph` and `drop_graph` are logged like `CREATE GRAPH` and
+    /// `DROP GRAPH`: replay neither loses an empty graph created through the
+    /// API nor brings back one dropped through it (its writes switched to it).
+    #[test]
+    fn graphs_created_and_dropped_through_the_api_are_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("api_graphs", &path);
+        assert_eq!(open(&path).list_graphs(), strings(&["empty"]));
+    }
+
+    #[test]
+    fn schema_change_outside_a_transaction_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("ddl_only", &path);
+        assert_eq!(open(&path).list_graphs(), vec!["g".to_string()]);
+    }
+
+    /// Schema changes queue for the commit and a rollback undoes them (#727), so
+    /// the log holds none of them, and a reopen after a crash shows none.
+    #[test]
+    fn schema_changes_in_a_rolled_back_transaction_leave_nothing_in_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("ddl_in_rolled_back_tx", &path);
+        let db = open(&path);
+        assert!(db.list_graphs().is_empty(), "{:?}", db.list_graphs());
+        let types = db.session().execute("SHOW NODE TYPES").unwrap();
+        assert_eq!(types.row_count(), 0);
+    }
+
+    /// Rows of a query, each value rendered as text (`NULL` for null).
+    fn rows(db: &GrafeoDB, query: &str) -> Vec<Vec<String>> {
+        let result = db.session().execute(query).unwrap();
+        result
+            .rows()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| match value {
+                        Value::Null => "NULL".to_string(),
+                        Value::String(s) => s.to_string(),
+                        Value::List(items) => {
+                            let mut items: Vec<String> = items
+                                .iter()
+                                .map(|item| match item {
+                                    Value::String(s) => s.to_string(),
+                                    other => other.to_string(),
+                                })
+                                .collect();
+                            items.sort();
+                            items.join(",")
+                        }
+                        other => other.to_string(),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn row(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    /// #395: a database-level write followed by `wal_checkpoint()` survives a
+    /// crash without `close()`.
+    #[test]
+    fn database_level_write_survives_checkpoint_without_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("db_write_then_checkpoint", &path);
+        assert_eq!(
+            rows(&open(&path), "MATCH (d:Document) RETURN d.title"),
+            vec![row(&["test"])]
+        );
+    }
+
+    /// #395 at the path the reporter used, without the `.grafeo` extension:
+    /// a database-level write survives a crash without `close()`, after a
+    /// `wal_checkpoint()` and without one. The crash leaves the sidecar WAL.
+    #[test]
+    fn database_level_write_survives_a_crash_at_a_path_without_extension() {
+        for scenario in ["db_write_then_checkpoint", "db_write"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("single");
+            crash_after(scenario, &path);
+            assert!(
+                path.is_file() && wal_dir(&path).is_dir(),
+                "{scenario}: the crash left the file and its sidecar WAL"
+            );
+            assert_eq!(
+                rows(&open(&path), "MATCH (d:Document) RETURN d.title"),
+                vec![row(&["test"])],
+                "{scenario}"
+            );
+        }
+    }
+
+    /// Every database-level write call is durable when it returns.
+    #[test]
+    fn database_level_writes_are_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("db_crud", &path);
+        let db = open(&path);
+        assert_eq!(
+            rows(
+                &db,
+                "MATCH (n:Person) RETURN n.name, labels(n), n.age ORDER BY n.name"
+            ),
+            vec![
+                row(&["Alix", "Employee,Person", "NULL"]),
+                row(&["Gus", "Person", "NULL"]),
+            ],
+            "nodes"
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "MATCH (a)-[r]->(b)                      RETURN a.name, type(r), b.name, r.since, r.w, r.x ORDER BY type(r)"
+            ),
+            vec![
+                row(&["Alix", "KNOWS", "Gus", "2020", "NULL", "NULL"]),
+                row(&["Gus", "LIKES", "Alix", "NULL", "1", "NULL"]),
+            ],
+            "edges"
+        );
+        assert_eq!(
+            rows(&db, "MATCH (n:Vec) RETURN count(n)"),
+            vec![row(&["2"])],
+            "batch_create_nodes"
+        );
+        assert_eq!(
+            rows(&db, "MATCH (n:Doc) RETURN n.title ORDER BY n.title"),
+            vec![row(&["a"]), row(&["b"])],
+            "batch_create_nodes_with_props"
+        );
+    }
+
+    /// A database-level write is committed on its own, without an open
+    /// session transaction's writes.
+    #[test]
+    fn database_level_write_during_a_session_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("db_write_during_session_tx", &path);
+        assert_eq!(names(&open(&path)), strings(&["Django"]));
+    }
+
+    /// A transaction still open at `close()` is not committed: not by the
+    /// checkpoint `close()` writes, and not on replay when the process exits
+    /// with the transaction open.
+    #[test]
+    fn open_transaction_at_close_is_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("closed.grafeo");
+        {
+            let db = open(&path);
+            let mut open_tx = db.session();
+            open_tx.begin_transaction().unwrap();
+            insert(&open_tx, "Vincent");
+            insert(&db.session(), "Gus");
+            db.close().unwrap();
+        }
+        assert_eq!(names(&open(&path)), strings(&["Gus"]), "after close()");
+
+        let crashed = dir.path().join("crashed.grafeo");
+        crash_after("open_transaction", &crashed);
+        assert_eq!(
+            names(&open(&crashed)),
+            strings(&["Gus"]),
+            "after replay of the WAL"
+        );
+    }
+
+    /// A group a crash cut off before its last frame is cut at open, so the
+    /// next commit, written after it, cannot pick it up.
+    #[test]
+    fn torn_tail_is_not_committed_by_a_later_transaction() {
+        use grafeo_storage::file::v3::header::FileHeaderV3;
+        use grafeo_storage::wal::{SEGMENT_HEADER_BYTES, ScanOptions, WalScan, list_wal_directory};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        crash_after("seed_alix", &path);
+        crash_after("insert_torn", &path);
+        {
+            // Cut Torn's group in its middle, as a crash while it was
+            // written would: what follows it (a sync marker) goes too.
+            let page = std::fs::read(&path).unwrap();
+            let database_id = FileHeaderV3::decode(&page[..4096]).unwrap().database_id;
+            let (first_lsn, segment) = list_wal_directory(&wal_dir(&path))
+                .unwrap()
+                .segments
+                .pop()
+                .unwrap();
+            let mut scan =
+                WalScan::open(wal_dir(&path), ScanOptions::new(database_id, first_lsn)).unwrap();
+            let mut last = None;
+            while let Some(group) = scan.next_group().unwrap() {
+                last = Some((group.start_lsn(), group.end_lsn()));
+            }
+            let (start, end) = last.expect("Torn's group");
+            let cut = SEGMENT_HEADER_BYTES as u64 + (start - first_lsn) + (end - start) / 2;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&segment)
+                .unwrap();
+            file.set_len(cut).unwrap();
+        }
+        crash_after("insert_gus", &path);
+        assert_eq!(names(&open(&path)), strings(&["Alix", "Gus"]));
+    }
+
+    /// A log written by an older version can end inside a named graph. New
+    /// default-graph writes must not replay into that graph.
+    #[test]
+    fn default_graph_writes_after_a_log_ending_in_a_named_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        // The database file, checkpointed empty: the log below comes after it.
+        open(&path).close().unwrap();
+        {
+            let wal = WalManager::open(wal_dir(&path)).unwrap();
+            let records = [
+                WalRecord::CreateNamedGraph {
+                    name: "g".to_string(),
+                },
+                WalRecord::SwitchGraph {
+                    name: Some("g".to_string()),
+                },
+                WalRecord::CreateNode {
+                    id: NodeId::new(1),
+                    labels: vec!["Person".to_string()],
+                },
+                WalRecord::SetNodeProperty {
+                    id: NodeId::new(1),
+                    key: "name".to_string(),
+                    value: Value::from("Mia"),
+                },
+                WalRecord::TransactionCommit {
+                    transaction_id: TransactionId::new(2),
+                },
+            ];
+            for record in &records {
+                wal.log(record).unwrap();
+            }
+        }
+        crash_after("insert_gus", &path);
+
+        let db = open(&path);
+        assert_eq!(names(&db), strings(&["Gus"]));
+        assert_eq!(names_in_graph(&db, "g"), strings(&["Mia"]));
+    }
+
+    #[cfg(all(feature = "sparql", feature = "triple-store"))]
+    mod rdf {
+        use super::*;
+        use grafeo_engine::GraphModel;
+
+        fn open_rdf(path: &Path) -> GrafeoDB {
+            GrafeoDB::with_config(config(path).with_graph_model(GraphModel::Rdf)).unwrap()
+        }
+
+        fn subjects(db: &GrafeoDB) -> Vec<String> {
+            let result = db
+                .session()
+                .execute_sparql("SELECT ?s WHERE { ?s <http://ex.org/p> ?o } ORDER BY ?s")
+                .unwrap();
+            result
+                .rows()
+                .iter()
+                .map(|row| match &row[0] {
+                    Value::RdfTerm(term) => match term.as_ref() {
+                        grafeo_common::types::rdf::Term::Iri(iri) => iri.as_str().to_string(),
+                        other => format!("{other:?}"),
+                    },
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn sparql_rollback_does_not_discard_another_transaction() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = db_path(&dir);
+            crash_after("rdf_abort_between", &path);
+            let db = open_rdf(&path);
+            assert_eq!(subjects(&db), vec!["http://ex.org/alix".to_string()]);
+        }
+
+        #[test]
+        fn database_level_sparql_update_is_durable() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = db_path(&dir);
+            crash_after("rdf_db_level", &path);
+            assert_eq!(
+                subjects(&open_rdf(&path)),
+                vec!["http://ex.org/mia".to_string()]
+            );
+        }
+    }
+}

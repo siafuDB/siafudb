@@ -1,0 +1,254 @@
+[package]
+name = "grafeo-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Query engine and database management for Grafeo"
+autotests = false
+
+[dependencies]
+grafeo-common.workspace = true
+grafeo-core = { workspace = true, default-features = false }
+grafeo-adapters = { workspace = true, default-features = false }
+grafeo-storage = { workspace = true, default-features = false, optional = true }
+
+# Error handling
+thiserror.workspace = true
+
+# Data structures
+arcstr.workspace = true
+hashbrown.workspace = true
+indexmap.workspace = true
+
+# Concurrency
+parking_lot.workspace = true
+
+# Serialization
+serde.workspace = true
+bincode.workspace = true
+serde_json = { version = "1", optional = true }  # The backup manifest and cursor (feature `wal`)
+
+# Regex for SPARQL FILTER (use regex-lite for smaller WASM builds)
+regex = { workspace = true, optional = true }
+regex-lite = { workspace = true, optional = true }
+
+# Cryptographic hashes for SPARQL hash functions (optional, RDF only)
+md5 = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+# Async runtime (optional, for async-storage feature)
+tokio = { workspace = true, optional = true }
+
+# Tracing (optional, zero-cost when disabled)
+tracing = { workspace = true, optional = true }
+
+# Arrow (optional, for zero-copy data export)
+arrow-schema = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+
+# Embedding (optional, for ONNX embedding generation)
+ort = { version = "2.0.0-rc.14", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
+hf-hub = { version = "1.0", optional = true, features = ["blocking"] }
+crc32fast = { workspace = true, optional = true }
+
+# Refcounted byte slices for mmap-backed column storage (Phase 3c)
+bytes.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+serde_json = "1"
+tokio.workspace = true
+proptest.workspace = true
+
+[features]
+default = ["gql", "parallel", "wal", "grafeo-file", "spill", "mmap", "regex"]
+lpg = []  # Deprecated: the LPG store is always built, so this enables nothing. Removed in 0.7.0.
+regex = ["dep:regex", "grafeo-core/regex"]
+regex-lite = ["dep:regex-lite", "grafeo-core/regex-lite"]
+gql = ["grafeo-adapters/gql"]
+cypher = ["grafeo-adapters/cypher", "gql"]
+sparql = ["grafeo-adapters/sparql"]
+gremlin = ["grafeo-adapters/gremlin"]
+graphql = ["grafeo-adapters/graphql"]
+sql-pgq = ["grafeo-adapters/sql-pgq", "gql"]  # SQL/PGQ (SQL:2023 GRAPH_TABLE); its graph patterns are translated as GQL's
+triple-store = ["grafeo-core/triple-store", "grafeo-adapters/triple-store", "md5", "sha1", "sha2"]  # RDF triple store model and planner; needs a regex backend (regex or regex-lite) for SPARQL REGEX
+ring-index = ["grafeo-core/ring-index", "triple-store"]  # Ring Index for compact RDF (3x memory reduction)
+shacl = ["grafeo-core/shacl", "sparql"]  # SHACL validation (core constraints + SPARQL dispatch)
+rdf = ["triple-store"]  # Deprecated: use triple-store
+parallel = ["grafeo-core/parallel", "grafeo-adapters/parallel"]  # rayon in core and adapters: batch vector search, graph algorithms
+algos = ["grafeo-adapters/algos"]  # Graph algorithm plugin (SSSP, PageRank, etc.)
+wal = ["dep:grafeo-storage", "grafeo-storage/wal", "grafeo-file", "dep:serde_json"]  # Write-ahead log storage (the sidecar WAL of a `.grafeo` file); serde_json writes the backup manifest and cursor
+async-storage = ["dep:grafeo-storage", "grafeo-storage/async-storage", "dep:tokio"]  # Deprecated since 0.6.1: its async checkpoint, snapshot and spill types wrap sync ones (call them from tokio::task::spawn_blocking); removed in 0.7.0
+grafeo-file = ["dep:grafeo-storage", "grafeo-storage/grafeo-file", "dep:crc32fast"]  # Single-file .grafeo format
+encryption = ["dep:grafeo-storage", "grafeo-common/encryption", "grafeo-storage/encryption"]  # AES-256-GCM encryption at rest
+spill = ["grafeo-core/spill"]  # Disk spilling for out-of-core execution
+mmap = ["grafeo-core/mmap"]  # File-backed vector storage
+temporal = []  # Deprecated since 0.6.0: enables nothing (a database's history retention, Config::with_history_retention, replaces it); removed in 0.7.0
+compact-store = []  # Deprecated since 0.6.0: enables nothing (a build that opens files reads a compacted 0.5.x one); removed in 0.7.0
+# Convenience groups
+languages = ["gql", "cypher", "sparql", "gremlin", "graphql", "sql-pgq"]  # All query language parsers
+ai = ["vector-index", "text-index", "hybrid-search", "cdc"]  # All AI/RAG features
+storage = ["wal", "grafeo-file", "spill", "mmap"]  # Persistent storage (WAL, single-file, disk spill, mmap)
+
+# Named profiles (ecosystem-aligned)
+full = ["languages", "ai", "triple-store", "regex", "parallel", "algos", "storage", "jsonl-import", "parquet-import"]
+
+# Data import
+jsonl-import = ["grafeo-core/jsonl-import"]  # JSON Lines file import
+parquet-import = ["grafeo-core/parquet-import"]  # Apache Parquet file import
+
+# Search & AI features
+vector-index = ["grafeo-core/vector-index"]  # HNSW vector index for k-NN search
+text-index = ["grafeo-core/text-index"]  # BM25 inverted index for full-text search
+hybrid-search = ["grafeo-core/hybrid-search", "text-index", "vector-index"]  # Combined text + vector search
+cdc = []  # Change data capture with history API
+metrics = []  # Lock-free query, transaction, and session metrics
+embed = ["ort", "tokenizers", "hf-hub"]  # ONNX embedding generation (opt-in, adds ~17MB)
+tracing = ["dep:tracing", "grafeo-common/tracing", "grafeo-storage?/tracing"]  # Observability spans and events
+
+# Data export
+arrow-export = ["dep:arrow-schema", "dep:arrow-array", "dep:arrow-ipc"]  # Arrow IPC zero-copy export
+
+# Testing utilities (zero overhead when disabled)
+testing-crash-injection = ["dep:grafeo-storage", "grafeo-common/testing-crash-injection", "grafeo-storage/testing-crash-injection"]  # Crash injection for recovery testing
+testing-statement-injection = ["grafeo-common/testing-statement-injection"]  # Failure injection at statement / commit entry for rollback atomicity tests, and a hook inside commit
+testing-warning-probe = ["grafeo-common/testing-warning-probe"]  # `Session::set_warning_probe`, which raises the 01Z99 notice at translation or at run time for the warning channel's tests
+testing-deadline-probe = ["grafeo-core/testing-deadline-probe", "grafeo-adapters/testing-deadline-probe"]  # Test only: a deadline that passes after N clock reads in procedures and paths
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "query_bench"
+harness = false
+
+[[bench]]
+name = "serialization_bench"
+harness = false
+
+[[bench]]
+name = "regression_bench"
+harness = false
+
+[[bench]]
+name = "memory_bench"
+harness = false
+
+[[bench]]
+name = "topk_e2e"
+harness = false
+
+[[bench]]
+name = "algorithms_bench"
+harness = false
+required-features = ["algos", "gql", "vector-index"]
+
+[[bench]]
+name = "write_path_bench"
+harness = false
+required-features = ["cypher", "wal"]
+
+# One integration test binary (tests/main.rs declares each test file as a module).
+[[test]]
+name = "main"
+path = "tests/main.rs"
+
+# CI runs it with only `gql,grafeo-file`, where `main` does not build.
+[[test]]
+name = "compacted_file_in_every_build"
+path = "tests/compacted_file_in_every_build.rs"
+
+# CI runs it with only `gql,wal,grafeo-file,encryption`, where `main` does not build.
+[[test]]
+name = "encryption_at_rest"
+path = "tests/encryption_at_rest.rs"
+
+# CI runs it with only `gql,wal,grafeo-file,encryption`, where `main` does not build.
+[[test]]
+name = "epochs_across_reopen"
+path = "tests/epochs_across_reopen.rs"
+
+# CI runs it with only `gql,grafeo-file`, where `main` does not build.
+[[test]]
+name = "functions_without_their_features"
+path = "tests/functions_without_their_features.rs"
+
+# CI runs it with encryption and crash injection on top of the shipped features; only these three need that build.
+[[test]]
+name = "legacy_spill"
+path = "tests/legacy_spill.rs"
+
+# Installs a global tracing subscriber, and CI runs it with encryption and crash injection on top of the shipped features.
+[[test]]
+name = "migration"
+path = "tests/migration.rs"
+
+# CI runs it with only `gql,grafeo-file`, where `main` does not build.
+[[test]]
+name = "migration_without_wal"
+path = "tests/migration_without_wal.rs"
+
+# Counts allocations with its own global allocator.
+[[test]]
+name = "path_search_budget"
+path = "tests/path_search_budget.rs"
+
+# Counts allocations with its own global allocator.
+[[test]]
+name = "typed_read_allocations"
+path = "tests/typed_read_allocations.rs"
+
+# Installs the global tracing subscriber. CI also runs it with only these features, where a crate
+# whose tracing feature the engine does not turn on loses its events (all features would hide it).
+[[test]]
+name = "storage_events"
+path = "tests/storage_events.rs"
+required-features = ["gql", "wal", "grafeo-file", "tracing", "testing-crash-injection"]
+
+# Counts allocated bytes with its own global allocator.
+[[test]]
+name = "turn_sample_allocations"
+path = "tests/turn_sample_allocations.rs"
+required-features = ["gql", "grafeo-file"]
+
+# Counts allocations with its own global allocator.
+[[test]]
+name = "peak_memory"
+path = "tests/peak_memory.rs"
+
+# CI runs it without `triple-store` (`gql,grafeo-file`), where `main` does not build.
+[[test]]
+name = "rdf_file_without_triple_store"
+path = "tests/rdf_file_without_triple_store.rs"
+
+# CI runs it with the `rdf` profile's engine features, where `main` does not build.
+[[test]]
+name = "rdf_persistence"
+path = "tests/rdf_persistence.rs"
+
+# CI runs it with only `gql,grafeo-file`, where `main` does not build.
+[[test]]
+name = "search_indexes_without_their_features"
+path = "tests/search_indexes_without_their_features.rs"
+
+# CI runs it with only `gql,grafeo-file`, where `main` does not build.
+[[test]]
+name = "snapshot_without_its_features"
+path = "tests/snapshot_without_its_features.rs"
+
+# CI runs it with encryption and crash injection on top of the shipped features; only these three need that build.
+[[test]]
+name = "spilled_embeddings"
+path = "tests/spilled_embeddings.rs"
+
+# CI runs it with only `gql,grafeo-file`, where `main` does not build.
+[[test]]
+name = "writes_after_close"
+path = "tests/writes_after_close.rs"

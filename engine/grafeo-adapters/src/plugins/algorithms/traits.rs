@@ -1,0 +1,1012 @@
+//! Core traits and types for graph algorithms.
+//!
+//! This module provides the fundamental building blocks for implementing
+//! high-performance graph algorithms, inspired by rustworkx patterns.
+
+use grafeo_common::types::{EdgeId, NodeId, PropertyKey, ReadView, Value};
+use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
+use grafeo_core::graph::lpg::{Edge, Node};
+use grafeo_core::graph::{Direction, GraphStore};
+use parking_lot::Mutex;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+use super::super::{AlgorithmResult, Domain, ParameterDef, Parameters, Prepared, prepare};
+
+/// The check of the running query's deadline an algorithm makes in its work loops: a
+/// [`deadline::Ticker`](grafeo_core::execution::deadline::Ticker), whose timeout is the query
+/// timeout error, so a procedure past its deadline fails as any statement does. One serves a
+/// whole run; a helper called once per pass of a loop takes the run's by reference.
+#[derive(Debug, Clone, Default)]
+pub struct Ticker(grafeo_core::execution::deadline::Ticker);
+
+impl Ticker {
+    /// A ticker of this thread's deadline, the running query's.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(grafeo_core::execution::deadline::Ticker::new())
+    }
+
+    /// A worker thread's ticker of the deadline its caller handed over (see
+    /// [`deadline::handoff`](grafeo_core::execution::deadline::handoff)).
+    #[cfg(feature = "parallel")]
+    #[must_use]
+    pub fn with_handoff(handoff: grafeo_core::execution::deadline::Handoff) -> Self {
+        Self(grafeo_core::execution::deadline::Ticker::with_handoff(
+            handoff,
+        ))
+    }
+
+    /// Counts a unit of work, reading the clock on the first and every 1,024th.
+    ///
+    /// # Errors
+    ///
+    /// The query timeout once the deadline has passed.
+    #[inline]
+    pub fn tick(&mut self) -> Result<()> {
+        self.0
+            .tick()
+            .map_err(|_| Error::from(QueryError::timeout()))
+    }
+}
+
+/// The error of edge `id`'s `property`, holding `value`: a value that is no number (an invalid
+/// value type, 22G12), or with `outside` a number outside the weight's domain (an invalid
+/// parameter value, 22023).
+#[cold]
+#[inline(never)]
+fn weight_refused(
+    id: EdgeId,
+    property: &str,
+    weight: EdgeWeight,
+    value: &Value,
+    outside: bool,
+) -> Error {
+    if outside {
+        return Error::from(QueryError::new(
+            QueryErrorKind::InvalidParameterValue,
+            format!(
+                "the {} '{property}' of edge {} is {value}, where it must be {}",
+                weight.what,
+                id.as_u64(),
+                weight.domain.describe(None)
+            ),
+        ));
+    }
+    Error::from(QueryError::new(
+        QueryErrorKind::WrongKind,
+        format!(
+            "the {} '{property}' of edge {} is a {} ({value}), not a number",
+            weight.what,
+            id.as_u64(),
+            value.type_name()
+        ),
+    ))
+}
+
+/// An edge property an algorithm reads as a number: what it is to the algorithm, the value of an
+/// edge without it, and the values it allows (see [`GraphView::edge_weight`]). Each weighted
+/// algorithm declares its own, next to its parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeWeight {
+    /// What the algorithm reads it as (`weight`, `capacity`, `cost`), for an error.
+    pub what: &'static str,
+    /// The value of an edge without the property, as released.
+    pub default: f64,
+    /// The values it allows; finite in every domain.
+    pub domain: Domain,
+}
+
+/// The graph an algorithm reads: a store at one view.
+///
+/// Every algorithm reads through it, so the graph it walks has the nodes of
+/// [`node_ids`](Self::node_ids) and only edges between them, all as one view
+/// sees them, however long it runs: a commit during the run changes nothing
+/// it reads. The view is the caller's, pinned for the run.
+///
+/// The reads answer like the store's; the first one that fails is recorded
+/// and the read answers as if nothing was found, and the public algorithm
+/// functions return that error instead of their answer
+/// ([`finish`](Self::finish)), so an algorithm never answers from a graph it
+/// could not read.
+pub struct GraphView<'a> {
+    store: &'a dyn GraphStore,
+    view: ReadView,
+    /// Whether a read failed: one load per read on the path without one.
+    failed: AtomicBool,
+    error: Mutex<Option<Error>>,
+}
+
+impl<'a> GraphView<'a> {
+    /// The graph of `store` as `view` sees it.
+    #[must_use]
+    pub fn new(store: &'a dyn GraphStore, view: ReadView) -> Self {
+        Self {
+            store,
+            view,
+            failed: AtomicBool::new(false),
+            error: Mutex::new(None),
+        }
+    }
+
+    /// The store read.
+    #[must_use]
+    pub fn store(&self) -> &'a dyn GraphStore {
+        self.store
+    }
+
+    /// The view the reads answer at.
+    #[must_use]
+    pub fn view(&self) -> ReadView {
+        self.view
+    }
+
+    /// The answer of a read, or `otherwise` after recording its error.
+    fn read<T>(&self, read: Result<T>, otherwise: T) -> T {
+        match read {
+            Ok(found) => found,
+            Err(error) => {
+                let mut slot = self.error.lock();
+                if slot.is_none() {
+                    *slot = Some(error);
+                    self.failed.store(true, AtomicOrdering::Release);
+                }
+                otherwise
+            }
+        }
+    }
+
+    /// `value`, the answer of the reads, or the error of the first read that
+    /// failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the first read that failed.
+    pub fn finish<T>(self, value: T) -> Result<T> {
+        if self.failed.load(AtomicOrdering::Acquire)
+            && let Some(error) = self.error.into_inner()
+        {
+            return Err(error);
+        }
+        Ok(value)
+    }
+
+    /// The nodes the view sees, by ascending id.
+    #[must_use]
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        self.read(self.store.node_ids(self.view), Vec::new())
+    }
+
+    /// Node `id` as the view sees it.
+    #[must_use]
+    pub fn node(&self, id: NodeId) -> Option<Node> {
+        self.read(self.store.node(id, self.view), None)
+    }
+
+    /// Edge `id` as the view sees it.
+    #[must_use]
+    pub fn edge(&self, id: EdgeId) -> Option<Edge> {
+        self.read(self.store.edge(id, self.view), None)
+    }
+
+    /// The value of property `key` of edge `id` as the view sees it: the one value, read
+    /// without the rest of the edge.
+    #[must_use]
+    pub fn edge_property(&self, id: EdgeId, key: &str) -> Option<Value> {
+        self.read(self.store.edge_property(id, key, self.view), None)
+    }
+
+    /// The number in the property `property` of edge `id` as a float (an
+    /// integer, a float or a decimal), the weight, capacity or cost an
+    /// algorithm reads as `weight` says; its default without a property name,
+    /// or when the edge has no such property.
+    ///
+    /// # Errors
+    ///
+    /// Naming the edge and the property: an invalid value type (22G12) for a
+    /// value that is no number, and an invalid parameter value (22023) for one
+    /// outside the weight's domain.
+    // Inlined into each algorithm's loop over edges, as the read it replaced was (measured: about
+    // 130 instructions an edge out of line); the errors are built apart, in `weight_refused`.
+    #[inline]
+    pub fn edge_weight(
+        &self,
+        id: EdgeId,
+        property: Option<&str>,
+        weight: EdgeWeight,
+    ) -> Result<f64> {
+        let Some(name) = property else {
+            return Ok(weight.default);
+        };
+        // One value read, not the whole edge: a weight is read once per edge an algorithm walks.
+        // The errors are built apart (`weight_refused`).
+        let Some(value) = self.edge_property(id, name) else {
+            return Ok(weight.default);
+        };
+        let number = match &value {
+            Value::Null => return Ok(weight.default),
+            Value::Int64(i) => *i as f64,
+            Value::Float64(f) => *f,
+            Value::Decimal(d) => d.to_f64(),
+            other => return Err(weight_refused(id, name, weight, other, false)),
+        };
+        if weight.domain.admits(number) {
+            return Ok(number);
+        }
+        Err(weight_refused(id, name, weight, &value, true))
+    }
+
+    /// The edges from `node` in `direction` the view sees, each with the
+    /// node at its other end, which the view sees too (see
+    /// [`GraphStore::edges`]).
+    #[must_use]
+    pub fn edges(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
+        self.read(
+            self.store.edges(node, direction, &[], self.view),
+            Vec::new(),
+        )
+    }
+
+    /// The nodes the view sees whose `property` equals `value`.
+    #[must_use]
+    pub fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
+        self.read(
+            self.store
+                .find_nodes_by_property(property, value, self.view),
+            Vec::new(),
+        )
+    }
+
+    /// The value of `key` of each node of `ids` as the view sees it: a
+    /// read the caller handles itself (the key of an algorithm's `key=`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a read the store cannot do.
+    pub fn node_property_batch(
+        &self,
+        ids: &[NodeId],
+        key: &PropertyKey,
+    ) -> Result<Vec<Option<Value>>> {
+        self.store.node_property_batch(ids, key, self.view)
+    }
+}
+
+/// `n` as an INT64 output value (a node id, a count or a position). A value past `i64::MAX` is an
+/// error, never a wrapped negative number.
+pub(crate) fn int_value<T>(n: T) -> Result<Value>
+where
+    i64: TryFrom<T>,
+{
+    i64::try_from(n)
+        .map(Value::Int64)
+        .map_err(|_| Error::Internal("an algorithm result does not fit an INT64".into()))
+}
+
+/// Safely converts a user-supplied `i64` parameter into a [`NodeId`].
+///
+/// Returns an error if the value is negative, since node IDs are unsigned.
+pub fn node_id_from_param(value: i64, param_name: &str) -> Result<NodeId> {
+    u64::try_from(value)
+        .map(NodeId::new)
+        .map_err(|_| Error::InvalidValue(format!("{param_name} must be non-negative, got {value}")))
+}
+
+// ============================================================================
+// Control Flow
+// ============================================================================
+
+/// Control flow for algorithm visitors.
+///
+/// Returned by visitor callbacks to control traversal behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control<B = ()> {
+    /// Continue the algorithm normally.
+    Continue,
+    /// Stop the algorithm and return the break value.
+    Break(B),
+    /// Skip the current subtree (for traversals) but continue the algorithm.
+    Prune,
+}
+
+impl<B> Control<B> {
+    /// Returns `true` if this is `Continue`.
+    #[inline]
+    pub fn is_continue(&self) -> bool {
+        matches!(self, Control::Continue)
+    }
+
+    /// Returns `true` if this is `Break`.
+    #[inline]
+    pub fn is_break(&self) -> bool {
+        matches!(self, Control::Break(_))
+    }
+
+    /// Returns `true` if this is `Prune`.
+    #[inline]
+    pub fn is_prune(&self) -> bool {
+        matches!(self, Control::Prune)
+    }
+
+    /// Converts to an option containing the break value.
+    pub fn break_value(self) -> Option<B> {
+        match self {
+            Control::Break(b) => Some(b),
+            _ => None,
+        }
+    }
+}
+
+impl<B> Default for Control<B> {
+    fn default() -> Self {
+        Control::Continue
+    }
+}
+
+// ============================================================================
+// Traversal Events
+// ============================================================================
+
+/// Events emitted during graph traversal (BFS/DFS).
+///
+/// These events follow the visitor pattern, allowing algorithms to
+/// react to different stages of the traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalEvent {
+    /// A node is discovered for the first time.
+    Discover(NodeId),
+
+    /// A tree edge is traversed (edge to an undiscovered node).
+    TreeEdge {
+        /// The source node of the edge.
+        source: NodeId,
+        /// The target node of the edge.
+        target: NodeId,
+        /// The edge ID.
+        edge: EdgeId,
+    },
+
+    /// A non-tree edge is traversed (edge to an already-discovered node).
+    /// In BFS, this is a cross edge. In DFS, this could be a back edge or cross edge.
+    NonTreeEdge {
+        /// The source node of the edge.
+        source: NodeId,
+        /// The target node of the edge.
+        target: NodeId,
+        /// The edge ID.
+        edge: EdgeId,
+    },
+
+    /// A back edge is traversed (DFS only - edge to an ancestor).
+    BackEdge {
+        /// The source node of the edge.
+        source: NodeId,
+        /// The target node of the edge.
+        target: NodeId,
+        /// The edge ID.
+        edge: EdgeId,
+    },
+
+    /// Processing of a node is complete.
+    Finish(NodeId),
+}
+
+impl TraversalEvent {
+    /// Returns the source node of this event, if applicable.
+    pub fn source(&self) -> Option<NodeId> {
+        match self {
+            TraversalEvent::Discover(n) | TraversalEvent::Finish(n) => Some(*n),
+            TraversalEvent::TreeEdge { source, .. }
+            | TraversalEvent::NonTreeEdge { source, .. }
+            | TraversalEvent::BackEdge { source, .. } => Some(*source),
+        }
+    }
+
+    /// Returns the target node of this event, if applicable.
+    pub fn target(&self) -> Option<NodeId> {
+        match self {
+            TraversalEvent::Discover(n) | TraversalEvent::Finish(n) => Some(*n),
+            TraversalEvent::TreeEdge { target, .. }
+            | TraversalEvent::NonTreeEdge { target, .. }
+            | TraversalEvent::BackEdge { target, .. } => Some(*target),
+        }
+    }
+}
+
+// ============================================================================
+// Priority Queue Support
+// ============================================================================
+
+/// The order of two scores in a heap or a sort: a total order, as both need one (`partial_cmp`
+/// with NaN taken as equal is not, and a sort may then panic), at the cost of one float
+/// comparison where neither is NaN, the case of every weight an algorithm reads. It is
+/// [`f64::total_cmp`] with `-0.0` and `0.0` taken as equal, the two being next to each other in
+/// that order, so it stays total.
+#[inline]
+#[must_use]
+pub fn score_order(a: f64, b: f64) -> Ordering {
+    a.partial_cmp(&b).unwrap_or_else(|| a.total_cmp(&b))
+}
+
+/// Wrapper for priority queue ordering (min-heap behavior).
+///
+/// Rust's `BinaryHeap` is a max-heap, so we reverse the ordering
+/// to get min-heap behavior for Dijkstra and A*.
+#[derive(Clone, Copy, Debug)]
+pub struct MinScored<T>(pub f64, pub T);
+
+impl<T> MinScored<T> {
+    /// Creates a new `MinScored` with the given score and value.
+    pub fn new(score: f64, value: T) -> Self {
+        MinScored(score, value)
+    }
+
+    /// Returns the score.
+    pub fn score(&self) -> &f64 {
+        &self.0
+    }
+
+    /// Returns the value.
+    pub fn value(&self) -> &T {
+        &self.1
+    }
+
+    /// Consumes self and returns the value.
+    pub fn into_value(self) -> T {
+        self.1
+    }
+}
+
+impl<T> PartialEq for MinScored<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl<T> Eq for MinScored<T> {}
+
+impl<T> Ord for MinScored<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reversed for a min-heap.
+        score_order(other.0, self.0)
+    }
+}
+
+impl<T> PartialOrd for MinScored<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// ============================================================================
+// Graph Algorithm Traits
+// ============================================================================
+
+/// A graph algorithm that can be executed on any graph store.
+///
+/// This trait extends the base `Algorithm` trait with graph-specific
+/// functionality, providing direct access to the graph store.
+pub trait GraphAlgorithm: Send + Sync {
+    /// Returns the name of the algorithm.
+    fn name(&self) -> &str;
+
+    /// Returns a description of the algorithm.
+    fn description(&self) -> &str;
+
+    /// Returns the parameter definitions for this algorithm.
+    fn parameters(&self) -> &[ParameterDef];
+
+    /// Runs the algorithm on the given graph store with the arguments `params`, prepared first
+    /// (see [`prepare`]): a required argument without a value, or one outside its domain, is
+    /// refused before any work, and an optional one left out takes its declared default.
+    ///
+    /// Implement [`compute`](Self::compute), never this: an override would skip the check.
+    ///
+    /// # Errors
+    ///
+    /// The invalid parameter value of [`prepare`], and the errors of
+    /// [`compute`](Self::compute).
+    fn execute(
+        &self,
+        store: &dyn GraphStore,
+        view: ReadView,
+        params: &Parameters,
+    ) -> Result<AlgorithmResult> {
+        let prepared = prepare(self.name(), self.parameters(), params)?;
+        self.compute(store, view, &prepared)
+    }
+
+    /// The algorithm's work on the given graph store, with arguments [`prepare`] checked and
+    /// completed: a required one has a value, and an optional one that declares a default has it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the algorithm fails (for example, on the graph's state).
+    fn compute(
+        &self,
+        store: &dyn GraphStore,
+        view: ReadView,
+        params: &Prepared,
+    ) -> Result<AlgorithmResult>;
+}
+
+impl Parameters {
+    /// These arguments prepared for `algorithm` (see [`prepare`]), for a caller that runs its
+    /// work some other way than [`GraphAlgorithm::execute`] (the bindings' algorithm methods,
+    /// which run its functions on a projection).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`prepare`].
+    pub fn resolved(self, algorithm: &dyn GraphAlgorithm) -> Result<Prepared> {
+        self.prepared(algorithm.name(), algorithm.parameters())
+    }
+}
+
+/// A graph algorithm that supports parallel execution.
+///
+/// Algorithms implementing this trait can automatically switch between
+/// sequential and parallel execution based on graph size.
+pub trait ParallelGraphAlgorithm: GraphAlgorithm {
+    /// Minimum node count to trigger parallelization.
+    ///
+    /// Below this threshold, sequential execution is used to avoid
+    /// parallelization overhead.
+    fn parallel_threshold(&self) -> usize {
+        50
+    }
+
+    /// Runs the algorithm with explicit parallelism control, with the arguments `params`
+    /// prepared first, as [`GraphAlgorithm::execute`] prepares them.
+    ///
+    /// Implement [`compute_parallel`](Self::compute_parallel), never this: an override would
+    /// skip the check.
+    ///
+    /// # Errors
+    ///
+    /// The invalid parameter value of [`prepare`], and the errors of
+    /// [`compute_parallel`](Self::compute_parallel).
+    fn execute_parallel(
+        &self,
+        store: &dyn GraphStore,
+        view: ReadView,
+        params: &Parameters,
+        num_threads: usize,
+    ) -> Result<AlgorithmResult> {
+        let prepared = prepare(self.name(), self.parameters(), params)?;
+        self.compute_parallel(store, view, &prepared, num_threads)
+    }
+
+    /// The algorithm's work with explicit parallelism control, with arguments [`prepare`]
+    /// checked and completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the algorithm fails (for example, on the graph's state).
+    fn compute_parallel(
+        &self,
+        store: &dyn GraphStore,
+        view: ReadView,
+        params: &Prepared,
+        num_threads: usize,
+    ) -> Result<AlgorithmResult>;
+}
+
+// ============================================================================
+// Distance Map
+// ============================================================================
+
+/// A map from nodes to distances/costs.
+///
+/// This trait abstracts over different distance map implementations,
+/// allowing algorithms to work with various storage strategies.
+pub trait DistanceMap<K> {
+    /// Gets the distance to a node, if known.
+    fn get(&self, node: NodeId) -> Option<&K>;
+
+    /// Sets the distance to a node.
+    fn insert(&mut self, node: NodeId, dist: K);
+
+    /// Returns `true` if the node has a recorded distance.
+    fn contains(&self, node: NodeId) -> bool {
+        self.get(node).is_some()
+    }
+}
+
+impl<V> DistanceMap<V> for HashMap<NodeId, V> {
+    fn get(&self, node: NodeId) -> Option<&V> {
+        HashMap::get(self, &node)
+    }
+
+    fn insert(&mut self, node: NodeId, dist: V) {
+        HashMap::insert(self, node, dist);
+    }
+}
+
+// ============================================================================
+// impl_algorithm! Macro
+// ============================================================================
+
+/// Generates a `GraphAlgorithm` trait implementation with the standard boilerplate.
+///
+/// # Syntax
+///
+/// ```ignore
+/// impl_algorithm! {
+///     StructName,
+///     name: "algorithm_name",
+///     description: "What the algorithm does",
+///     params: params_fn,            // fn() -> &'static [ParameterDef]
+///     compute(store, params) { ... } // body that returns Result<AlgorithmResult>,
+///                                    // `store` the `GraphView` it reads, `params`
+///                                    // the prepared arguments
+/// }
+/// ```
+///
+/// For algorithms with no parameters, use `params: &[]` instead of a function name.
+/// If the compute body does not use `params`, prefix it with `_` to silence warnings:
+///
+/// ```ignore
+/// impl_algorithm! {
+///     StructName,
+///     name: "algorithm_name",
+///     description: "What the algorithm does",
+///     params: &[],
+///     compute(store, _params) { ... }
+/// }
+/// ```
+macro_rules! impl_algorithm {
+    (
+        $struct_name:ty,
+        name: $name:expr,
+        description: $desc:expr,
+        params: &[],
+        compute($store:ident, $params:ident) $body:block
+    ) => {
+        impl $crate::plugins::algorithms::GraphAlgorithm for $struct_name {
+            fn name(&self) -> &str {
+                $name
+            }
+
+            fn description(&self) -> &str {
+                $desc
+            }
+
+            fn parameters(&self) -> &[super::super::ParameterDef] {
+                &[]
+            }
+
+            fn compute(
+                &self,
+                store: &dyn grafeo_core::graph::GraphStore,
+                view: grafeo_common::types::ReadView,
+                $params: &super::super::Prepared,
+            ) -> grafeo_common::utils::error::Result<super::super::AlgorithmResult> {
+                let graph = $crate::plugins::algorithms::GraphView::new(store, view);
+                let $store = &graph;
+                let found = $crate::plugins::algorithms::traits::evaluated(|| $body);
+                graph.finish(found)?
+            }
+        }
+    };
+    (
+        $struct_name:ty,
+        name: $name:expr,
+        description: $desc:expr,
+        params: $params_fn:expr,
+        compute($store:ident, $params:ident) $body:block
+    ) => {
+        impl $crate::plugins::algorithms::GraphAlgorithm for $struct_name {
+            fn name(&self) -> &str {
+                $name
+            }
+
+            fn description(&self) -> &str {
+                $desc
+            }
+
+            fn parameters(&self) -> &[super::super::ParameterDef] {
+                $params_fn()
+            }
+
+            fn compute(
+                &self,
+                store: &dyn grafeo_core::graph::GraphStore,
+                view: grafeo_common::types::ReadView,
+                $params: &super::super::Prepared,
+            ) -> grafeo_common::utils::error::Result<super::super::AlgorithmResult> {
+                let graph = $crate::plugins::algorithms::GraphView::new(store, view);
+                let $store = &graph;
+                let found = $crate::plugins::algorithms::traits::evaluated(|| $body);
+                graph.finish(found)?
+            }
+        }
+    };
+}
+
+pub(crate) use impl_algorithm;
+
+/// The result of an algorithm's `body`, which may return early: the
+/// compute bodies of [`impl_algorithm!`] and the hand-written ones run in a
+/// closure so a `return` leaves the body, not `compute`, and the
+/// [`GraphView`]'s read error is still checked after it.
+pub(crate) fn evaluated<T>(body: impl FnOnce() -> T) -> T {
+    body()
+}
+
+// ============================================================================
+// Result Builders
+// ============================================================================
+
+/// Helper for building algorithm results with node ID and value columns.
+pub struct NodeValueResultBuilder {
+    node_ids: Vec<u64>,
+    values: Vec<Value>,
+    value_column_name: String,
+}
+
+impl NodeValueResultBuilder {
+    /// Creates a new builder with pre-allocated capacity.
+    pub fn with_capacity(value_column_name: impl Into<String>, capacity: usize) -> Self {
+        Self {
+            node_ids: Vec::with_capacity(capacity),
+            values: Vec::with_capacity(capacity),
+            value_column_name: value_column_name.into(),
+        }
+    }
+
+    /// Adds a node ID and value pair.
+    pub fn push(&mut self, node: NodeId, value: impl Into<Value>) {
+        self.node_ids.push(node.0);
+        self.values.push(value.into());
+    }
+
+    /// Builds the algorithm result.
+    pub fn build(self) -> AlgorithmResult {
+        let mut result = AlgorithmResult::new(vec!["node_id".to_string(), self.value_column_name]);
+        for (node_id, value) in self.node_ids.into_iter().zip(self.values) {
+            // reason: node IDs are sequential counters, well within i64::MAX
+            #[allow(clippy::cast_possible_wrap)]
+            result.add_row(vec![Value::Int64(node_id as i64), value]);
+        }
+        result
+    }
+}
+
+/// Helper for building algorithm results with component information.
+pub struct ComponentResultBuilder {
+    node_ids: Vec<u64>,
+    component_ids: Vec<u64>,
+}
+
+impl ComponentResultBuilder {
+    /// Creates a new builder.
+    pub fn new() -> Self {
+        Self {
+            node_ids: Vec::new(),
+            component_ids: Vec::new(),
+        }
+    }
+
+    /// Creates a new builder with pre-allocated capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            node_ids: Vec::with_capacity(capacity),
+            component_ids: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Adds a node ID and component ID pair.
+    pub fn push(&mut self, node: NodeId, component: u64) {
+        self.node_ids.push(node.0);
+        self.component_ids.push(component);
+    }
+
+    /// Builds the algorithm result.
+    pub fn build(self) -> AlgorithmResult {
+        let mut result =
+            AlgorithmResult::new(vec!["node_id".to_string(), "component_id".to_string()]);
+        for (node_id, component_id) in self.node_ids.into_iter().zip(self.component_ids) {
+            // reason: node/component IDs are sequential counters, well within i64::MAX
+            #[allow(clippy::cast_possible_wrap)]
+            result.add_row(vec![
+                Value::Int64(node_id as i64),
+                Value::Int64(component_id as i64),
+            ]);
+        }
+        result
+    }
+}
+
+impl Default for ComponentResultBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use grafeo_common::types::{EdgeId, NodeId};
+
+    use super::*;
+
+    // ---- Control ----
+
+    #[test]
+    fn control_is_continue() {
+        assert!(Control::<()>::Continue.is_continue());
+        assert!(!Control::<()>::Prune.is_continue());
+        assert!(!Control::Break(42).is_continue());
+    }
+
+    #[test]
+    fn control_is_break() {
+        assert!(Control::Break("stop").is_break());
+        assert!(!Control::<()>::Continue.is_break());
+        assert!(!Control::<()>::Prune.is_break());
+    }
+
+    #[test]
+    fn control_is_prune() {
+        assert!(Control::<()>::Prune.is_prune());
+        assert!(!Control::<()>::Continue.is_prune());
+        assert!(!Control::Break(0u8).is_prune());
+    }
+
+    #[test]
+    fn control_break_value() {
+        assert_eq!(Control::Break(99u32).break_value(), Some(99u32));
+        assert_eq!(Control::<u32>::Continue.break_value(), None);
+        assert_eq!(Control::<u32>::Prune.break_value(), None);
+    }
+
+    #[test]
+    fn control_default_is_continue() {
+        let c: Control<()> = Default::default();
+        assert!(c.is_continue());
+    }
+
+    // ---- TraversalEvent ----
+
+    #[test]
+    fn traversal_event_discover_source_and_target() {
+        let n = NodeId(7);
+        let ev = TraversalEvent::Discover(n);
+        assert_eq!(ev.source(), Some(n));
+        assert_eq!(ev.target(), Some(n));
+    }
+
+    #[test]
+    fn traversal_event_finish_source_and_target() {
+        let n = NodeId(3);
+        let ev = TraversalEvent::Finish(n);
+        assert_eq!(ev.source(), Some(n));
+        assert_eq!(ev.target(), Some(n));
+    }
+
+    #[test]
+    fn traversal_event_tree_edge() {
+        let src = NodeId(1);
+        let dst = NodeId(2);
+        let edge = EdgeId(10);
+        let ev = TraversalEvent::TreeEdge {
+            source: src,
+            target: dst,
+            edge,
+        };
+        assert_eq!(ev.source(), Some(src));
+        assert_eq!(ev.target(), Some(dst));
+    }
+
+    #[test]
+    fn traversal_event_non_tree_edge() {
+        let src = NodeId(1);
+        let dst = NodeId(3);
+        let edge = EdgeId(20);
+        let ev = TraversalEvent::NonTreeEdge {
+            source: src,
+            target: dst,
+            edge,
+        };
+        assert_eq!(ev.source(), Some(src));
+        assert_eq!(ev.target(), Some(dst));
+    }
+
+    #[test]
+    fn traversal_event_back_edge() {
+        let src = NodeId(5);
+        let dst = NodeId(1);
+        let edge = EdgeId(30);
+        let ev = TraversalEvent::BackEdge {
+            source: src,
+            target: dst,
+            edge,
+        };
+        assert_eq!(ev.source(), Some(src));
+        assert_eq!(ev.target(), Some(dst));
+    }
+
+    // ---- MinScored ----
+
+    #[test]
+    fn min_scored_ordering_is_reversed() {
+        // Lower score = higher priority in BinaryHeap (min-heap)
+        let a = MinScored::new(1.0f64, "a");
+        let b = MinScored::new(5.0f64, "b");
+        assert!(a > b, "lower score should sort as Greater for min-heap");
+    }
+
+    #[test]
+    fn min_scored_equal_scores() {
+        let a = MinScored::new(3.0f64, "x");
+        let b = MinScored::new(3.0f64, "y");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn min_scored_accessors() {
+        let ms = MinScored::new(42.0f64, NodeId(7));
+        assert_eq!(*ms.score(), 42.0);
+        assert_eq!(*ms.value(), NodeId(7));
+        assert_eq!(ms.into_value(), NodeId(7));
+    }
+
+    // ---- DistanceMap ----
+
+    #[test]
+    fn distance_map_contains_via_default_impl() {
+        let mut map: std::collections::HashMap<NodeId, f64> = std::collections::HashMap::new();
+        let n = NodeId(1);
+        assert!(!map.contains(n));
+        map.insert(n, 1.5);
+        assert!(map.contains(n));
+    }
+
+    // ---- NodeValueResultBuilder ----
+
+    #[test]
+    fn node_value_result_builder_basic() {
+        let mut b = NodeValueResultBuilder::with_capacity("score", 2);
+        b.push(NodeId(1), Value::Float64(0.9));
+        b.push(NodeId(2), Value::Float64(0.5));
+        let result = b.build();
+        assert_eq!(result.columns, vec!["node_id", "score"]);
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn node_value_result_builder_empty() {
+        let b = NodeValueResultBuilder::with_capacity("val", 0);
+        let result = b.build();
+        assert!(result.rows.is_empty(), "{:?}", result.rows);
+    }
+
+    // ---- ComponentResultBuilder ----
+
+    #[test]
+    fn component_result_builder_basic() {
+        let mut b = ComponentResultBuilder::new();
+        b.push(NodeId(10), 0);
+        b.push(NodeId(20), 1);
+        b.push(NodeId(30), 0);
+        let result = b.build();
+        assert_eq!(result.columns, vec!["node_id", "component_id"]);
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn component_result_builder_with_capacity() {
+        let mut b = ComponentResultBuilder::with_capacity(5);
+        b.push(NodeId(1), 0);
+        let result = b.build();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn component_result_builder_default() {
+        let b: ComponentResultBuilder = Default::default();
+        let result = b.build();
+        assert!(result.rows.is_empty(), "{:?}", result.rows);
+    }
+}

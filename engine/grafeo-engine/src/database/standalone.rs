@@ -1,0 +1,1246 @@
+//! Standalone changes: graph commands, schema statements and the index API.
+//!
+//! None of them is an entry of a transaction's change set. Each statement or
+//! call collects what it changes in a [`StandaloneChange`] while it holds
+//! commits off, checking every op against the catalog and the store first,
+//! then [`commit`] logs the change as one WAL group of its own and applies it
+//! op by op through [`apply`], the function replay applies the logged ops
+//! with ([`replay`]). So a statement refused by its checks leaves nothing,
+//! in memory or in the log, and what replay rebuilds is what the statement
+//! made, record for record.
+//!
+//! Outside a transaction such a change takes effect at once. In one it queues for
+//! the commit (`QueuedSchemaOp`), whose WAL group holds it among the data records,
+//! and a rollback drops it (ISO/IEC 39075 Feature GP18).
+//!
+//! An RDF graph operation (`CREATE`, `DROP`, `CLEAR`, `COPY`, `MOVE`, `ADD`)
+//! is one too: [`commit_rdf`] logs it as a group of its own and applies it
+//! to the RDF store through [`apply_rdf`], which replay applies it with.
+
+#![deny(clippy::let_underscore_must_use)]
+
+use std::sync::Arc;
+
+use grafeo_common::change::StandaloneOp;
+use grafeo_common::storage::catalog_record::{
+    CatalogKey, CatalogRecord, IndexKeyRecord, IndexKindRecord, IndexNameRecord, IndexRecord,
+};
+#[cfg(feature = "wal")]
+#[cfg(query_language)]
+use grafeo_common::types::EpochId;
+use grafeo_common::utils::error::{Error, QueryError, Result};
+
+use super::catalog_records::{
+    constraint_definition, edge_type_definition, graph_indexes, graph_type_definition, index_name,
+    node_type_definition, procedure_definition, record_name,
+};
+use super::catalog_section::GraphIndexes;
+use super::root_store::RootStore;
+use crate::catalog::{Catalog, CatalogError};
+use crate::transaction::{BuiltIndex, CommitsHeld, StandaloneChange, TransactionManager};
+
+/// Who applies an op.
+pub(crate) enum Applying<'a> {
+    /// A statement or call, whose checks passed and whose change was logged:
+    /// an op that does not apply is a broken invariant.
+    Live,
+    /// Replay of a logged op, which can meet what the database image holds
+    /// already (a crash between writing a checkpoint and trimming the WAL)
+    /// or miss what a later op of the WAL removed: an op that finds its
+    /// entry there (or gone, for a drop) changes nothing. The vector and
+    /// text indexes it puts are kept in `unbuilt`, built from the data once
+    /// the whole WAL is replayed. A snapshot's catalog applies the same way.
+    #[cfg_attr(
+        not(any(feature = "wal", feature = "triple-store")),
+        expect(
+            dead_code,
+            reason = "WAL replay and a transaction's RDF graph ops apply this way; neither is built"
+        )
+    )]
+    Replay {
+        /// The indexes left to build once the database is built.
+        unbuilt: &'a mut Vec<GraphIndexes>,
+    },
+    /// The catalog of a snapshot, one whole set applied to an empty catalog
+    /// (an import, a restore): no record repeats or misses another, so one
+    /// that does not apply is damage, as for a live op. Its vector and text
+    /// indexes are kept in `unbuilt`, as on replay.
+    Snapshot {
+        /// The indexes left to build once the database is built.
+        unbuilt: &'a mut Vec<GraphIndexes>,
+    },
+}
+
+impl Applying<'_> {
+    /// `outcome` of a catalog call for `op`: a repeat is no error on replay.
+    fn catalog(
+        &self,
+        op: &StandaloneOp,
+        outcome: std::result::Result<(), CatalogError>,
+    ) -> Result<()> {
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) if self.tolerates(&error) => {
+                grafeo_common::grafeo_debug!("WAL replay skipped {}: {error}", describe(op));
+                Ok(())
+            }
+            Err(error) => Err(not_applied(op, &error.to_string())),
+        }
+    }
+
+    /// Whether `error` is one replay meets for an op whose effect is there
+    /// already, or whose entry a later op removed (see [`Applying::Replay`]).
+    fn tolerates(&self, error: &CatalogError) -> bool {
+        matches!(self, Self::Replay { .. })
+            && matches!(
+                error,
+                CatalogError::TypeAlreadyExists(_)
+                    | CatalogError::TypeNotFound(_)
+                    | CatalogError::ProcedureAlreadyExists(_)
+                    | CatalogError::ProcedureNotFound(_)
+                    | CatalogError::SchemaAlreadyExists(_)
+                    | CatalogError::SchemaNotFound(_)
+                    | CatalogError::ConstraintAlreadyExists
+                    | CatalogError::ConstraintNotFound(_)
+            )
+    }
+
+    /// Fails a live op or a snapshot's that found nothing to change (`what`
+    /// says what it missed); replay goes on.
+    fn missing(&self, op: &StandaloneOp, what: &str) -> Result<()> {
+        match self {
+            Self::Live | Self::Snapshot { .. } => Err(not_applied(op, what)),
+            Self::Replay { .. } => {
+                grafeo_common::grafeo_debug!("WAL replay skipped {}: {what}", describe(op));
+                Ok(())
+            }
+        }
+    }
+
+    /// The indexes left to build once the database is built: none live,
+    /// where every index is built as it is put.
+    fn unbuilt(&mut self) -> Option<&mut Vec<GraphIndexes>> {
+        match self {
+            Self::Live => None,
+            Self::Replay { unbuilt } | Self::Snapshot { unbuilt } => Some(unbuilt),
+        }
+    }
+}
+
+/// How errors name an op.
+fn describe(op: &StandaloneOp) -> String {
+    match op {
+        StandaloneOp::CreateGraph { name } => format!("the creation of graph '{name}'"),
+        StandaloneOp::DropGraph { name } => format!("the drop of graph '{name}'"),
+        StandaloneOp::PutCatalog(record) => record_name(record),
+        StandaloneOp::DropCatalog(key) => format!("the drop of {key:?}"),
+        StandaloneOp::RdfGraph(op) => format!("the RDF graph operation {op:?}"),
+    }
+}
+
+/// The error of an op that does not apply.
+fn not_applied(op: &StandaloneOp, reason: &str) -> Error {
+    Error::Internal(format!("{} did not apply: {reason}", describe(op)))
+}
+
+/// Holds commits off for a standalone change for as long as the guard
+/// lives, so a checkpoint or `close()` sees all of it or none of it. With
+/// `writes_too` (a graph drop) it also waits for the writes of open
+/// transactions in progress and keeps new ones out meanwhile, so what their
+/// change sets hold is what the stores hold (see
+/// [`refuse_drop_with_open_changes`]).
+///
+/// # Errors
+///
+/// The database-closed error after `close()` of a persistent database, and
+/// the incomplete-commit error after a commit that did not complete.
+pub(crate) fn hold(manager: &TransactionManager, writes_too: bool) -> Result<CommitsHeld<'_>> {
+    let held = if writes_too {
+        let held = manager.hold_commits()?;
+        manager.check_open()?;
+        held
+    } else {
+        manager.hold_commits_for_change()?
+    };
+    // A standalone change cannot tell here whether it will change anything:
+    // it counts, as the hold is released.
+    #[cfg(feature = "grafeo-file")]
+    let held = {
+        let mut held = held;
+        held.changed(manager);
+        held
+    };
+    // Tests start a checkpoint or `close()` here, which must wait.
+    #[cfg(feature = "testing-statement-injection")]
+    grafeo_common::testing::commit_hook::run_during_held_change();
+    Ok(held)
+}
+
+/// Refuses to drop the graph with storage key `name` while an open
+/// transaction (the dropping session's own one too) has changes in it: its
+/// commit would log them under the graph's name, and replay would create
+/// the graph again for them. The caller holds commits off and the writes
+/// of open transactions out (`held`), so no transaction records a change in
+/// the graph between this check and the drop, and the dropped graph's store
+/// refuses every write after it.
+///
+/// # Errors
+///
+/// A write conflict naming the graph.
+pub(crate) fn refuse_drop_with_open_changes(
+    manager: &TransactionManager,
+    held: &CommitsHeld<'_>,
+    name: &str,
+) -> Result<()> {
+    let changed = manager
+        .open_change_sets(held)
+        .iter()
+        .any(|changes| changes.writes_graph(Some(name)));
+    if changed {
+        return Err(Error::Transaction(
+            grafeo_common::utils::error::TransactionError::WriteConflict(format!(
+                "graph '{name}' has changes of an open transaction: drop it once that \
+                 transaction commits or rolls back"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// Fails when one of `open` has changes in the graph with storage key `name`.
+///
+/// # Errors
+///
+/// A write conflict naming the graph.
+pub(crate) fn refuse_drop_with_changes_in(
+    open: &[Arc<crate::transaction::TransactionChanges>],
+    name: &str,
+) -> Result<()> {
+    if open.iter().any(|changes| changes.writes_graph(Some(name))) {
+        return Err(Error::Transaction(
+            grafeo_common::utils::error::TransactionError::WriteConflict(format!(
+                "graph '{name}' has changes of an open transaction: drop it once that \
+                 transaction commits or rolls back"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// What `op` does to `catalog` alone: a transaction's own view of the catalog, in
+/// which a graph or an index exists only by its records.
+///
+/// # Errors
+///
+/// An op that does not apply to it.
+pub(crate) fn apply_to_catalog(op: &StandaloneOp, catalog: &Catalog) -> Result<()> {
+    match op {
+        StandaloneOp::CreateGraph { .. }
+        | StandaloneOp::RdfGraph(_)
+        | StandaloneOp::PutCatalog(CatalogRecord::Index(_) | CatalogRecord::LabelIndex(_))
+        | StandaloneOp::DropCatalog(CatalogKey::Index { .. } | CatalogKey::LabelIndex { .. }) => {
+            Ok(())
+        }
+        StandaloneOp::DropGraph { name } => {
+            catalog.unbind_graph(name);
+            Ok(())
+        }
+        other => apply::<grafeo_core::graph::rowgroup::RowGroupStore>(
+            other,
+            None,
+            None,
+            catalog,
+            &mut Applying::Live,
+        ),
+    }
+}
+
+/// A catalog of its own with what `catalog` holds now.
+///
+/// # Errors
+///
+/// A record that does not apply: damage.
+pub(crate) fn copy_of_catalog(catalog: &Catalog) -> Result<Catalog> {
+    let names = super::catalog_section::index_names_of(catalog);
+    let copy = Catalog::new();
+    for record in super::catalog_section::catalog_records(catalog, Vec::new(), &names, true)? {
+        apply_to_catalog(&StandaloneOp::PutCatalog(record), &copy)?;
+    }
+    Ok(copy)
+}
+
+/// Adds to `change`, which creates the graph with storage key `graph`, the index of each
+/// uniqueness rule that reaches it: its first key, which the check looks up, so its writes
+/// do not scan. Nothing for a catalog with no such rule, without copying it.
+///
+/// # Errors
+///
+/// A record of the change that does not apply to a copy of the catalog: damage.
+pub(crate) fn index_new_graph_for_its_rules(
+    change: &mut StandaloneChange,
+    base: &Catalog,
+    graph: &str,
+) -> Result<()> {
+    use crate::catalog::{CatalogConstraintValidator, NodeTypeDefinition, TypeConstraint};
+
+    let first_key = |def: &NodeTypeDefinition| -> Vec<String> {
+        def.constraints
+            .iter()
+            .filter_map(|constraint| match constraint {
+                TypeConstraint::Unique(keys) | TypeConstraint::PrimaryKey(keys) => {
+                    keys.first().cloned()
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let declares_types = change
+        .ops()
+        .any(|op| matches!(op, StandaloneOp::PutCatalog(CatalogRecord::NodeType(_))));
+    if !declares_types
+        && base
+            .all_node_type_defs()
+            .iter()
+            .all(|def| first_key(def).is_empty())
+    {
+        return Ok(());
+    }
+    let what_if = copy_of_catalog(base)?;
+    for op in change.ops() {
+        apply_to_catalog(op, &what_if)?;
+    }
+    let what_if = Arc::new(what_if);
+    let validator = CatalogConstraintValidator::of_graph(&what_if, Some(graph));
+    let mut indexes = std::collections::BTreeSet::new();
+    for def in what_if.all_node_type_defs() {
+        let label = crate::catalog::unqualified(&def.name);
+        if validator.node_type(label).is_some() {
+            for key in first_key(&def) {
+                indexes.insert((label.to_string(), key));
+            }
+        }
+    }
+    for (label, key) in indexes {
+        change.push(super::index::put_label_index(Some(graph), &label, &key));
+    }
+    Ok(())
+}
+
+/// The claim on the `name` of a `kind` of the catalog.
+pub(crate) fn name_claim(kind: &str, name: &str) -> crate::transaction::KeyClaim {
+    crate::transaction::KeyClaim {
+        graph: None,
+        label: Arc::from(kind),
+        properties: vec!["name".to_string()],
+        values: vec![grafeo_common::types::HashableValue::from(
+            grafeo_common::types::Value::from(name),
+        )],
+    }
+}
+
+/// The claim of every RDF graph operation, whichever graphs it names: one key, as `DROP ALL`
+/// overlaps them all, until reads of RDF are isolated by triple (#718).
+pub(crate) fn rdf_graph_ops_claim() -> crate::transaction::KeyClaim {
+    name_claim("RDF graph operations", "")
+}
+
+/// The names `op` changes, which a transaction claims at its statement: another that
+/// changes one fails at once.
+pub(crate) fn claims_of(op: &StandaloneOp) -> Vec<crate::transaction::KeyClaim> {
+    let claim = |kind: &str, name: String| name_claim(kind, &name);
+    match op {
+        StandaloneOp::CreateGraph { name } | StandaloneOp::DropGraph { name } => {
+            vec![claim("graph", name.clone())]
+        }
+        StandaloneOp::PutCatalog(record) => vec![match record {
+            CatalogRecord::StoredConfig(_) => claim("stored configuration", String::new()),
+            CatalogRecord::Schema(record) => claim("schema", record.name.clone()),
+            CatalogRecord::NodeType(record) => claim("node type", record.name.clone()),
+            CatalogRecord::EdgeType(record) => claim("edge type", record.name.clone()),
+            CatalogRecord::GraphType(record) => claim("graph type", record.name.clone()),
+            CatalogRecord::GraphBinding(record) => claim("graph", record.graph.clone()),
+            CatalogRecord::Constraint(record) => claim("constraint", record.name.clone()),
+            CatalogRecord::IndexName(record) => claim("index name", record.name.clone()),
+            CatalogRecord::Procedure(record) => claim("procedure", record.name.clone()),
+            CatalogRecord::Index(record) => claim(
+                "index",
+                format!("{:?} {:?}", record.graph, index_key(&record.index)),
+            ),
+            CatalogRecord::LabelIndex(record) => claim(
+                "index",
+                label_index_claim(record.graph.as_ref(), &record.label, &record.key),
+            ),
+        }],
+        StandaloneOp::DropCatalog(key) => vec![match key {
+            CatalogKey::StoredConfig => claim("stored configuration", String::new()),
+            CatalogKey::Schema(name) => claim("schema", name.clone()),
+            CatalogKey::NodeType(name) => claim("node type", name.clone()),
+            CatalogKey::EdgeType(name) => claim("edge type", name.clone()),
+            CatalogKey::GraphType(name) => claim("graph type", name.clone()),
+            CatalogKey::GraphBinding(name) => claim("graph", name.clone()),
+            CatalogKey::Constraint(name) => claim("constraint", name.clone()),
+            CatalogKey::IndexName(name) => claim("index name", name.clone()),
+            CatalogKey::Procedure(name) => claim("procedure", name.clone()),
+            CatalogKey::Index { graph, index } => claim("index", format!("{graph:?} {index:?}")),
+            CatalogKey::LabelIndex { graph, label, key } => {
+                claim("index", label_index_claim(graph.as_ref(), label, key))
+            }
+        }],
+        StandaloneOp::RdfGraph(_) => vec![rdf_graph_ops_claim()],
+    }
+}
+
+/// What a claim on the index on `label` and `key` of `graph` names, its put and its drop alike.
+fn label_index_claim(graph: Option<&String>, label: &str, key: &str) -> String {
+    format!("{graph:?} on label {label:?} {key:?}")
+}
+
+/// Logs `change` as one WAL group of its own (to `wal`, when the database
+/// logs), then applies its ops in order. The caller checked every op while
+/// holding commits off (`_held`), so a checkpoint or `close()` sees all of
+/// the change or none of it.
+///
+/// # Errors
+///
+/// The error of writing the group: nothing is applied then. An op that does
+/// not apply after the group was logged is a broken invariant: the error
+/// comes back and the database is poisoned (no commit until it is reopened,
+/// whose replay applies the group).
+pub(crate) fn commit<S: RootStore>(
+    change: StandaloneChange,
+    _held: &CommitsHeld<'_>,
+    #[cfg(feature = "wal")] wal: Option<&grafeo_storage::wal::Wal>,
+    store: Option<&Arc<S>>,
+    catalog: &Catalog,
+    manager: &TransactionManager,
+) -> Result<()> {
+    if change.is_empty() {
+        return Ok(());
+    }
+    // A database on a backend of its own has a catalog, and no named graphs
+    // and indexes of the built-in store: such an op is refused before
+    // anything is logged or applied.
+    if store.is_none()
+        && let Some(op) = change.ops().find(|op| !catalog_only(op))
+    {
+        return Err(Error::from(QueryError::unsupported(format!(
+            "{} needs the built-in store: a database on a backend of its own has no named \
+             graphs and no indexes",
+            describe(op)
+        ))));
+    }
+    // The index builds' memory is reserved before anything is logged: one
+    // past the memory limit is refused (S001) and changes nothing. The
+    // grant is held until the indexes are in; their store counts them then.
+    let mut change = change;
+    let _reserved = (
+        match store {
+            Some(store) => reserve_index_builds(&change, store)?,
+            None => None,
+        },
+        change.take_reserved(),
+    );
+    #[cfg(feature = "wal")]
+    if let Some(wal) = wal {
+        log(wal, &change, manager)?;
+    }
+    for (op, built) in change.into_ops() {
+        if let Err(error) = apply(&op, built, store, catalog, &mut Applying::Live) {
+            manager.poison(&format!("a logged change did not apply: {error}"));
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// About the heap bytes an index takes per node it holds, for a property
+/// index the build of which runs at the apply: its value, the node's id and
+/// the map's slot.
+const PROPERTY_INDEX_BYTES_PER_NODE: usize = 64;
+
+/// A grant of what the property index builds of `change` take, from the
+/// nodes of their graph (they build at the apply; a vector or text index
+/// was built while the statement checked the change, and its reservation
+/// came with it). `None` without a buffer manager or such a build.
+///
+/// # Errors
+///
+/// The memory limit's refusal (`GRAFEO-S001`), after the buffer manager made
+/// what room it could.
+fn reserve_index_builds<S: RootStore>(
+    change: &StandaloneChange,
+    store: &Arc<S>,
+) -> Result<Option<grafeo_common::memory::buffer::MemoryGrant>> {
+    use grafeo_common::memory::buffer::MemoryRegion;
+    use grafeo_common::utils::error::LimitBound;
+
+    let Some(manager) = store.memory_manager_of() else {
+        return Ok(None);
+    };
+    let mut bytes = 0_usize;
+    for (op, built) in change.entries() {
+        let graph = match (op, built) {
+            (_, Some(_)) => continue,
+            (StandaloneOp::PutCatalog(CatalogRecord::Index(record)), None)
+                if matches!(record.index, IndexKindRecord::Property { .. }) =>
+            {
+                record.graph.as_deref()
+            }
+            (StandaloneOp::PutCatalog(CatalogRecord::LabelIndex(record)), None) => {
+                record.graph.as_deref()
+            }
+            _ => continue,
+        };
+        bytes = bytes.saturating_add(graph_store(store, graph).map_or(0, |target| {
+            target
+                .nodes_held()
+                .saturating_mul(PROPERTY_INDEX_BYTES_PER_NODE)
+        }));
+    }
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let mut grant = manager.empty_grant(MemoryRegion::IndexBuffers);
+    if grant.try_grow(bytes) || (manager.make_room(bytes) && grant.try_grow(bytes)) {
+        Ok(Some(grant))
+    } else {
+        Err(manager.refusal(LimitBound::MemoryLimit, bytes).into())
+    }
+}
+
+/// Whether `op` changes nothing but the catalog (a schema, a type, a graph
+/// type or its binding, a constraint, a procedure, the stored configuration),
+/// so a database without the built-in store applies it.
+fn catalog_only(op: &StandaloneOp) -> bool {
+    match op {
+        StandaloneOp::PutCatalog(record) => !matches!(
+            record,
+            CatalogRecord::Index(_) | CatalogRecord::LabelIndex(_)
+        ),
+        StandaloneOp::DropCatalog(key) => !matches!(
+            key,
+            CatalogKey::Index { .. } | CatalogKey::LabelIndex { .. }
+        ),
+        StandaloneOp::CreateGraph { .. }
+        | StandaloneOp::DropGraph { .. }
+        | StandaloneOp::RdfGraph(_) => false,
+    }
+}
+
+/// The built-in store an op of the named graphs or the indexes applies to.
+///
+/// # Errors
+///
+/// Without one (a database on a backend of its own): [`commit`] refuses
+/// such an op before it is logged, so this is a broken invariant.
+fn built_in<'s, S: RootStore>(store: Option<&'s Arc<S>>, op: &StandaloneOp) -> Result<&'s Arc<S>> {
+    store.ok_or_else(|| {
+        not_applied(
+            op,
+            "a database on a backend of its own has no built-in store",
+        )
+    })
+}
+
+/// Commits a graph copy (`CREATE GRAPH dest AS COPY OF ...`): `change`
+/// creates the graph `dest` (with the source's type binding), and the copy
+/// holds every node and edge of `source` as a reader at the published epoch
+/// sees them, with their ids, labels and current properties (no open
+/// transaction's writes, no property history). Logged as one WAL group, the
+/// graph's records then a create record per copied entity, then applied,
+/// each copied entity through the replay's own apply at that epoch, so a
+/// reopen rebuilds the same graph. The caller holds commits off.
+///
+/// # Errors
+///
+/// As [`commit`]; a copied entity that does not apply poisons the database
+/// (the graph is new and empty, so it cannot conflict).
+#[cfg(feature = "gql")]
+pub(crate) fn commit_copy<S: RootStore>(
+    change: StandaloneChange,
+    _held: &CommitsHeld<'_>,
+    #[cfg(feature = "wal")] wal: Option<&grafeo_storage::wal::Wal>,
+    store: &Arc<S>,
+    catalog: &Catalog,
+    manager: &TransactionManager,
+    (source, dest): (&S, &str),
+) -> Result<()> {
+    use grafeo_core::graph::apply::Writer;
+
+    let epoch = manager.current_epoch();
+    #[cfg(feature = "wal")]
+    if let Some(wal) = wal {
+        log_copy(wal, &change, manager, epoch, (source, dest))?;
+    }
+    for (op, built) in change.into_ops() {
+        if let Err(error) = apply(&op, built, Some(store), catalog, &mut Applying::Live) {
+            manager.poison(&format!("a logged change did not apply: {error}"));
+            return Err(error);
+        }
+    }
+    let Some(target) = store.graph(dest) else {
+        let message = format!("the copy {dest} was created, then not found");
+        manager.poison(&message);
+        return Err(Error::Internal(message));
+    };
+    for op in source.copied(epoch) {
+        if let Err(error) = target.apply(&op, Writer::Replay { epoch }) {
+            let message = format!("a logged copy into {dest} did not apply: {error}");
+            manager.poison(&message);
+            return Err(Error::Internal(message));
+        }
+    }
+    target.sync_epoch(epoch);
+    Ok(())
+}
+
+/// Writes a graph copy to `wal` as one group (see [`commit_copy`]) at
+/// `epoch`, and syncs it as the durability mode asks.
+///
+/// # Errors
+///
+/// As [`log`].
+#[cfg(feature = "wal")]
+#[cfg(feature = "gql")]
+fn log_copy<S: RootStore>(
+    wal: &grafeo_storage::wal::Wal,
+    change: &StandaloneChange,
+    manager: &TransactionManager,
+    epoch: EpochId,
+    (source, dest): (&S, &str),
+) -> Result<()> {
+    use grafeo_common::types::TransactionId;
+    use grafeo_storage::wal::GroupError;
+
+    use super::wal_log::{commit_error, write_copy};
+
+    let mut group = wal
+        .begin_group(TransactionId::SYSTEM)
+        .map_err(commit_error)?;
+    write_copy(&mut group, change, epoch, dest, source.copied(epoch))?;
+    match group.finish() {
+        Ok(_) => Ok(()),
+        Err(error @ GroupError::OutcomeUnknown(_)) => {
+            let error = commit_error(error);
+            manager.poison(&format!(
+                "a graph copy may be in the WAL unapplied: {error}"
+            ));
+            Err(error)
+        }
+        Err(error) => Err(commit_error(error)),
+    }
+}
+
+/// Writes `change` to `wal` as one group of its own, at the published epoch
+/// (the change takes effect at once), and syncs it as the durability mode
+/// asks.
+///
+/// # Errors
+///
+/// The group was not written, or the WAL takes no more writes: nothing of
+/// the change is applied, and the statement fails
+/// ([`TransactionError::LogWriteFailed`] or
+/// [`TransactionError::LogUnavailable`]). The group was written but not made
+/// durable ([`TransactionError::CommitOutcomeUnknown`]): it may survive, but
+/// nothing of it is applied here, so the database is poisoned until a reopen
+/// decides from the log.
+///
+/// [`TransactionError::LogWriteFailed`]: grafeo_common::utils::error::TransactionError::LogWriteFailed
+/// [`TransactionError::LogUnavailable`]: grafeo_common::utils::error::TransactionError::LogUnavailable
+/// [`TransactionError::CommitOutcomeUnknown`]: grafeo_common::utils::error::TransactionError::CommitOutcomeUnknown
+#[cfg(feature = "wal")]
+fn log(
+    wal: &grafeo_storage::wal::Wal,
+    change: &StandaloneChange,
+    manager: &TransactionManager,
+) -> Result<()> {
+    use grafeo_common::storage::log_record::Origin;
+    use grafeo_common::types::TransactionId;
+    use grafeo_storage::wal::GroupError;
+
+    use super::wal_log::{commit_error, write_standalone};
+
+    let mut group = wal
+        .begin_group(TransactionId::SYSTEM)
+        .map_err(commit_error)?;
+    write_standalone(&mut group, change, manager.current_epoch(), Origin::Schema)?;
+    match group.finish() {
+        Ok(_) => Ok(()),
+        Err(error @ GroupError::OutcomeUnknown(_)) => {
+            let error = commit_error(error);
+            manager.poison(&format!(
+                "a standalone change may be in the WAL unapplied: {error}"
+            ));
+            Err(error)
+        }
+        Err(error) => Err(commit_error(error)),
+    }
+}
+
+/// Applies `op` to `store` (the root store, which holds the named graphs)
+/// and `catalog`: what a statement does once its change is logged, and what
+/// replay does with the logged op. `built` is the index a statement built
+/// for the put of an index record.
+///
+/// # Errors
+///
+/// Live: an op the statement's checks should have refused. Replay: an op
+/// that does not apply for another reason than a repeat (see
+/// [`Applying::Replay`]), or a put of an index whose definition does not fit
+/// this platform.
+pub(crate) fn apply<S: RootStore>(
+    op: &StandaloneOp,
+    built: Option<BuiltIndex>,
+    store: Option<&Arc<S>>,
+    catalog: &Catalog,
+    applying: &mut Applying<'_>,
+) -> Result<()> {
+    match op {
+        StandaloneOp::CreateGraph { name } => {
+            if built_in(store, op)?.create_graph(name)? {
+                Ok(())
+            } else {
+                applying.missing(op, "the graph exists")
+            }
+        }
+        StandaloneOp::DropGraph { name } => {
+            if let Some(unbuilt) = applying.unbuilt() {
+                unbuilt.retain(|graph| graph.graph.as_deref() != Some(name.as_str()));
+            }
+            if built_in(store, op)?.drop_graph(name) {
+                // The graph's type goes with it.
+                catalog.unbind_graph(name);
+                Ok(())
+            } else {
+                applying.missing(op, "the graph does not exist")
+            }
+        }
+        StandaloneOp::PutCatalog(record) => {
+            put(op, record, built, store, catalog, applying)?;
+            if holds_rules(record) {
+                catalog.rules_changed();
+            }
+            Ok(())
+        }
+        StandaloneOp::DropCatalog(key) => {
+            drop_entry(op, key, store, catalog, applying)?;
+            if key_of_rules(key) {
+                catalog.rules_changed();
+            }
+            Ok(())
+        }
+        // A change of the RDF store, which `commit_rdf` and `replay` apply
+        // through `apply_rdf`: a change of the labeled property graphs and
+        // the catalog never holds one.
+        StandaloneOp::RdfGraph(_) => Err(not_applied(
+            op,
+            "an RDF graph operation applies to the RDF store, through `apply_rdf`",
+        )),
+    }
+}
+
+/// Whether `record` holds rules writes must meet: an open transaction's commit then checks
+/// its writes again.
+fn holds_rules(record: &CatalogRecord) -> bool {
+    match record {
+        CatalogRecord::NodeType(_)
+        | CatalogRecord::EdgeType(_)
+        | CatalogRecord::GraphType(_)
+        | CatalogRecord::GraphBinding(_)
+        | CatalogRecord::Constraint(_) => true,
+        CatalogRecord::StoredConfig(_)
+        | CatalogRecord::Schema(_)
+        | CatalogRecord::Index(_)
+        | CatalogRecord::LabelIndex(_)
+        | CatalogRecord::IndexName(_)
+        | CatalogRecord::Procedure(_) => false,
+    }
+}
+
+/// [`holds_rules`] of a record `key` names.
+fn key_of_rules(key: &CatalogKey) -> bool {
+    match key {
+        CatalogKey::NodeType(_)
+        | CatalogKey::EdgeType(_)
+        | CatalogKey::GraphType(_)
+        | CatalogKey::GraphBinding(_)
+        | CatalogKey::Constraint(_) => true,
+        CatalogKey::StoredConfig
+        | CatalogKey::Schema(_)
+        | CatalogKey::Index { .. }
+        | CatalogKey::LabelIndex { .. }
+        | CatalogKey::IndexName(_)
+        | CatalogKey::Procedure(_) => false,
+    }
+}
+
+/// Logs the RDF graph operation `op` as one WAL group of its own (to `wal`,
+/// when the database logs), then applies it to `rdf`. The caller checked it
+/// while holding commits off (`_held`), so a checkpoint or `close()` sees
+/// all of it or none of it.
+///
+/// # Errors
+///
+/// As [`commit`].
+#[cfg(feature = "triple-store")]
+pub(crate) fn commit_rdf(
+    op: grafeo_common::change::RdfGraphOp,
+    _held: &CommitsHeld<'_>,
+    #[cfg(feature = "wal")] wal: Option<&grafeo_storage::wal::Wal>,
+    rdf: &grafeo_core::graph::rdf::RdfStore,
+    manager: &TransactionManager,
+) -> Result<()> {
+    let op = StandaloneOp::RdfGraph(op);
+    #[cfg(feature = "wal")]
+    if let Some(wal) = wal {
+        let mut change = StandaloneChange::new();
+        change.push(op.clone());
+        log(wal, &change, manager)?;
+    }
+    if let Err(error) = apply_rdf(&op, rdf, &Applying::Live) {
+        manager.poison(&format!("a logged change did not apply: {error}"));
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Applies `op`, an RDF graph operation, to `rdf`: what a statement does
+/// once it is logged, and what replay does with the logged op. A create of a
+/// graph that exists, or a drop of a named graph that does not, applies
+/// nothing: an error live (the statement's checks refuse it), skipped on
+/// replay.
+///
+/// # Errors
+///
+/// Live: an op the statement's checks should have refused.
+#[cfg(feature = "triple-store")]
+pub(crate) fn apply_rdf(
+    op: &StandaloneOp,
+    rdf: &grafeo_core::graph::rdf::RdfStore,
+    applying: &Applying<'_>,
+) -> Result<()> {
+    let StandaloneOp::RdfGraph(graph_op) = op else {
+        return Err(not_applied(op, "it is no RDF graph operation"));
+    };
+    if rdf.apply_graph_op(graph_op) {
+        return Ok(());
+    }
+    match graph_op {
+        grafeo_common::change::RdfGraphOp::Create { .. } => {
+            applying.missing(op, "the graph exists")
+        }
+        _ => applying.missing(op, "the graph does not exist"),
+    }
+}
+
+/// Applies the put of `record` (see [`apply`]): the record replaces the
+/// entry with its key, or adds it.
+fn put<S: RootStore>(
+    op: &StandaloneOp,
+    record: &CatalogRecord,
+    built: Option<BuiltIndex>,
+    store: Option<&Arc<S>>,
+    catalog: &Catalog,
+    applying: &mut Applying<'_>,
+) -> Result<()> {
+    match record {
+        CatalogRecord::StoredConfig(config) => {
+            catalog.set_stored_config(Some(config.clone()));
+            Ok(())
+        }
+        CatalogRecord::Schema(schema) => {
+            let outcome = catalog.register_schema_namespace(schema.name.clone());
+            applying.catalog(op, outcome)
+        }
+        CatalogRecord::NodeType(record) => {
+            catalog.register_or_replace_node_type(node_type_definition(record.clone())?);
+            Ok(())
+        }
+        CatalogRecord::EdgeType(record) => {
+            catalog.register_or_replace_edge_type_def(edge_type_definition(record.clone())?);
+            Ok(())
+        }
+        CatalogRecord::GraphType(record) => {
+            let def = graph_type_definition(record.clone());
+            // A graph type replaced keeps the graphs bound to it (`ALTER
+            // GRAPH TYPE`); a new one drops the bindings a dropped graph type
+            // of its name left (see `register_graph_type`).
+            if catalog.get_graph_type_def(&def.name).is_some() {
+                catalog.register_or_replace_graph_type(def);
+                Ok(())
+            } else {
+                let outcome = catalog.register_graph_type(def);
+                applying.catalog(op, outcome)
+            }
+        }
+        CatalogRecord::GraphBinding(binding) => {
+            let outcome = catalog.bind_graph_type(&binding.graph, binding.graph_type.clone());
+            applying.catalog(op, outcome)
+        }
+        CatalogRecord::Constraint(record) => {
+            // A constraint of the name there already (replay over an image
+            // that holds it) is made again: its node type may have been
+            // replaced since without the type constraints that enforce it.
+            let def = constraint_definition(record.clone());
+            if catalog.constraint(&def.name).is_some() {
+                applying.catalog(op, catalog.drop_constraint(&def.name))?;
+            }
+            let outcome = catalog.create_constraint(def);
+            applying.catalog(op, outcome)
+        }
+        CatalogRecord::Index(record) => {
+            put_index(op, record, built, built_in(store, op)?, applying)
+        }
+        CatalogRecord::LabelIndex(record) => {
+            match graph_store(built_in(store, op)?, record.graph.as_deref()) {
+                Some(target) => {
+                    target.create_label_index(&record.label, &record.key);
+                    Ok(())
+                }
+                None => applying.missing(op, "the graph does not exist"),
+            }
+        }
+        CatalogRecord::IndexName(record) => {
+            if !has_index_name(catalog, record) {
+                let name = index_name(record.clone());
+                let label = catalog.get_or_create_label(&name.label);
+                let property = catalog.get_or_create_property_key(&name.property);
+                catalog.create_index(&name.name, label, property, name.index_type);
+            }
+            Ok(())
+        }
+        CatalogRecord::Procedure(record) => {
+            let outcome = catalog.replace_procedure(procedure_definition(record.clone()));
+            applying.catalog(op, outcome)
+        }
+    }
+}
+
+/// Whether the catalog has the index name `record` names, with its label,
+/// property and kind: `CREATE INDEX` names one index per property, so a
+/// name can come more than once, but each of these once.
+fn has_index_name(catalog: &Catalog, record: &IndexNameRecord) -> bool {
+    let wanted = index_name(record.clone());
+    catalog.all_indexes().into_iter().any(|def| {
+        def.name == wanted.name
+            && def.index_type == wanted.index_type
+            && catalog
+                .get_label_name(def.label)
+                .is_some_and(|label| *label == *wanted.label)
+            && catalog
+                .get_property_key_name(def.property_key)
+                .is_some_and(|property| *property == *wanted.property)
+    })
+}
+
+/// The store of the graph with storage key `graph` (`None` for the default
+/// graph), or `None` when no such graph exists.
+fn graph_store<S: RootStore>(store: &Arc<S>, graph: Option<&str>) -> Option<Arc<S>> {
+    match graph {
+        None => Some(Arc::clone(store)),
+        Some(key) => store.graph(key),
+    }
+}
+
+/// Applies the put of an index record (see [`apply`]): installs the index a
+/// statement built, or a property index, which is built from the data at
+/// once. Replay keeps a vector or text index for the build after the replay
+/// instead, in place of an index of the same key the image held.
+fn put_index<S: RootStore>(
+    op: &StandaloneOp,
+    record: &IndexRecord,
+    built: Option<BuiltIndex>,
+    store: &Arc<S>,
+    applying: &mut Applying<'_>,
+) -> Result<()> {
+    let Some(target) = graph_store(store, record.graph.as_deref()) else {
+        return applying.missing(op, "the graph does not exist");
+    };
+    if let IndexKindRecord::Property { key } = &record.index {
+        target.create_property_index(key);
+        return Ok(());
+    }
+    match (applying, built) {
+        (Applying::Replay { unbuilt } | Applying::Snapshot { unbuilt }, _) => {
+            let key = index_key(&record.index);
+            remove_index(&*target, &key);
+            forget_unbuilt(unbuilt, record.graph.as_deref(), &key);
+            let mut indexes = graph_indexes(vec![record.clone()])?;
+            match unbuilt.iter_mut().find(|graph| graph.graph == record.graph) {
+                Some(graph) => {
+                    let indexes = indexes.remove(0);
+                    graph.vector.extend(indexes.vector);
+                    graph.text.extend(indexes.text);
+                }
+                None => unbuilt.append(&mut indexes),
+            }
+            Ok(())
+        }
+        (Applying::Live, Some(index)) => install(&*target, &record.index, index),
+        (Applying::Live, None) => Err(not_applied(op, "the index was not built")),
+    }
+}
+
+/// Installs `index`, built for `kind`, in `target`, in place of an index of
+/// the same label and property.
+///
+/// # Errors
+///
+/// An index built for another kind of record than `kind`: a broken
+/// invariant (a statement builds the index its record describes).
+#[cfg_attr(
+    not(any(feature = "vector-index", feature = "text-index")),
+    expect(
+        unused_variables,
+        clippy::needless_pass_by_value,
+        reason = "without vector and text indexes no index is ever built"
+    )
+)]
+fn install<S: RootStore>(target: &S, kind: &IndexKindRecord, index: BuiltIndex) -> Result<()> {
+    match index {
+        #[cfg(feature = "vector-index")]
+        BuiltIndex::Vector(index) => {
+            let IndexKindRecord::Vector {
+                label, property, ..
+            } = kind
+            else {
+                return Err(Error::Internal(format!(
+                    "a vector index built for {kind:?}"
+                )));
+            };
+            target.add_vector_index(label, property, Arc::new(index));
+            Ok(())
+        }
+        #[cfg(feature = "text-index")]
+        BuiltIndex::Text(index) => {
+            let IndexKindRecord::Text {
+                label, property, ..
+            } = kind
+            else {
+                return Err(Error::Internal(format!("a text index built for {kind:?}")));
+            };
+            target.add_text_index(label, property, Arc::new(parking_lot::RwLock::new(index)));
+            Ok(())
+        }
+    }
+}
+
+/// What identifies the index of `kind`.
+fn index_key(kind: &IndexKindRecord) -> IndexKeyRecord {
+    match kind {
+        IndexKindRecord::Property { key } => IndexKeyRecord::Property { key: key.clone() },
+        IndexKindRecord::Vector {
+            label, property, ..
+        } => IndexKeyRecord::Vector {
+            label: label.clone(),
+            property: property.clone(),
+        },
+        IndexKindRecord::Text {
+            label, property, ..
+        } => IndexKeyRecord::Text {
+            label: label.clone(),
+            property: property.clone(),
+        },
+    }
+}
+
+/// Removes the index `key` names from `target`; whether there was one.
+fn remove_index<S: RootStore>(target: &S, key: &IndexKeyRecord) -> bool {
+    match key {
+        IndexKeyRecord::Property { key } => target.drop_property_index(key),
+        #[cfg(feature = "vector-index")]
+        IndexKeyRecord::Vector { label, property } => target.remove_vector_index(label, property),
+        #[cfg(feature = "text-index")]
+        IndexKeyRecord::Text { label, property } => target.remove_text_index(label, property),
+        #[cfg(not(all(feature = "vector-index", feature = "text-index")))]
+        _ => false,
+    }
+}
+
+/// Removes the vector or text index `key` names in the graph `graph` from
+/// the indexes left to build.
+fn forget_unbuilt(unbuilt: &mut Vec<GraphIndexes>, graph: Option<&str>, key: &IndexKeyRecord) {
+    for indexes in unbuilt
+        .iter_mut()
+        .filter(|indexes| indexes.graph.as_deref() == graph)
+    {
+        match key {
+            IndexKeyRecord::Property { .. } => {}
+            IndexKeyRecord::Vector { label, property } => indexes
+                .vector
+                .retain(|def| (&def.label, &def.property) != (label, property)),
+            IndexKeyRecord::Text { label, property } => indexes
+                .text
+                .retain(|def| (&def.label, &def.property) != (label, property)),
+        }
+    }
+    unbuilt.retain(|indexes| !indexes.is_empty());
+}
+
+/// Applies the drop of the entry `key` names (see [`apply`]).
+fn drop_entry<S: RootStore>(
+    op: &StandaloneOp,
+    key: &CatalogKey,
+    store: Option<&Arc<S>>,
+    catalog: &Catalog,
+    applying: &mut Applying<'_>,
+) -> Result<()> {
+    match key {
+        CatalogKey::StoredConfig => {
+            if catalog.set_stored_config(None).is_some() {
+                Ok(())
+            } else {
+                applying.missing(op, "the database stores no configuration")
+            }
+        }
+        CatalogKey::Schema(name) => {
+            let outcome = catalog.drop_schema_namespace(name);
+            applying.catalog(op, outcome)
+        }
+        CatalogKey::NodeType(name) => {
+            let outcome = catalog.drop_node_type(name);
+            applying.catalog(op, outcome)
+        }
+        CatalogKey::EdgeType(name) => {
+            let outcome = catalog.drop_edge_type_def(name);
+            applying.catalog(op, outcome)
+        }
+        CatalogKey::GraphType(name) => {
+            let outcome = catalog.drop_graph_type(name);
+            applying.catalog(op, outcome)
+        }
+        CatalogKey::Constraint(name) => {
+            let outcome = catalog.drop_constraint(name);
+            applying.catalog(op, outcome)
+        }
+        CatalogKey::Procedure(name) => {
+            let outcome = catalog.drop_procedure(name);
+            applying.catalog(op, outcome)
+        }
+        CatalogKey::Index { graph, index } => {
+            if let Some(unbuilt) = applying.unbuilt() {
+                forget_unbuilt(unbuilt, graph.as_deref(), index);
+            }
+            match graph_store(built_in(store, op)?, graph.as_deref()) {
+                Some(target) if remove_index(&*target, index) => Ok(()),
+                Some(_) => applying.missing(op, "there is no such index"),
+                None => applying.missing(op, "the graph does not exist"),
+            }
+        }
+        CatalogKey::LabelIndex { graph, label, key } => {
+            match graph_store(built_in(store, op)?, graph.as_deref()) {
+                Some(target) if target.drop_label_index(label, key) => Ok(()),
+                Some(_) => applying.missing(op, "there is no such index"),
+                None => applying.missing(op, "the graph does not exist"),
+            }
+        }
+        // Every property of the name: an index over several has one
+        // definition per property.
+        CatalogKey::IndexName(name) => match catalog.drop_indexes_named(name) {
+            0 => applying.missing(op, "there is no index of that name"),
+            _ => Ok(()),
+        },
+        // No statement drops a binding on its own: dropping a graph leaves
+        // its binding, which binds nothing until a graph of its name exists.
+        CatalogKey::GraphBinding(_) => Err(not_applied(
+            op,
+            "a graph type binding is not dropped on its own by this release",
+        )),
+    }
+}
+
+/// Replays the standalone op the WAL record `record` holds (a framed WAL v2
+/// log record): applies it as the statement that logged it did (see
+/// [`Applying::Replay`]), the vector and text indexes it puts kept in
+/// `unbuilt`. `wal` names the WAL in errors.
+///
+/// # Errors
+///
+/// Returns an error naming the WAL when the record does not decode, holds
+/// no standalone op, or holds one that does not apply; and when it puts a
+/// vector or text index this build cannot build (it would be lost: see
+/// `sections::FeatureData`).
+#[cfg(feature = "wal")]
+pub(crate) fn replay<S: RootStore>(
+    record: &[u8],
+    wal: &std::path::Path,
+    store: &Arc<S>,
+    #[cfg(feature = "triple-store")] rdf: &grafeo_core::graph::rdf::RdfStore,
+    catalog: &Catalog,
+    unbuilt: &mut Vec<GraphIndexes>,
+) -> Result<()> {
+    use grafeo_common::storage::{LogRecord, read_log_records};
+    use grafeo_common::utils::error::StorageError;
+
+    let failed = |reason: String| {
+        Error::from(StorageError::RecoveryFailed(format!(
+            "cannot replay a standalone change of the WAL {}: {reason}",
+            wal.display()
+        )))
+    };
+    let mut ops = Vec::new();
+    read_log_records(record, &mut |record| {
+        ops.push(record);
+        Ok(())
+    })
+    .map_err(|error| failed(error.to_string()))?;
+    for record in ops {
+        let LogRecord::Standalone(op) = record else {
+            return Err(failed(format!("{record:?} is no standalone change")));
+        };
+        refuse_unbuildable(&op, wal)?;
+        let applied = if matches!(op, StandaloneOp::RdfGraph(_)) {
+            #[cfg(feature = "triple-store")]
+            {
+                apply_rdf(&op, rdf, &Applying::Replay { unbuilt })
+            }
+            // This build cannot replay it: the next checkpoint would write
+            // the file without its change, and remove the WAL.
+            #[cfg(not(feature = "triple-store"))]
+            {
+                return Err(super::sections::refusal(
+                    wal,
+                    &[(&super::sections::RDF_TRIPLES, "WAL records".to_string())],
+                ));
+            }
+        } else {
+            apply(
+                &op,
+                None,
+                Some(store),
+                catalog,
+                &mut Applying::Replay { unbuilt },
+            )
+        };
+        applied.map_err(|error| failed(error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Refuses the put of a vector or text index this build cannot build: the
+/// next checkpoint would write the catalog without it.
+#[cfg(feature = "wal")]
+fn refuse_unbuildable(op: &StandaloneOp, wal: &std::path::Path) -> Result<()> {
+    let StandaloneOp::PutCatalog(CatalogRecord::Index(record)) = op else {
+        return Ok(());
+    };
+    let data = match &record.index {
+        IndexKindRecord::Vector { .. } if !super::sections::VECTOR_INDEXES.in_build() => {
+            &super::sections::VECTOR_INDEXES
+        }
+        IndexKindRecord::Text { .. } if !super::sections::TEXT_INDEXES.in_build() => {
+            &super::sections::TEXT_INDEXES
+        }
+        _ => return Ok(()),
+    };
+    Err(super::sections::refusal(
+        wal,
+        &[(
+            data,
+            format!(
+                "WAL records: {}",
+                record_name(&CatalogRecord::Index(record.clone()))
+            ),
+        )],
+    ))
+}

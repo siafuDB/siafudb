@@ -1,0 +1,5237 @@
+//! Cypher Parser.
+//!
+//! Parses Cypher queries into an AST.
+
+#[allow(clippy::wildcard_imports)]
+use super::ast::*;
+use super::lexer::{Lexer, Token, TokenKind};
+use crate::query::keywords::unescape_string;
+use crate::query::limits::{Chain, Nesting, nesting_error_message};
+use crate::query::schema::IndexOptionValue;
+use grafeo_common::utils::error::{QueryError, QueryErrorKind, Result};
+
+/// Cypher query parser.
+pub struct Parser<'a> {
+    lexer: Lexer<'a>,
+    current: Token,
+    previous: Token,
+    source: &'a str,
+    /// How deep the statement parsed so far nests (see
+    /// [`MAX_NESTING_DEPTH`](crate::query::limits::MAX_NESTING_DEPTH)).
+    /// Saved and restored with the lexer where the parser backtracks.
+    nesting: Nesting,
+    /// Whether the last error is one no other reading of the tokens avoids
+    /// (a second type of a relationship, see
+    /// [`Self::parse_relationship_types`]): where the parser tries a pattern
+    /// and backtracks to an expression, it returns that error instead.
+    definite_error: bool,
+}
+
+impl<'a> Parser<'a> {
+    /// Creates a new parser for the given query.
+    pub fn new(query: &'a str) -> Self {
+        let mut lexer = Lexer::new(query);
+        let current = lexer.next_token();
+        let previous = Token {
+            kind: TokenKind::Eof,
+            text: String::new(),
+            span: current.span,
+        };
+        Self {
+            lexer,
+            current,
+            previous,
+            source: query,
+            nesting: Nesting::default(),
+            definite_error: false,
+        }
+    }
+
+    /// Enters one level of nesting, or fails past the nesting limit.
+    fn enter_nesting(&mut self) -> Result<()> {
+        if self.nesting.enter() {
+            Ok(())
+        } else {
+            Err(self.error(&nesting_error_message()))
+        }
+    }
+
+    /// Leaves the level [`Self::enter_nesting`] entered.
+    fn exit_nesting(&mut self) {
+        self.nesting.exit();
+    }
+
+    /// Enters a subquery, which nests two levels: translating and planning
+    /// one takes more stack than an expression in parentheses.
+    fn enter_subquery(&mut self) -> Result<()> {
+        self.enter_nesting()?;
+        self.enter_nesting()
+    }
+
+    /// Leaves the levels [`Self::enter_subquery`] entered.
+    fn exit_subquery(&mut self) {
+        self.exit_nesting();
+        self.exit_nesting();
+    }
+
+    /// Begins a chain of binary operators (see [`Nesting::begin_chain`]).
+    fn begin_chain(&mut self) -> Chain {
+        self.nesting.begin_chain()
+    }
+
+    /// Counts one operator of a chain, or fails past the nesting limit.
+    fn link_chain(&mut self) -> Result<()> {
+        if self.nesting.link() {
+            Ok(())
+        } else {
+            Err(self.error(&nesting_error_message()))
+        }
+    }
+
+    /// Ends a chain of binary operators.
+    fn end_chain(&mut self, chain: Chain) {
+        self.nesting.end_chain(chain);
+    }
+
+    /// Parses the query into a statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input contains invalid or unexpected Cypher syntax.
+    pub fn parse(&mut self) -> Result<Statement> {
+        // Handle EXPLAIN/PROFILE prefix: wraps the entire following statement
+        if self.current.kind == TokenKind::Identifier
+            && self.current.text.eq_ignore_ascii_case("EXPLAIN")
+        {
+            self.advance(); // consume EXPLAIN
+            self.enter_nesting()?;
+            let inner = self.parse()?;
+            self.exit_nesting();
+            return Ok(Statement::Explain(Box::new(inner)));
+        }
+        if self.current.kind == TokenKind::Identifier
+            && self.current.text.eq_ignore_ascii_case("PROFILE")
+        {
+            self.advance(); // consume PROFILE
+            self.enter_nesting()?;
+            let inner = self.parse()?;
+            self.exit_nesting();
+            return Ok(Statement::Profile(Box::new(inner)));
+        }
+
+        // Schema DDL: CREATE INDEX, DROP INDEX, CREATE CONSTRAINT, DROP CONSTRAINT
+        if self.current.kind == TokenKind::Create
+            && self.peek_kind() == TokenKind::Identifier
+            && (self.peek_text_eq_ignore_case("INDEX")
+                || self.peek_text_eq_ignore_case("CONSTRAINT"))
+        {
+            let stmt = self.parse_schema_create()?;
+            self.expect_end_of_query()?;
+            return Ok(stmt);
+        }
+        if self.current.kind == TokenKind::Identifier
+            && self.current.text.eq_ignore_ascii_case("DROP")
+            && let Some(stmt) = self.try_parse_schema_drop()?
+        {
+            self.expect_end_of_query()?;
+            return Ok(stmt);
+        }
+        // ALTER CURRENT GRAPH TYPE
+        if self.current.kind == TokenKind::Identifier
+            && self.current.text.eq_ignore_ascii_case("ALTER")
+            && let Some(stmt) = self.try_parse_alter_current_graph_type()?
+        {
+            self.expect_end_of_query()?;
+            return Ok(stmt);
+        }
+        // SHOW INDEXES / SHOW CONSTRAINTS / SHOW CURRENT GRAPH TYPE
+        if self.current.kind == TokenKind::Identifier
+            && self.current.text.eq_ignore_ascii_case("SHOW")
+            && let Some(stmt) = self.try_parse_show()?
+        {
+            self.expect_end_of_query()?;
+            return Ok(stmt);
+        }
+
+        let stmt = self.parse_statement()?;
+        // Check for UNION continuation
+        if self.current.kind == TokenKind::Union {
+            return self.parse_union_continuation(stmt);
+        }
+        self.expect_end_of_query()?;
+        Ok(stmt)
+    }
+
+    /// Requires that only `;` remain after a complete statement.
+    fn expect_end_of_query(&mut self) -> Result<()> {
+        let saw_semicolon = self.current.kind == TokenKind::Semicolon;
+        self.skip_semicolons();
+        if self.current.kind == TokenKind::Eof {
+            return Ok(());
+        }
+        if saw_semicolon {
+            return Err(self.error(
+                "multiple statements separated by ';' are not supported in one call: \
+                 run them separately",
+            ));
+        }
+        Err(self.error("Expected end of query"))
+    }
+
+    /// Parses UNION / UNION ALL between query blocks.
+    fn parse_union_continuation(&mut self, first_stmt: Statement) -> Result<Statement> {
+        let Statement::Query(first_query) = first_stmt else {
+            return Err(self.error("UNION requires query statements"));
+        };
+        let mut queries = vec![first_query];
+        let mut union_all = None;
+
+        while self.current.kind == TokenKind::Union {
+            self.parse_union_keyword(&mut union_all)?;
+            let next_stmt = self.parse_statement()?;
+            match next_stmt {
+                Statement::Query(q) => queries.push(q),
+                _ => return Err(self.error("UNION requires query statements")),
+            }
+        }
+
+        self.expect_end_of_query()?;
+
+        Ok(Statement::Union {
+            queries,
+            all: union_all.unwrap_or(false),
+        })
+    }
+
+    /// Consumes `UNION` or `UNION ALL`. As in openCypher, one chain of
+    /// queries uses one of them: `union_all` holds the kind seen so far, and
+    /// a different one is an error.
+    fn parse_union_keyword(&mut self, union_all: &mut Option<bool>) -> Result<()> {
+        self.expect(TokenKind::Union)?;
+        let all = self.current.kind == TokenKind::All;
+        if all {
+            self.advance(); // consume ALL
+        }
+        if union_all.is_some_and(|seen| seen != all) {
+            return Err(self.error("Invalid combination of UNION and UNION ALL"));
+        }
+        *union_all = Some(all);
+        Ok(())
+    }
+
+    fn parse_statement(&mut self) -> Result<Statement> {
+        // Parse reading/writing clauses into a query
+        let mut clauses = Vec::new();
+
+        loop {
+            self.reject_clause_after_return(&clauses)?;
+            match self.current.kind {
+                TokenKind::Match => {
+                    clauses.push(Clause::Match(self.parse_match_clause()?));
+                }
+                TokenKind::Optional => {
+                    self.advance();
+                    self.expect(TokenKind::Match)?;
+                    let match_clause = self.parse_match_clause_body()?;
+                    clauses.push(Clause::OptionalMatch(match_clause));
+                }
+                TokenKind::Where => {
+                    clauses.push(Clause::Where(self.parse_where_clause()?));
+                }
+                TokenKind::With => {
+                    clauses.push(Clause::With(self.parse_with_clause()?));
+                }
+                TokenKind::Return => {
+                    clauses.push(Clause::Return(self.parse_return_clause()?));
+                }
+                TokenKind::Unwind => {
+                    clauses.push(Clause::Unwind(self.parse_unwind_clause()?));
+                }
+                TokenKind::Create => {
+                    clauses.push(Clause::Create(self.parse_create_clause()?));
+                }
+                TokenKind::Merge => {
+                    clauses.push(Clause::Merge(self.parse_merge_clause()?));
+                }
+                TokenKind::Delete | TokenKind::Detach => {
+                    clauses.push(Clause::Delete(self.parse_delete_clause()?));
+                }
+                TokenKind::Set => {
+                    clauses.push(Clause::Set(self.parse_set_clause()?));
+                }
+                TokenKind::Remove => {
+                    clauses.push(Clause::Remove(self.parse_remove_clause()?));
+                }
+                TokenKind::Order => {
+                    clauses.push(Clause::OrderBy(self.parse_order_by_clause()?));
+                }
+                TokenKind::Skip => {
+                    self.advance();
+                    clauses.push(Clause::Skip(self.parse_expression()?));
+                }
+                TokenKind::Limit => {
+                    self.advance();
+                    clauses.push(Clause::Limit(self.parse_expression()?));
+                }
+                TokenKind::Call => clauses.push(self.parse_call()?),
+                _ => {
+                    // FOREACH and LOAD are contextual keywords (not reserved)
+                    if self.can_be_identifier()
+                        && self.get_identifier_text().to_uppercase() == "FOREACH"
+                    {
+                        clauses.push(Clause::ForEach(self.parse_foreach_clause()?));
+                    } else if self.is_contextual("LOAD") {
+                        clauses.push(Clause::LoadCsv(self.parse_load_csv_clause()?));
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if clauses.is_empty() {
+            return Err(self.error("Expected a Cypher clause"));
+        }
+
+        Ok(Statement::Query(Query {
+            clauses,
+            span: None,
+        }))
+    }
+
+    /// Fails when the current token starts a clause other than `ORDER BY`,
+    /// `SKIP` or `LIMIT` after a `RETURN` in `clauses`: in openCypher a
+    /// `RETURN` ends its query part (a `WITH` passes rows on), and a clause
+    /// after it would otherwise replace it.
+    fn reject_clause_after_return(&self, clauses: &[Clause]) -> Result<()> {
+        if !clauses
+            .iter()
+            .any(|clause| matches!(clause, Clause::Return(_)))
+        {
+            return Ok(());
+        }
+        let starts_clause = matches!(
+            self.current.kind,
+            TokenKind::Match
+                | TokenKind::Optional
+                | TokenKind::Where
+                | TokenKind::With
+                | TokenKind::Return
+                | TokenKind::Unwind
+                | TokenKind::Create
+                | TokenKind::Merge
+                | TokenKind::Delete
+                | TokenKind::Detach
+                | TokenKind::Set
+                | TokenKind::Remove
+                | TokenKind::Call
+        ) || (self.can_be_identifier()
+            && self.get_identifier_text().eq_ignore_ascii_case("FOREACH"))
+            || self.is_contextual("LOAD");
+        if !starts_clause {
+            return Ok(());
+        }
+        Err(self.error(&format!(
+            "{} after RETURN: RETURN must be the last clause of a query (pass rows on with WITH)",
+            self.current.text.to_uppercase()
+        )))
+    }
+
+    /// Parses `CALL [(scope)] { subquery [UNION [ALL] subquery]* }` or a
+    /// procedure call: a procedure name comes before any `(`.
+    fn parse_call(&mut self) -> Result<Clause> {
+        if !matches!(self.peek_kind(), TokenKind::LBrace | TokenKind::LParen) {
+            return Ok(Clause::Call(self.parse_call_clause()?));
+        }
+        self.advance(); // consume CALL
+        let scope = if self.current.kind == TokenKind::LParen {
+            Some(self.parse_call_scope()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::LBrace)?;
+        self.enter_subquery()?;
+        let query = self.parse_subquery_body()?;
+        let mut unions = Vec::new();
+        let mut union_all = None;
+        while self.current.kind == TokenKind::Union {
+            self.parse_union_keyword(&mut union_all)?;
+            unions.push(self.parse_subquery_body()?);
+        }
+        self.exit_subquery();
+        self.expect(TokenKind::RBrace)?;
+        Ok(Clause::CallSubquery {
+            query,
+            scope,
+            unions,
+            union_all: union_all.unwrap_or(false),
+        })
+    }
+
+    /// Parses a CALL clause: `CALL name.space(args) [YIELD field [AS alias], ...]`.
+    fn parse_call_clause(&mut self) -> Result<CallClause> {
+        let span_start = self.current.span.start;
+        self.expect(TokenKind::Call)?;
+
+        // Parse dotted procedure name
+        let mut name_parts = vec![self.expect_identifier()?];
+        while self.current.kind == TokenKind::Dot {
+            self.advance();
+            name_parts.push(self.expect_identifier()?);
+        }
+
+        // Parse argument list
+        self.expect(TokenKind::LParen)?;
+        let mut arguments = Vec::new();
+        if self.current.kind != TokenKind::RParen {
+            arguments.push(self.parse_expression()?);
+            while self.current.kind == TokenKind::Comma {
+                self.advance();
+                arguments.push(self.parse_expression()?);
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+
+        // Parse optional YIELD clause
+        let yield_items = if self.current.kind == TokenKind::Yield {
+            self.advance();
+            let mut items = vec![self.parse_cypher_yield_item()?];
+            while self.current.kind == TokenKind::Comma {
+                self.advance();
+                items.push(self.parse_cypher_yield_item()?);
+            }
+            Some(items)
+        } else {
+            None
+        };
+
+        Ok(CallClause {
+            procedure_name: name_parts,
+            arguments,
+            yield_items,
+            span: Some(grafeo_common::utils::error::SourceSpan::new(
+                span_start,
+                self.current.span.start,
+                1,
+                1,
+            )),
+        })
+    }
+
+    /// Parses a FOREACH clause: `FOREACH (var IN expr | clauses)`.
+    /// Parses a LOAD CSV clause:
+    /// `LOAD CSV [WITH HEADERS] FROM 'path' AS variable [FIELDTERMINATOR 'sep']`
+    fn parse_load_csv_clause(&mut self) -> Result<LoadCsvClause> {
+        self.advance(); // consume LOAD
+
+        self.expect_contextual("CSV")?;
+
+        // Optional WITH HEADERS
+        let with_headers = if self.current.kind == TokenKind::With {
+            self.advance(); // consume WITH
+            self.expect_contextual("HEADERS")?;
+            true
+        } else {
+            false
+        };
+
+        // FROM 'path'
+        self.expect_contextual("FROM")?;
+        let path = if self.current.kind == TokenKind::String {
+            let raw = self.current.text.clone();
+            self.advance();
+            // Strip quotes and unescape
+            unescape_string(&raw[1..raw.len() - 1])
+        } else {
+            return Err(self.error("Expected string literal for file path"));
+        };
+
+        // AS variable
+        self.expect(TokenKind::As)?;
+        let variable = self.expect_identifier()?;
+
+        // Optional FIELDTERMINATOR 'char'
+        let field_terminator = if self.is_contextual("FIELDTERMINATOR") {
+            self.advance();
+            if self.current.kind == TokenKind::String {
+                let raw = self.current.text.clone();
+                self.advance();
+                let unescaped = unescape_string(&raw[1..raw.len() - 1]);
+                let ch = unescaped
+                    .chars()
+                    .next()
+                    .ok_or_else(|| self.error("FIELDTERMINATOR must be a single character"))?;
+                Some(ch)
+            } else {
+                return Err(self.error("Expected string literal for FIELDTERMINATOR"));
+            }
+        } else {
+            None
+        };
+
+        Ok(LoadCsvClause {
+            with_headers,
+            path,
+            variable,
+            field_terminator,
+            span: None,
+        })
+    }
+
+    fn parse_foreach_clause(&mut self) -> Result<ForEachClause> {
+        self.advance(); // consume FOREACH identifier
+        self.expect(TokenKind::LParen)?;
+        let variable = self.expect_identifier()?;
+        self.expect(TokenKind::In)?;
+        let list = self.parse_expression()?;
+        self.expect(TokenKind::Pipe)?;
+        let mut clauses = Vec::new();
+        // Parse mutation clauses until closing paren
+        while self.current.kind != TokenKind::RParen {
+            match self.current.kind {
+                TokenKind::Set => clauses.push(Clause::Set(self.parse_set_clause()?)),
+                TokenKind::Delete | TokenKind::Detach => {
+                    clauses.push(Clause::Delete(self.parse_delete_clause()?));
+                }
+                TokenKind::Remove => clauses.push(Clause::Remove(self.parse_remove_clause()?)),
+                TokenKind::Create => clauses.push(Clause::Create(self.parse_create_clause()?)),
+                TokenKind::Merge => clauses.push(Clause::Merge(self.parse_merge_clause()?)),
+                _ => {
+                    if self.can_be_identifier()
+                        && self.get_identifier_text().to_uppercase() == "FOREACH"
+                    {
+                        // A nested FOREACH nests as a subquery: it plans as one.
+                        self.enter_subquery()?;
+                        let inner = self.parse_foreach_clause()?;
+                        self.exit_subquery();
+                        clauses.push(Clause::ForEach(inner));
+                    } else {
+                        return Err(self.error("Expected mutation clause in FOREACH"));
+                    }
+                }
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(ForEachClause {
+            variable,
+            list,
+            clauses,
+        })
+    }
+
+    /// Parses the body of an inline subquery (CALL { ... } or COUNT { ... }).
+    ///
+    /// Expects to be positioned after the opening `{`.
+    fn parse_subquery_body(&mut self) -> Result<Query> {
+        let mut clauses = Vec::new();
+        while self.current.kind != TokenKind::RBrace && self.current.kind != TokenKind::Eof {
+            self.reject_clause_after_return(&clauses)?;
+            match self.current.kind {
+                TokenKind::Match => {
+                    clauses.push(Clause::Match(self.parse_match_clause()?));
+                }
+                TokenKind::Optional => {
+                    self.advance();
+                    self.expect(TokenKind::Match)?;
+                    let match_clause = self.parse_match_clause_body()?;
+                    clauses.push(Clause::OptionalMatch(match_clause));
+                }
+                TokenKind::Where => {
+                    clauses.push(Clause::Where(self.parse_where_clause()?));
+                }
+                TokenKind::With => {
+                    clauses.push(Clause::With(self.parse_with_clause()?));
+                }
+                TokenKind::Return => {
+                    clauses.push(Clause::Return(self.parse_return_clause()?));
+                }
+                TokenKind::Unwind => {
+                    clauses.push(Clause::Unwind(self.parse_unwind_clause()?));
+                }
+                TokenKind::Create => {
+                    clauses.push(Clause::Create(self.parse_create_clause()?));
+                }
+                TokenKind::Set => {
+                    clauses.push(Clause::Set(self.parse_set_clause()?));
+                }
+                TokenKind::Merge => {
+                    clauses.push(Clause::Merge(self.parse_merge_clause()?));
+                }
+                TokenKind::Delete | TokenKind::Detach => {
+                    clauses.push(Clause::Delete(self.parse_delete_clause()?));
+                }
+                TokenKind::Remove => {
+                    clauses.push(Clause::Remove(self.parse_remove_clause()?));
+                }
+                TokenKind::Order => {
+                    clauses.push(Clause::OrderBy(self.parse_order_by_clause()?));
+                }
+                TokenKind::Skip => {
+                    self.advance();
+                    clauses.push(Clause::Skip(self.parse_expression()?));
+                }
+                TokenKind::Limit => {
+                    self.advance();
+                    clauses.push(Clause::Limit(self.parse_expression()?));
+                }
+                TokenKind::Call => clauses.push(self.parse_call()?),
+                // FOREACH is a contextual keyword (not reserved)
+                _ if self.can_be_identifier()
+                    && self.get_identifier_text().eq_ignore_ascii_case("FOREACH") =>
+                {
+                    clauses.push(Clause::ForEach(self.parse_foreach_clause()?));
+                }
+                _ => break,
+            }
+        }
+        if clauses.is_empty() {
+            return Err(self.error("Expected at least one clause in subquery"));
+        }
+        Ok(Query {
+            clauses,
+            span: None,
+        })
+    }
+
+    /// Parses a single YIELD item: `field_name [AS alias]`.
+    fn parse_cypher_yield_item(&mut self) -> Result<YieldItem> {
+        let field_name = self.expect_identifier()?;
+        let alias = if self.current.kind == TokenKind::As {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        Ok(YieldItem { field_name, alias })
+    }
+
+    fn parse_match_clause(&mut self) -> Result<MatchClause> {
+        self.expect(TokenKind::Match)?;
+        self.parse_match_clause_body()
+    }
+
+    fn parse_match_clause_body(&mut self) -> Result<MatchClause> {
+        let patterns = self.parse_pattern_list()?;
+        Ok(MatchClause {
+            patterns,
+            span: None,
+        })
+    }
+
+    /// Parses the inner query of an EXISTS or COUNT subquery: MATCH and
+    /// OPTIONAL MATCH clauses and an optional WHERE.
+    fn parse_exists_inner_query(&mut self) -> Result<Query> {
+        let mut clauses = Vec::new();
+
+        loop {
+            match self.current.kind {
+                TokenKind::Match => clauses.push(Clause::Match(self.parse_match_clause()?)),
+                TokenKind::Optional => {
+                    self.advance();
+                    self.expect(TokenKind::Match)?;
+                    clauses.push(Clause::OptionalMatch(self.parse_match_clause_body()?));
+                }
+                _ => break,
+            }
+        }
+
+        // Bare pattern form: EXISTS { (a)-[r]->(b) WHERE ... }
+        // Treat as implicit MATCH when no MATCH keyword but a pattern starts with (
+        if clauses.is_empty() && self.current.kind == TokenKind::LParen {
+            clauses.push(Clause::Match(self.parse_match_clause_body()?));
+        }
+
+        if clauses.is_empty() {
+            return Err(self.error("EXISTS subquery requires at least one MATCH clause"));
+        }
+
+        if self.current.kind == TokenKind::Where {
+            clauses.push(Clause::Where(self.parse_where_clause()?));
+        }
+
+        Ok(Query {
+            clauses,
+            span: None,
+        })
+    }
+
+    fn parse_where_clause(&mut self) -> Result<WhereClause> {
+        self.expect(TokenKind::Where)?;
+        let predicate = self.parse_expression()?;
+        Ok(WhereClause {
+            predicate,
+            span: None,
+        })
+    }
+
+    fn parse_with_clause(&mut self) -> Result<WithClause> {
+        self.expect(TokenKind::With)?;
+
+        let distinct = if self.current.kind == TokenKind::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        // `WITH *`, which more items may follow (openCypher 9 grammar,
+        // ProjectionItems: `*, a.name AS name`)
+        let is_wildcard = if self.current.kind == TokenKind::Star {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let items = if !is_wildcard {
+            self.parse_projection_items()?
+        } else if self.current.kind == TokenKind::Comma {
+            self.advance();
+            self.parse_projection_items()?
+        } else {
+            Vec::new()
+        };
+
+        let where_clause = if self.current.kind == TokenKind::Where {
+            Some(Box::new(self.parse_where_clause()?))
+        } else {
+            None
+        };
+
+        Ok(WithClause {
+            distinct,
+            items,
+            is_wildcard,
+            where_clause,
+            span: None,
+        })
+    }
+
+    fn parse_return_clause(&mut self) -> Result<ReturnClause> {
+        self.expect(TokenKind::Return)?;
+
+        let distinct = if self.current.kind == TokenKind::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        // `RETURN *`, which more items may follow, as after WITH
+        let items = if self.current.kind == TokenKind::Star {
+            self.advance();
+            if self.current.kind == TokenKind::Comma {
+                self.advance();
+                ReturnItems::AllAnd(self.parse_projection_items()?)
+            } else {
+                ReturnItems::All
+            }
+        } else {
+            ReturnItems::Explicit(self.parse_projection_items()?)
+        };
+
+        Ok(ReturnClause {
+            distinct,
+            items,
+            span: None,
+        })
+    }
+
+    fn parse_unwind_clause(&mut self) -> Result<UnwindClause> {
+        self.expect(TokenKind::Unwind)?;
+        let expression = self.parse_expression()?;
+        self.expect(TokenKind::As)?;
+        let variable = self.expect_identifier()?;
+
+        Ok(UnwindClause {
+            expression,
+            variable,
+            span: None,
+        })
+    }
+
+    fn parse_create_clause(&mut self) -> Result<CreateClause> {
+        self.expect(TokenKind::Create)?;
+        let patterns = self.parse_pattern_list()?;
+        for pattern in &patterns {
+            self.check_one_type_each("CREATE", pattern)?;
+        }
+        Ok(CreateClause {
+            patterns,
+            span: None,
+        })
+    }
+
+    /// Refuses a relationship with alternative types (`:A|B`) in `pattern`
+    /// of `clause`, which creates relationships: each gets one type.
+    fn check_one_type_each(&self, clause: &str, pattern: &Pattern) -> Result<()> {
+        match pattern {
+            Pattern::Node(_) => Ok(()),
+            Pattern::NamedPath { pattern, .. } => self.check_one_type_each(clause, pattern),
+            Pattern::Path(path) => match path.chain.iter().find(|rel| rel.types.len() > 1) {
+                Some(rel) => Err(self.error(&format!(
+                    "{clause} gives a relationship one type: :{} names alternatives, which \
+                     only a pattern to match can have",
+                    rel.types.join("|")
+                ))),
+                None => Ok(()),
+            },
+        }
+    }
+
+    fn parse_merge_clause(&mut self) -> Result<MergeClause> {
+        self.expect(TokenKind::Merge)?;
+        let pattern = self.parse_pattern()?;
+        self.check_one_type_each("MERGE", &pattern)?;
+
+        let mut on_create = None;
+        let mut on_match = None;
+
+        while self.current.kind == TokenKind::On {
+            self.advance();
+            match self.current.kind {
+                TokenKind::Create => {
+                    self.advance();
+                    on_create = Some(self.parse_set_clause()?);
+                }
+                TokenKind::Match => {
+                    self.advance();
+                    on_match = Some(self.parse_set_clause()?);
+                }
+                _ => return Err(self.error("Expected CREATE or MATCH after ON")),
+            }
+        }
+
+        Ok(MergeClause {
+            pattern,
+            on_create,
+            on_match,
+            span: None,
+        })
+    }
+
+    fn parse_delete_clause(&mut self) -> Result<DeleteClause> {
+        let detach = if self.current.kind == TokenKind::Detach {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        self.expect(TokenKind::Delete)?;
+
+        let mut expressions = vec![self.parse_expression()?];
+        while self.current.kind == TokenKind::Comma {
+            self.advance();
+            expressions.push(self.parse_expression()?);
+        }
+
+        Ok(DeleteClause {
+            detach,
+            expressions,
+            span: None,
+        })
+    }
+
+    fn parse_set_clause(&mut self) -> Result<SetClause> {
+        self.expect(TokenKind::Set)?;
+
+        let mut items = vec![self.parse_set_item()?];
+        while self.current.kind == TokenKind::Comma {
+            self.advance();
+            items.push(self.parse_set_item()?);
+        }
+
+        Ok(SetClause { items, span: None })
+    }
+
+    fn parse_set_item(&mut self) -> Result<SetItem> {
+        let variable = self.expect_identifier()?;
+
+        if self.current.kind == TokenKind::Dot {
+            // n.prop = value
+            self.advance();
+            let property = self.expect_identifier()?;
+            self.expect(TokenKind::Eq)?;
+            let value = self.parse_expression()?;
+            Ok(SetItem::Property {
+                variable,
+                property,
+                value,
+            })
+        } else if self.current.kind == TokenKind::PlusEq {
+            // n += {props}
+            self.advance();
+            let properties = self.parse_expression()?;
+            Ok(SetItem::MergeProperties {
+                variable,
+                properties,
+            })
+        } else if self.current.kind == TokenKind::Eq {
+            // n = {props}
+            self.advance();
+            let properties = self.parse_expression()?;
+            Ok(SetItem::AllProperties {
+                variable,
+                properties,
+            })
+        } else if self.current.kind == TokenKind::Colon {
+            // n:Label1:Label2
+            let mut labels = Vec::new();
+            while self.current.kind == TokenKind::Colon {
+                self.advance();
+                labels.push(self.expect_identifier()?);
+            }
+            Ok(SetItem::Labels { variable, labels })
+        } else {
+            Err(self.error("Expected property assignment or label"))
+        }
+    }
+
+    fn parse_remove_clause(&mut self) -> Result<RemoveClause> {
+        self.expect(TokenKind::Remove)?;
+
+        let mut items = vec![self.parse_remove_item()?];
+        while self.current.kind == TokenKind::Comma {
+            self.advance();
+            items.push(self.parse_remove_item()?);
+        }
+
+        Ok(RemoveClause { items, span: None })
+    }
+
+    fn parse_remove_item(&mut self) -> Result<RemoveItem> {
+        let variable = self.expect_identifier()?;
+
+        if self.current.kind == TokenKind::Dot {
+            // n.prop
+            self.advance();
+            let property = self.expect_identifier()?;
+            Ok(RemoveItem::Property { variable, property })
+        } else if self.current.kind == TokenKind::Colon {
+            // n:Label1:Label2
+            let mut labels = Vec::new();
+            while self.current.kind == TokenKind::Colon {
+                self.advance();
+                labels.push(self.expect_identifier()?);
+            }
+            Ok(RemoveItem::Labels { variable, labels })
+        } else {
+            Err(self.error("Expected property or label to remove"))
+        }
+    }
+
+    fn parse_order_by_clause(&mut self) -> Result<OrderByClause> {
+        self.expect(TokenKind::Order)?;
+        self.expect(TokenKind::By)?;
+
+        let mut items = vec![self.parse_sort_item()?];
+        while self.current.kind == TokenKind::Comma {
+            self.advance();
+            items.push(self.parse_sort_item()?);
+        }
+
+        Ok(OrderByClause { items, span: None })
+    }
+
+    fn parse_sort_item(&mut self) -> Result<SortItem> {
+        let expression = self.parse_expression()?;
+        let direction = match self.current.kind {
+            TokenKind::Asc | TokenKind::Ascending => {
+                self.advance();
+                SortDirection::Asc
+            }
+            TokenKind::Desc | TokenKind::Descending => {
+                self.advance();
+                SortDirection::Desc
+            }
+            _ => SortDirection::default(),
+        };
+        Ok(SortItem {
+            expression,
+            direction,
+        })
+    }
+
+    fn parse_projection_items(&mut self) -> Result<Vec<ProjectionItem>> {
+        let mut items = vec![self.parse_projection_item()?];
+        while self.current.kind == TokenKind::Comma {
+            self.advance();
+            items.push(self.parse_projection_item()?);
+        }
+        Ok(items)
+    }
+
+    fn parse_projection_item(&mut self) -> Result<ProjectionItem> {
+        let expression = self.parse_expression()?;
+        let alias = if self.current.kind == TokenKind::As {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        Ok(ProjectionItem {
+            expression,
+            alias,
+            span: None,
+        })
+    }
+
+    fn parse_pattern_list(&mut self) -> Result<Vec<Pattern>> {
+        let mut patterns = vec![self.parse_pattern()?];
+        while self.current.kind == TokenKind::Comma {
+            self.advance();
+            patterns.push(self.parse_pattern()?);
+        }
+        Ok(patterns)
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern> {
+        // Check for named path: p = (...)
+        // Allow contextual keywords to be used as path variable names
+        if self.can_be_identifier() && self.peek_kind() == TokenKind::Eq {
+            let name = self.expect_identifier()?;
+            self.expect(TokenKind::Eq)?;
+
+            // Check for path function: shortestPath(...) or allShortestPaths(...)
+            let (path_function, inner_pattern) = self.parse_path_function_or_pattern()?;
+
+            return Ok(Pattern::NamedPath {
+                name,
+                path_function,
+                pattern: Box::new(inner_pattern),
+            });
+        }
+
+        let start = self.parse_node_pattern()?;
+
+        // Check for path continuation
+        if matches!(
+            self.current.kind,
+            TokenKind::Arrow | TokenKind::LeftArrow | TokenKind::Minus | TokenKind::DoubleDash
+        ) {
+            let mut chain = Vec::new();
+            while matches!(
+                self.current.kind,
+                TokenKind::Arrow | TokenKind::LeftArrow | TokenKind::Minus | TokenKind::DoubleDash
+            ) {
+                chain.push(self.parse_relationship_pattern()?);
+            }
+            Ok(Pattern::Path(PathPattern {
+                start,
+                chain,
+                span: None,
+            }))
+        } else {
+            Ok(Pattern::Node(start))
+        }
+    }
+
+    /// Parse an optional path function followed by a pattern.
+    /// Handles: `shortestPath(pattern)`, `allShortestPaths(pattern)`, or just `pattern`
+    fn parse_path_function_or_pattern(&mut self) -> Result<(Option<PathFunction>, Pattern)> {
+        // Check for path function: shortestPath or allShortestPaths
+        if self.can_be_identifier() {
+            let func_name = self.get_identifier_text().to_lowercase();
+            if func_name == "shortestpath" {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let pattern = self.parse_inner_pattern()?;
+                self.expect(TokenKind::RParen)?;
+                return Ok((Some(PathFunction::ShortestPath), pattern));
+            } else if func_name == "allshortestpaths" {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let pattern = self.parse_inner_pattern()?;
+                self.expect(TokenKind::RParen)?;
+                return Ok((Some(PathFunction::AllShortestPaths), pattern));
+            }
+        }
+
+        // No path function, just parse the pattern
+        let pattern = self.parse_inner_pattern()?;
+        Ok((None, pattern))
+    }
+
+    /// Parse a pattern without checking for named paths (to avoid recursion).
+    fn parse_inner_pattern(&mut self) -> Result<Pattern> {
+        let start = self.parse_node_pattern()?;
+
+        // Check for path continuation
+        if matches!(
+            self.current.kind,
+            TokenKind::Arrow | TokenKind::LeftArrow | TokenKind::Minus | TokenKind::DoubleDash
+        ) {
+            let mut chain = Vec::new();
+            while matches!(
+                self.current.kind,
+                TokenKind::Arrow | TokenKind::LeftArrow | TokenKind::Minus | TokenKind::DoubleDash
+            ) {
+                chain.push(self.parse_relationship_pattern()?);
+            }
+            Ok(Pattern::Path(PathPattern {
+                start,
+                chain,
+                span: None,
+            }))
+        } else {
+            Ok(Pattern::Node(start))
+        }
+    }
+
+    fn parse_node_pattern(&mut self) -> Result<NodePattern> {
+        self.expect(TokenKind::LParen)?;
+
+        // Variable can be an identifier or a contextual keyword like 'end'
+        let variable = if self.can_be_identifier() && self.current.kind != TokenKind::Colon {
+            let name = self.get_identifier_text();
+            self.advance();
+            Some(name)
+        } else {
+            None
+        };
+
+        let mut labels = Vec::new();
+        while self.current.kind == TokenKind::Colon {
+            self.advance();
+            labels.push(self.expect_identifier()?);
+        }
+
+        let properties = if self.current.kind == TokenKind::LBrace {
+            self.parse_property_map()?
+        } else {
+            Vec::new()
+        };
+
+        self.expect(TokenKind::RParen)?;
+
+        Ok(NodePattern {
+            variable,
+            labels,
+            properties,
+            span: None,
+        })
+    }
+
+    fn parse_relationship_pattern(&mut self) -> Result<RelationshipPattern> {
+        // Parse direction and relationship details
+        let (direction, has_bracket) = match self.current.kind {
+            TokenKind::Arrow => {
+                // ->
+                self.advance();
+                (Direction::Outgoing, false)
+            }
+            TokenKind::LeftArrow => {
+                // <- possibly followed by - for <-- (anonymous incoming)
+                self.advance();
+                if self.current.kind == TokenKind::LBracket {
+                    // <-[...]- (incoming with bracket details)
+                    (Direction::Incoming, true)
+                } else if self.current.kind == TokenKind::Minus {
+                    // <-- (anonymous incoming shorthand), or <--> (either way)
+                    self.advance();
+                    if self.current.kind == TokenKind::Gt {
+                        self.advance();
+                        (Direction::Undirected, false)
+                    } else {
+                        (Direction::Incoming, false)
+                    }
+                } else if self.current.kind == TokenKind::Arrow {
+                    // <-> (either way)
+                    self.advance();
+                    (Direction::Undirected, false)
+                } else {
+                    (Direction::Incoming, false)
+                }
+            }
+            TokenKind::Minus => {
+                // - followed by [ or > or ->
+                self.advance();
+
+                if self.current.kind == TokenKind::LBracket {
+                    // -[...]- or -[...]->
+                    (Direction::Undirected, true) // Direction will be updated based on closing
+                } else if self.current.kind == TokenKind::Arrow {
+                    // --> (Minus then Arrow): anonymous outgoing shorthand
+                    self.advance();
+                    (Direction::Outgoing, false)
+                } else if self.current.kind == TokenKind::Gt {
+                    // -> (Minus then Gt, fallback)
+                    self.advance();
+                    (Direction::Outgoing, false)
+                } else {
+                    return Err(self.error("Expected relationship pattern"));
+                }
+            }
+            TokenKind::DoubleDash => {
+                // -- or -->
+                self.advance();
+                if self.current.kind == TokenKind::Gt {
+                    // --> anonymous outgoing
+                    self.advance();
+                    (Direction::Outgoing, false)
+                } else {
+                    // -- anonymous undirected
+                    (Direction::Undirected, false)
+                }
+            }
+            _ => return Err(self.error("Expected relationship pattern")),
+        };
+
+        // Parse relationship details [r:TYPE*1..3 {props}]
+        let (variable, types, length, properties, rel_where, final_direction) =
+            if has_bracket || self.current.kind == TokenKind::LBracket {
+                if self.current.kind == TokenKind::LBracket {
+                    self.advance();
+                }
+
+                // Parse optional variable name - could be followed by : for type
+                // Allow contextual keywords like 'end' to be used as variable names
+                let var = if self.can_be_identifier() {
+                    // Check if this is a variable (followed by :, ], {, *, or WHERE)
+                    let is_variable = self.peek_kind() == TokenKind::Colon
+                        || self.peek_kind() == TokenKind::RBracket
+                        || self.peek_kind() == TokenKind::LBrace
+                        || self.peek_kind() == TokenKind::Star
+                        || self.peek_kind() == TokenKind::Where;
+                    if is_variable {
+                        let name = self.get_identifier_text();
+                        self.advance();
+                        Some(name)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let rel_types = self.parse_relationship_types()?;
+
+                // Parse variable length *min..max
+                let len = if self.current.kind == TokenKind::Star {
+                    self.advance();
+                    Some(self.parse_length_range()?)
+                } else {
+                    None
+                };
+
+                let props = if self.current.kind == TokenKind::LBrace {
+                    self.parse_property_map()?
+                } else {
+                    Vec::new()
+                };
+
+                // Parse inline WHERE clause: -[r WHERE expr]->
+                let where_expr = if self.current.kind == TokenKind::Where {
+                    self.advance();
+                    Some(self.parse_expression()?)
+                } else {
+                    None
+                };
+
+                self.expect(TokenKind::RBracket)?;
+
+                // Determine direction from closing symbol: `<-[...]->` points
+                // both ways, which openCypher reads as either direction.
+                let dir = if self.current.kind == TokenKind::Arrow {
+                    self.advance();
+                    if direction == Direction::Incoming {
+                        Direction::Undirected
+                    } else {
+                        Direction::Outgoing
+                    }
+                } else if self.current.kind == TokenKind::Minus {
+                    self.advance();
+                    if direction == Direction::Incoming {
+                        Direction::Incoming
+                    } else {
+                        Direction::Undirected
+                    }
+                } else {
+                    direction
+                };
+
+                (var, rel_types, len, props, where_expr, dir)
+            } else {
+                (None, Vec::new(), None, Vec::new(), None, direction)
+            };
+
+        let target = self.parse_node_pattern()?;
+
+        Ok(RelationshipPattern {
+            variable,
+            types,
+            direction: final_direction,
+            length,
+            properties,
+            where_clause: rel_where,
+            target,
+            span: None,
+        })
+    }
+
+    /// Parses the types of a relationship pattern: none, one (`:KNOWS`), or
+    /// alternatives (`:KNOWS|LIKES`, also written `:KNOWS|:LIKES`), as
+    /// openCypher 9's `RelationshipTypes` writes them. A relationship has
+    /// one type, so a second `:` (`:Graph:CONTAINS`) is an error that names
+    /// the two ways to write what was meant: the quoted name of one type
+    /// with a colon in it, or the alternatives.
+    fn parse_relationship_types(&mut self) -> Result<Vec<String>> {
+        let mut types = Vec::new();
+        if self.current.kind != TokenKind::Colon {
+            return Ok(types);
+        }
+        self.advance();
+        types.push(self.expect_identifier()?);
+        while self.current.kind == TokenKind::Pipe {
+            self.advance();
+            if self.current.kind == TokenKind::Colon {
+                self.advance();
+            }
+            types.push(self.expect_identifier()?);
+        }
+        if self.current.kind == TokenKind::Colon {
+            let colon = self.current.span;
+            self.advance();
+            self.definite_error = true;
+            let first = types.last().map_or("A", String::as_str);
+            let second = if self.can_be_identifier() {
+                self.get_identifier_text()
+            } else {
+                "B".to_string()
+            };
+            return Err(QueryError::new(
+                QueryErrorKind::Syntax,
+                format!(
+                    "[Cypher] A relationship has one type: write :`{first}:{second}` for the \
+                     type named {first}:{second}, or :{first}|{second} to match either type"
+                ),
+            )
+            .with_span(colon)
+            .with_source(self.source.to_string())
+            .into());
+        }
+        Ok(types)
+    }
+
+    fn parse_length_range(&mut self) -> Result<LengthRange> {
+        let min = if self.current.kind == TokenKind::Integer {
+            let val = self.current.text.parse().unwrap_or(1);
+            self.advance();
+            Some(val)
+        } else {
+            None
+        };
+
+        let max = if self.current.kind == TokenKind::DotDot {
+            self.advance();
+            if self.current.kind == TokenKind::Integer {
+                let val = self.current.text.parse().unwrap_or(u32::MAX);
+                self.advance();
+                Some(val)
+            } else {
+                None // Unbounded
+            }
+        } else {
+            min // If no .., max = min (exact length)
+        };
+
+        Ok(LengthRange { min, max })
+    }
+
+    fn parse_property_map(&mut self) -> Result<Vec<(String, Expression)>> {
+        self.expect(TokenKind::LBrace)?;
+
+        let mut props = Vec::new();
+
+        if self.current.kind != TokenKind::RBrace {
+            props.push(self.parse_property_pair()?);
+            while self.current.kind == TokenKind::Comma {
+                self.advance();
+                props.push(self.parse_property_pair()?);
+            }
+        }
+
+        self.expect(TokenKind::RBrace)?;
+        Ok(props)
+    }
+
+    fn parse_property_pair(&mut self) -> Result<(String, Expression)> {
+        let key = self.expect_identifier()?;
+        self.expect(TokenKind::Colon)?;
+        let value = self.parse_expression()?;
+        Ok((key, value))
+    }
+
+    // Expression parsing with precedence climbing
+
+    /// Parses an expression, which nests one level in the expression,
+    /// list, call or clause it is part of.
+    fn parse_expression(&mut self) -> Result<Expression> {
+        self.enter_nesting()?;
+        let expression = self.parse_or_expression()?;
+        self.exit_nesting();
+        Ok(expression)
+    }
+
+    fn parse_or_expression(&mut self) -> Result<Expression> {
+        self.parse_balanced_chain(TokenKind::Or, BinaryOp::Or, Self::parse_xor_expression)
+    }
+
+    fn parse_xor_expression(&mut self) -> Result<Expression> {
+        self.parse_balanced_chain(TokenKind::Xor, BinaryOp::Xor, Self::parse_and_expression)
+    }
+
+    fn parse_and_expression(&mut self) -> Result<Expression> {
+        self.parse_balanced_chain(TokenKind::And, BinaryOp::And, Self::parse_not_expression)
+    }
+
+    /// Parses `operand` joined by `token`, an associative operator, into a
+    /// balanced tree of `op` (see [`Nesting::join_balanced`]): a chain of any
+    /// length stays shallow.
+    fn parse_balanced_chain(
+        &mut self,
+        token: TokenKind,
+        op: BinaryOp,
+        operand: fn(&mut Self) -> Result<Expression>,
+    ) -> Result<Expression> {
+        let chain = self.begin_chain();
+        let first = operand(self)?;
+        if self.current.kind != token {
+            self.end_chain(chain);
+            return Ok(first);
+        }
+        let mut operands = vec![(first, self.nesting.take_operand())];
+        while self.current.kind == token {
+            self.advance();
+            let next = operand(self)?;
+            operands.push((next, self.nesting.take_operand()));
+        }
+        let tree = self
+            .nesting
+            .join_balanced(operands, |left, right| Expression::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            })
+            .ok_or_else(|| self.error(&nesting_error_message()));
+        self.end_chain(chain);
+        tree
+    }
+
+    fn parse_not_expression(&mut self) -> Result<Expression> {
+        if self.current.kind == TokenKind::Not {
+            self.advance();
+            self.enter_nesting()?;
+            let operand = self.parse_not_expression();
+            self.exit_nesting();
+            let operand = operand?;
+            Ok(Expression::Unary {
+                op: UnaryOp::Not,
+                operand: Box::new(operand),
+            })
+        } else {
+            self.parse_comparison_expression()
+        }
+    }
+
+    /// Parses comparisons and the string, list and null predicates. A chain
+    /// of comparisons is the conjunction of its comparisons (openCypher 9,
+    /// "Comparison operators"): `a < b <= c` is `a < b AND b <= c`, which does
+    /// not compare `a` with `c`.
+    fn parse_comparison_expression(&mut self) -> Result<Expression> {
+        let chain = self.begin_chain();
+        let expression = self.parse_comparison_chain()?;
+        self.end_chain(chain);
+        Ok(expression)
+    }
+
+    /// The operands and operators of a chain of comparisons, each operator
+    /// nesting one level (see [`Self::parse_comparison_expression`]). Each
+    /// operand is a predicate expression: `1 = 2 IN [false]` compares 1 with
+    /// `2 IN [false]`.
+    fn parse_comparison_chain(&mut self) -> Result<Expression> {
+        let mut left = self.parse_predicate_expression()?;
+        // The right operand of the comparison `left` ends with, kept when the
+        // next operator is a comparison too, which compares it again.
+        let mut chained_operand: Option<Expression> = None;
+
+        while let Some(op) = comparison_op(self.current.kind) {
+            self.advance();
+            let right = self.parse_predicate_expression()?;
+            let middle = chained_operand.take();
+            if comparison_op(self.current.kind).is_some() {
+                chained_operand = Some(right.clone());
+            }
+            left = match middle {
+                // `a < b <= c` reads `a < b AND b <= c`.
+                Some(middle) => Expression::Binary {
+                    left: Box::new(left),
+                    op: BinaryOp::And,
+                    right: Box::new(Expression::Binary {
+                        left: Box::new(middle),
+                        op,
+                        right: Box::new(right),
+                    }),
+                },
+                None => Expression::Binary {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                },
+            };
+        }
+
+        Ok(left)
+    }
+
+    /// The string, list and null predicates (`IN`, `STARTS WITH`, `ENDS
+    /// WITH`, `CONTAINS`, `=~`, `IS [NOT] NULL`), left to right. They bind
+    /// tighter than the comparisons, as in openCypher 9: `x IN l = true` is
+    /// `(x IN l) = true`.
+    fn parse_predicate_expression(&mut self) -> Result<Expression> {
+        let chain = self.begin_chain();
+        let predicate = self.parse_predicate_chain();
+        self.end_chain(chain);
+        predicate
+    }
+
+    fn parse_predicate_chain(&mut self) -> Result<Expression> {
+        let mut left = self.parse_additive_expression()?;
+        loop {
+            let op = match self.current.kind {
+                TokenKind::In => {
+                    self.advance();
+                    BinaryOp::In
+                }
+                TokenKind::Starts | TokenKind::Ends => {
+                    let op = if self.current.kind == TokenKind::Starts {
+                        BinaryOp::StartsWith
+                    } else {
+                        BinaryOp::EndsWith
+                    };
+                    self.advance();
+                    self.expect(TokenKind::With)?;
+                    op
+                }
+                TokenKind::Contains => {
+                    self.advance();
+                    BinaryOp::Contains
+                }
+                TokenKind::RegexMatch => {
+                    self.advance();
+                    BinaryOp::RegexMatch
+                }
+                TokenKind::Is => {
+                    self.advance();
+                    let not = self.current.kind == TokenKind::Not;
+                    if not {
+                        self.advance();
+                    }
+                    self.expect(TokenKind::Null)?;
+                    self.link_chain()?;
+                    left = Expression::Unary {
+                        op: if not {
+                            UnaryOp::IsNotNull
+                        } else {
+                            UnaryOp::IsNull
+                        },
+                        operand: Box::new(left),
+                    };
+                    continue;
+                }
+                _ => return Ok(left),
+            };
+            let right = self.parse_additive_expression()?;
+            self.link_chain()?;
+            left = Expression::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+    }
+
+    fn parse_additive_expression(&mut self) -> Result<Expression> {
+        let chain = self.begin_chain();
+        let mut left = self.parse_multiplicative_expression()?;
+
+        loop {
+            let op = match self.current.kind {
+                TokenKind::Plus => BinaryOp::Add,
+                TokenKind::Minus => BinaryOp::Sub,
+                _ => break,
+            };
+
+            self.advance();
+            let right = self.parse_multiplicative_expression()?;
+            self.link_chain()?;
+            left = Expression::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        self.end_chain(chain);
+
+        Ok(left)
+    }
+
+    fn parse_multiplicative_expression(&mut self) -> Result<Expression> {
+        let chain = self.begin_chain();
+        let mut left = self.parse_power_expression()?;
+
+        loop {
+            let op = match self.current.kind {
+                TokenKind::Star => BinaryOp::Mul,
+                TokenKind::Slash => BinaryOp::Div,
+                TokenKind::Percent => BinaryOp::Mod,
+                _ => break,
+            };
+
+            self.advance();
+            let right = self.parse_power_expression()?;
+            self.link_chain()?;
+            left = Expression::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        self.end_chain(chain);
+
+        Ok(left)
+    }
+
+    fn parse_power_expression(&mut self) -> Result<Expression> {
+        let mut left = self.parse_unary_expression()?;
+
+        if self.current.kind == TokenKind::Caret {
+            self.advance();
+            // Right associative: each `^` nests one level, so bound the depth.
+            self.enter_nesting()?;
+            let right = self.parse_power_expression();
+            self.exit_nesting();
+            let right = right?;
+            left = Expression::Binary {
+                left: Box::new(left),
+                op: BinaryOp::Pow,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn parse_unary_expression(&mut self) -> Result<Expression> {
+        match self.current.kind {
+            TokenKind::Minus => {
+                self.advance();
+                // Fold -<integer> at parse time to handle i64::MIN correctly
+                if self.current.kind == TokenKind::Integer {
+                    let text = &self.current.text;
+                    if let Ok(val) = format!("-{text}").parse::<i64>() {
+                        self.advance();
+                        return Ok(Expression::Literal(Literal::Integer(val)));
+                    }
+                }
+                if self.current.kind == TokenKind::Float {
+                    let value = self.float_literal()?;
+                    self.advance();
+                    return Ok(Expression::Literal(Literal::Float(-value)));
+                }
+                self.enter_nesting()?;
+                let operand = self.parse_unary_expression();
+                self.exit_nesting();
+                let operand = operand?;
+                Ok(Expression::Unary {
+                    op: UnaryOp::Neg,
+                    operand: Box::new(operand),
+                })
+            }
+            TokenKind::Plus => {
+                self.advance();
+                self.enter_nesting()?;
+                let operand = self.parse_unary_expression();
+                self.exit_nesting();
+                let operand = operand?;
+                Ok(Expression::Unary {
+                    op: UnaryOp::Pos,
+                    operand: Box::new(operand),
+                })
+            }
+            _ => self.parse_postfix_expression(),
+        }
+    }
+
+    fn parse_postfix_expression(&mut self) -> Result<Expression> {
+        // Each property access, subscript and label check nests one level.
+        let chain = self.begin_chain();
+        // Parentheses, lists and maps go around the primary expression's
+        // parser: its frame is large, and each level of a deeply nested
+        // expression would keep one on the stack.
+        // A call (a function, or a form such as reduce or a list predicate)
+        // nests one level more than its arguments: it is parsed in that
+        // large frame.
+        let call = self.can_be_identifier() && self.peek_kind() == TokenKind::LParen;
+        let mut expr = match self.current.kind {
+            TokenKind::LParen => self.parse_parenthesized_expression()?,
+            TokenKind::LBracket => self.parse_list_expression()?,
+            TokenKind::LBrace => self.parse_map_literal()?,
+            _ if call => {
+                self.enter_nesting()?;
+                let call = self.parse_primary_expression();
+                self.exit_nesting();
+                call?
+            }
+            _ => self.parse_primary_expression()?,
+        };
+
+        loop {
+            match self.current.kind {
+                TokenKind::Dot => {
+                    self.advance();
+                    let property = self.expect_identifier()?;
+                    self.link_chain()?;
+                    expr = Expression::PropertyAccess {
+                        base: Box::new(expr),
+                        property,
+                    };
+                }
+                TokenKind::LBracket => {
+                    self.advance();
+                    self.link_chain()?;
+                    // Detect slice: [start..end], [start..], [..end], [..]
+                    if self.current.kind == TokenKind::DotDot {
+                        // [..end] or [..]
+                        self.advance();
+                        let end = if self.current.kind != TokenKind::RBracket {
+                            Some(Box::new(self.parse_expression()?))
+                        } else {
+                            None
+                        };
+                        self.expect(TokenKind::RBracket)?;
+                        expr = Expression::SliceAccess {
+                            base: Box::new(expr),
+                            start: None,
+                            end,
+                        };
+                    } else {
+                        let index = self.parse_expression()?;
+                        if self.current.kind == TokenKind::DotDot {
+                            // [start..end] or [start..]
+                            self.advance();
+                            let end = if self.current.kind != TokenKind::RBracket {
+                                Some(Box::new(self.parse_expression()?))
+                            } else {
+                                None
+                            };
+                            self.expect(TokenKind::RBracket)?;
+                            expr = Expression::SliceAccess {
+                                base: Box::new(expr),
+                                start: Some(Box::new(index)),
+                                end,
+                            };
+                        } else {
+                            // Regular index access
+                            self.expect(TokenKind::RBracket)?;
+                            expr = Expression::IndexAccess {
+                                base: Box::new(expr),
+                                index: Box::new(index),
+                            };
+                        }
+                    }
+                }
+                TokenKind::Colon => {
+                    // n:Label label-check syntax, emits hasLabel() function calls.
+                    // Multiple labels (n:Person:Actor) are ANDead together.
+                    let base = expr;
+                    let mut combined: Option<Expression> = None;
+                    while self.current.kind == TokenKind::Colon {
+                        self.advance();
+                        let label = self.expect_identifier()?;
+                        self.link_chain()?;
+                        let check = Expression::FunctionCall {
+                            name: "hasLabel".to_string(),
+                            distinct: false,
+                            args: vec![base.clone(), Expression::Literal(Literal::String(label))],
+                        };
+                        combined = Some(match combined {
+                            None => check,
+                            Some(prev) => Expression::Binary {
+                                left: Box::new(prev),
+                                op: BinaryOp::And,
+                                right: Box::new(check),
+                            },
+                        });
+                    }
+                    expr = combined
+                        .ok_or_else(|| self.error("expected at least one label after ':'"))?;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        self.end_chain(chain);
+
+        Ok(expr)
+    }
+
+    /// Parses `( ... )` at the start of an expression. A pattern with a
+    /// relationship, `(d)-[:T]->()`, is a pattern predicate: true when it has
+    /// a match, like EXISTS { MATCH (d)-[:T]->() }. Anything else in
+    /// parentheses, including a lone `(n)`, is an expression, which nests one
+    /// level deeper.
+    fn parse_parenthesized_expression(&mut self) -> Result<Expression> {
+        let saved = (
+            self.lexer.clone(),
+            self.current.clone(),
+            self.previous.clone(),
+            self.nesting,
+        );
+        self.definite_error = false;
+        match self.parse_pattern() {
+            Ok(pattern @ Pattern::Path(_)) => {
+                return Ok(Expression::Exists(Box::new(Query {
+                    clauses: vec![Clause::Match(MatchClause {
+                        patterns: vec![pattern],
+                        span: None,
+                    })],
+                    span: None,
+                })));
+            }
+            Err(error) if self.definite_error => return Err(error),
+            _ => {}
+        }
+        (self.lexer, self.current, self.previous, self.nesting) = saved;
+
+        self.expect(TokenKind::LParen)?;
+        let expr = self.parse_expression()?;
+        self.expect(TokenKind::RParen)?;
+        Ok(expr)
+    }
+
+    /// Parses a list literal, a list comprehension or a pattern
+    /// comprehension, from its `[`: each element nests one level deeper.
+    fn parse_list_expression(&mut self) -> Result<Expression> {
+        self.expect(TokenKind::LBracket)?;
+
+        // Detect pattern comprehension: [(pattern) WHERE pred | expr]
+        // A pattern starts with `(`, while list elements starting with `(`
+        // are parenthesized expressions. We use backtracking to distinguish.
+        if self.current.kind == TokenKind::LParen {
+            let saved = (
+                self.lexer.clone(),
+                self.current.clone(),
+                self.previous.clone(),
+                self.nesting,
+            );
+            self.definite_error = false;
+            match self.parse_pattern() {
+                Ok(pattern) => {
+                    let where_clause = if self.current.kind == TokenKind::Where {
+                        self.advance();
+                        Some(Box::new(self.parse_expression()?))
+                    } else {
+                        None
+                    };
+                    if self.current.kind == TokenKind::Pipe {
+                        self.advance();
+                        let projection = self.parse_expression()?;
+                        self.expect(TokenKind::RBracket)?;
+                        return Ok(Expression::PatternComprehension {
+                            pattern: Box::new(pattern),
+                            where_clause,
+                            projection: Box::new(projection),
+                        });
+                    }
+                }
+                Err(error) if self.definite_error => return Err(error),
+                Err(_) => {}
+            }
+            // Not a pattern comprehension, restore and continue
+            (self.lexer, self.current, self.previous, self.nesting) = saved;
+        }
+
+        // Detect list comprehension: [var IN list WHERE pred | expr]
+        if self.can_be_identifier() && self.peek_kind() == TokenKind::In {
+            let variable = self.get_identifier_text();
+            self.advance(); // consume variable
+            self.advance(); // consume IN
+            let list = self.parse_expression()?;
+
+            let filter = if self.current.kind == TokenKind::Where {
+                self.advance();
+                Some(Box::new(self.parse_expression()?))
+            } else {
+                None
+            };
+
+            let projection = if self.current.kind == TokenKind::Pipe {
+                self.advance();
+                Some(Box::new(self.parse_expression()?))
+            } else {
+                None
+            };
+
+            self.expect(TokenKind::RBracket)?;
+            return Ok(Expression::ListComprehension {
+                variable,
+                list: Box::new(list),
+                filter,
+                projection,
+            });
+        }
+
+        // List literal
+        let mut items = Vec::new();
+        if self.current.kind != TokenKind::RBracket {
+            items.push(self.parse_expression()?);
+            while self.current.kind == TokenKind::Comma {
+                self.advance();
+                items.push(self.parse_expression()?);
+            }
+        }
+        self.expect(TokenKind::RBracket)?;
+        Ok(Expression::List(items))
+    }
+
+    /// Parses the arguments of a call of the function `name`, from its `(`.
+    fn parse_function_call(&mut self, name: String) -> Result<Expression> {
+        self.expect(TokenKind::LParen)?;
+        let distinct = if self.current.kind == TokenKind::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let mut args = Vec::new();
+        // Handle count(*) special case
+        if self.current.kind == TokenKind::Star {
+            self.advance();
+            args.push(Expression::Variable("*".to_string()));
+        } else if self.current.kind != TokenKind::RParen {
+            args.push(self.parse_expression()?);
+            while self.current.kind == TokenKind::Comma {
+                self.advance();
+                args.push(self.parse_expression()?);
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+
+        Ok(Expression::FunctionCall {
+            name,
+            distinct,
+            args,
+        })
+    }
+
+    /// Parses a map literal, from its `{`: each value nests one level deeper.
+    fn parse_map_literal(&mut self) -> Result<Expression> {
+        self.expect(TokenKind::LBrace)?;
+        let mut pairs = Vec::new();
+        if self.current.kind != TokenKind::RBrace {
+            let key = self.expect_identifier()?;
+            self.expect(TokenKind::Colon)?;
+            let value = self.parse_expression()?;
+            pairs.push((key, value));
+
+            while self.current.kind == TokenKind::Comma {
+                self.advance();
+                let key = self.expect_identifier()?;
+                self.expect(TokenKind::Colon)?;
+                let value = self.parse_expression()?;
+                pairs.push((key, value));
+            }
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(Expression::Map(pairs))
+    }
+
+    fn parse_primary_expression(&mut self) -> Result<Expression> {
+        match self.current.kind {
+            TokenKind::Null => {
+                self.advance();
+                Ok(Expression::Literal(Literal::Null))
+            }
+            TokenKind::True => {
+                self.advance();
+                Ok(Expression::Literal(Literal::Bool(true)))
+            }
+            TokenKind::False => {
+                self.advance();
+                Ok(Expression::Literal(Literal::Bool(false)))
+            }
+            TokenKind::Integer => {
+                let text = &self.current.text;
+                let value = if text.starts_with("0x") || text.starts_with("0X") {
+                    i64::from_str_radix(&text[2..], 16)
+                } else if text.starts_with("0o") || text.starts_with("0O") {
+                    i64::from_str_radix(&text[2..], 8)
+                } else {
+                    text.parse()
+                }
+                .map_err(|e: std::num::ParseIntError| {
+                    if *e.kind() == std::num::IntErrorKind::PosOverflow
+                        || *e.kind() == std::num::IntErrorKind::NegOverflow
+                    {
+                        self.error(&format!(
+                            "Integer literal '{}' overflows the valid range ({} to {})",
+                            text,
+                            i64::MIN,
+                            i64::MAX
+                        ))
+                    } else {
+                        self.error(&format!("Invalid integer literal: '{}'", text))
+                    }
+                })?;
+                self.advance();
+                Ok(Expression::Literal(Literal::Integer(value)))
+            }
+            TokenKind::Float => {
+                let value = self.float_literal()?;
+                self.advance();
+                Ok(Expression::Literal(Literal::Float(value)))
+            }
+            TokenKind::String => {
+                let text = &self.current.text;
+                let inner = &text[1..text.len() - 1];
+                let value = unescape_string(inner);
+                self.advance();
+                Ok(Expression::Literal(Literal::String(value)))
+            }
+            TokenKind::Dollar => {
+                self.advance();
+                let name = self.expect_identifier()?;
+                Ok(Expression::Parameter(name))
+            }
+            _ if self.can_be_identifier() => {
+                let name = self.get_identifier_text();
+                let lower = name.to_lowercase();
+
+                // IEEE 754 special float literals (only when not a function call)
+                if lower == "nan" && self.peek_kind() != TokenKind::LParen {
+                    self.advance();
+                    return Ok(Expression::Literal(Literal::Float(f64::NAN)));
+                }
+                if (lower == "inf" || lower == "infinity") && self.peek_kind() != TokenKind::LParen
+                {
+                    self.advance();
+                    return Ok(Expression::Literal(Literal::Float(f64::INFINITY)));
+                }
+
+                // Check for list predicate functions: all, any, none, single
+                if matches!(lower.as_str(), "all" | "any" | "none" | "single")
+                    && self.peek_kind() == TokenKind::LParen
+                {
+                    // Tentatively parse as list predicate
+                    // Save state so we can fall back to function call if this is not
+                    // the `var IN list WHERE pred` form.
+                    let saved_lexer = self.lexer.clone();
+                    let saved_current = self.current.clone();
+                    let saved_previous = self.previous.clone();
+
+                    self.advance(); // consume identifier
+                    self.advance(); // consume '('
+
+                    // Expect an identifier (the iteration variable)
+                    if self.can_be_identifier() {
+                        let variable = self.get_identifier_text();
+                        self.advance();
+
+                        if self.current.kind == TokenKind::In {
+                            // This is the list predicate form
+                            self.advance(); // consume IN
+                            let list = self.parse_expression()?;
+                            self.expect(TokenKind::Where)?;
+                            let predicate = self.parse_expression()?;
+                            self.expect(TokenKind::RParen)?;
+
+                            let kind = match lower.as_str() {
+                                "all" => ListPredicateKind::All,
+                                "any" => ListPredicateKind::Any,
+                                "none" => ListPredicateKind::None,
+                                "single" => ListPredicateKind::Single,
+                                _ => unreachable!(),
+                            };
+
+                            return Ok(Expression::ListPredicate {
+                                kind,
+                                variable,
+                                list: Box::new(list),
+                                predicate: Box::new(predicate),
+                            });
+                        }
+                    }
+
+                    // Fall back: restore state and parse as regular identifier/function
+                    self.lexer = saved_lexer;
+                    self.current = saved_current;
+                    self.previous = saved_previous;
+                }
+
+                self.advance();
+
+                // EXISTS { MATCH ... WHERE ... } subquery form
+                if lower == "exists" && self.current.kind == TokenKind::LBrace {
+                    self.enter_subquery()?;
+                    self.advance(); // consume {
+                    let inner_query = self.parse_exists_inner_query()?;
+                    self.expect(TokenKind::RBrace)?;
+                    self.exit_subquery();
+                    return Ok(Expression::Exists(Box::new(inner_query)));
+                }
+
+                // COUNT { MATCH ... WHERE ... } subquery form
+                if lower == "count" && self.current.kind == TokenKind::LBrace {
+                    self.enter_subquery()?;
+                    self.advance(); // consume {
+                    let inner_query = self.parse_exists_inner_query()?;
+                    self.expect(TokenKind::RBrace)?;
+                    self.exit_subquery();
+                    return Ok(Expression::CountSubquery(Box::new(inner_query)));
+                }
+
+                // reduce(acc = init, x IN list | expr)
+                if lower == "reduce" && self.current.kind == TokenKind::LParen {
+                    let saved = (
+                        self.lexer.clone(),
+                        self.current.clone(),
+                        self.previous.clone(),
+                    );
+                    self.advance(); // consume (
+                    if self.can_be_identifier() {
+                        let accumulator = self.get_identifier_text();
+                        self.advance();
+                        if self.current.kind == TokenKind::Eq {
+                            self.advance(); // consume =
+                            let initial = self.parse_expression()?;
+                            if self.current.kind == TokenKind::Comma {
+                                self.advance(); // consume ,
+                                let variable = self.get_identifier_text();
+                                self.advance();
+                                self.expect(TokenKind::In)?;
+                                let list = self.parse_expression()?;
+                                self.expect(TokenKind::Pipe)?;
+                                let expression = self.parse_expression()?;
+                                self.expect(TokenKind::RParen)?;
+                                return Ok(Expression::Reduce {
+                                    accumulator,
+                                    initial: Box::new(initial),
+                                    variable,
+                                    list: Box::new(list),
+                                    expression: Box::new(expression),
+                                });
+                            }
+                        }
+                    }
+                    // Not valid reduce syntax, restore and fall through
+                    (self.lexer, self.current, self.previous) = saved;
+                }
+
+                // Map projection: variable { .prop, key: expr, .* }
+                if self.current.kind == TokenKind::LBrace {
+                    let saved = (
+                        self.lexer.clone(),
+                        self.current.clone(),
+                        self.previous.clone(),
+                    );
+                    self.advance(); // consume {
+                    if self.current.kind == TokenKind::Dot || self.current.kind == TokenKind::RBrace
+                    {
+                        let mut entries = Vec::new();
+                        while self.current.kind != TokenKind::RBrace {
+                            if self.current.kind == TokenKind::Dot {
+                                self.advance();
+                                if self.current.kind == TokenKind::Star {
+                                    self.advance();
+                                    entries.push(MapProjectionEntry::AllProperties);
+                                } else if self.can_be_identifier() {
+                                    let prop = self.get_identifier_text();
+                                    self.advance();
+                                    entries.push(MapProjectionEntry::PropertySelector(prop));
+                                } else {
+                                    break;
+                                }
+                            } else if self.can_be_identifier() {
+                                let key = self.get_identifier_text();
+                                self.advance();
+                                self.expect(TokenKind::Colon)?;
+                                let value = self.parse_expression()?;
+                                entries.push(MapProjectionEntry::LiteralEntry(key, value));
+                            } else {
+                                break;
+                            }
+                            if self.current.kind == TokenKind::Comma {
+                                self.advance();
+                            }
+                        }
+                        if self.current.kind == TokenKind::RBrace {
+                            self.advance();
+                            return Ok(Expression::MapProjection {
+                                base: name,
+                                entries,
+                            });
+                        }
+                    }
+                    // Not valid map projection, restore
+                    (self.lexer, self.current, self.previous) = saved;
+                }
+
+                // Check if function call (its extra level of nesting is
+                // counted where the postfix expression starts)
+                if self.current.kind == TokenKind::LParen {
+                    self.parse_function_call(name)
+                } else {
+                    Ok(Expression::Variable(name))
+                }
+            }
+            TokenKind::LParen => self.parse_parenthesized_expression(),
+            TokenKind::LBracket => self.parse_list_expression(),
+            TokenKind::LBrace => self.parse_map_literal(),
+            TokenKind::Case => {
+                self.advance();
+                self.parse_case_expression()
+            }
+            // COUNT aggregate or COUNT { subquery }
+            TokenKind::Count => {
+                self.advance();
+                if self.current.kind == TokenKind::LBrace {
+                    // COUNT { MATCH ... WHERE ... } subquery
+                    self.advance(); // consume {
+                    let inner_query = self.parse_subquery_body()?;
+                    self.expect(TokenKind::RBrace)?;
+                    Ok(Expression::CountSubquery(Box::new(inner_query)))
+                } else {
+                    self.parse_aggregate_function("count")
+                }
+            }
+            _ => Err(self.error("Expected expression")),
+        }
+    }
+
+    fn parse_aggregate_function(&mut self, name: &str) -> Result<Expression> {
+        self.expect(TokenKind::LParen)?;
+
+        let distinct = if self.current.kind == TokenKind::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let mut args = Vec::new();
+        // Handle COUNT(*) special case
+        if self.current.kind == TokenKind::Star {
+            self.advance();
+            // For COUNT(*), we use a special marker
+            args.push(Expression::Variable("*".to_string()));
+        } else if self.current.kind != TokenKind::RParen {
+            args.push(self.parse_expression()?);
+            while self.current.kind == TokenKind::Comma {
+                self.advance();
+                args.push(self.parse_expression()?);
+            }
+        }
+
+        self.expect(TokenKind::RParen)?;
+
+        Ok(Expression::FunctionCall {
+            name: name.to_string(),
+            distinct,
+            args,
+        })
+    }
+
+    fn parse_case_expression(&mut self) -> Result<Expression> {
+        self.enter_nesting()?;
+
+        let input = if self.current.kind != TokenKind::When {
+            Some(Box::new(self.parse_expression()?))
+        } else {
+            None
+        };
+
+        let mut whens = Vec::new();
+        while self.current.kind == TokenKind::When {
+            self.advance();
+            let when_expr = self.parse_expression()?;
+            self.expect(TokenKind::Then)?;
+            let then_expr = self.parse_expression()?;
+            whens.push((when_expr, then_expr));
+        }
+
+        let else_clause = if self.current.kind == TokenKind::Else {
+            self.advance();
+            Some(Box::new(self.parse_expression()?))
+        } else {
+            None
+        };
+
+        self.expect(TokenKind::End)?;
+        self.exit_nesting();
+
+        Ok(Expression::Case {
+            input,
+            whens,
+            else_clause,
+        })
+    }
+
+    // Helper methods
+    fn advance(&mut self) {
+        self.previous = std::mem::replace(&mut self.current, self.lexer.next_token());
+    }
+
+    fn expect(&mut self, kind: TokenKind) -> Result<()> {
+        if self.current.kind == kind {
+            self.advance();
+            Ok(())
+        } else {
+            Err(self.error(&format!("Expected {:?}", kind)))
+        }
+    }
+
+    /// Parses the variable scope clause of `CALL (a, b) { ... }`: the names
+    /// in parentheses, `*` for all outer variables, none for `()`.
+    fn parse_call_scope(&mut self) -> Result<Vec<String>> {
+        self.expect(TokenKind::LParen)?;
+        let mut names = Vec::new();
+        if self.current.kind == TokenKind::Star {
+            self.advance();
+            names.push("*".to_string());
+        } else if self.current.kind != TokenKind::RParen {
+            loop {
+                names.push(self.expect_identifier()?);
+                if self.current.kind != TokenKind::Comma {
+                    break;
+                }
+                self.advance();
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(names)
+    }
+
+    fn expect_identifier(&mut self) -> Result<String> {
+        if self.can_be_identifier() {
+            let text = self.get_identifier_text();
+            self.advance();
+            Ok(text)
+        } else {
+            Err(self.error("Expected identifier"))
+        }
+    }
+
+    /// Check if the current token can be used as an identifier.
+    /// This includes true identifiers and contextual keywords that can be used as names.
+    fn can_be_identifier(&self) -> bool {
+        matches!(
+            self.current.kind,
+            TokenKind::Identifier
+                | TokenKind::QuotedIdentifier
+                // Contextual keywords that can be used as identifiers
+                | TokenKind::End
+                | TokenKind::Count
+                | TokenKind::Starts
+                | TokenKind::Ends
+                | TokenKind::Contains
+                | TokenKind::All
+                | TokenKind::Asc
+                | TokenKind::Desc
+                | TokenKind::Ascending
+                | TokenKind::Descending
+                | TokenKind::On
+                | TokenKind::Call
+                | TokenKind::Yield
+                | TokenKind::Exists
+                | TokenKind::Order
+                | TokenKind::By
+                | TokenKind::Skip
+                | TokenKind::Limit
+        )
+    }
+
+    /// Get the text of the current token as an identifier: a quoted one
+    /// without its backticks, and a doubled backtick inside is one backtick
+    /// (`` `a``b` `` is ``a`b``).
+    fn get_identifier_text(&self) -> String {
+        let text = &self.current.text;
+        if self.current.kind == TokenKind::QuotedIdentifier {
+            text[1..text.len() - 1].replace("``", "`")
+        } else {
+            text.clone()
+        }
+    }
+
+    fn peek_kind(&mut self) -> TokenKind {
+        // Lookahead - we need to save and restore state
+        let saved_pos = self.lexer.clone();
+        let token = self.lexer.next_token();
+        let kind = token.kind;
+        self.lexer = saved_pos;
+        kind
+    }
+
+    fn peek_text_eq_ignore_case(&mut self, expected: &str) -> bool {
+        let saved_pos = self.lexer.clone();
+        let token = self.lexer.next_token();
+        let matches = token.text.eq_ignore_ascii_case(expected);
+        self.lexer = saved_pos;
+        matches
+    }
+
+    fn skip_semicolons(&mut self) {
+        while self.current.kind == TokenKind::Semicolon {
+            self.advance();
+        }
+    }
+
+    /// Expects the current token to be an identifier matching `expected` (case-insensitive).
+    fn expect_contextual(&mut self, expected: &str) -> Result<()> {
+        if self.can_be_identifier() && self.get_identifier_text().eq_ignore_ascii_case(expected) {
+            self.advance();
+            Ok(())
+        } else {
+            Err(self.error(&format!("Expected '{expected}'")))
+        }
+    }
+
+    /// Checks if the current token is a contextual keyword (case-insensitive).
+    fn is_contextual(&self, keyword: &str) -> bool {
+        self.current.kind == TokenKind::Identifier
+            && self.current.text.eq_ignore_ascii_case(keyword)
+    }
+
+    /// Parses IF NOT EXISTS, returns true if present.
+    fn parse_if_not_exists(&mut self) -> bool {
+        if self.current.kind == TokenKind::Identifier
+            && self.current.text.eq_ignore_ascii_case("IF")
+        {
+            let saved = self.lexer.clone();
+            let saved_cur = self.current.clone();
+            self.advance();
+            if self.current.kind == TokenKind::Not {
+                self.advance();
+                if self.current.kind == TokenKind::Exists {
+                    self.advance();
+                    return true;
+                }
+            }
+            // Rewind
+            self.lexer = saved;
+            self.current = saved_cur;
+        }
+        false
+    }
+
+    /// Parses IF EXISTS, returns true if present.
+    fn parse_if_exists(&mut self) -> bool {
+        if self.current.kind == TokenKind::Identifier
+            && self.current.text.eq_ignore_ascii_case("IF")
+        {
+            let saved = self.lexer.clone();
+            let saved_cur = self.current.clone();
+            self.advance();
+            if self.current.kind == TokenKind::Exists {
+                self.advance();
+                return true;
+            }
+            // Rewind
+            self.lexer = saved;
+            self.current = saved_cur;
+        }
+        false
+    }
+
+    // ========================================================================
+    // Schema DDL parsing
+    // ========================================================================
+
+    /// Parses CREATE INDEX or CREATE CONSTRAINT.
+    fn parse_schema_create(&mut self) -> Result<Statement> {
+        self.expect(TokenKind::Create)?; // consume CREATE
+
+        if self.is_contextual("INDEX") {
+            self.advance();
+            self.parse_create_index()
+        } else if self.is_contextual("CONSTRAINT") {
+            self.advance();
+            self.parse_create_constraint()
+        } else {
+            Err(self.error("Expected INDEX or CONSTRAINT after CREATE"))
+        }
+    }
+
+    /// CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.property)
+    /// [USING TEXT|VECTOR|BTREE [{options}]]: an index without a name is
+    /// named `Label_property_index`.
+    fn parse_create_index(&mut self) -> Result<Statement> {
+        let name = self.parse_optional_schema_name()?;
+        let if_not_exists = self.parse_if_not_exists();
+
+        self.expect_contextual("FOR")?;
+        self.expect(TokenKind::LParen)?;
+        let _var = self.expect_identifier()?;
+        self.expect(TokenKind::Colon)?;
+        let label = self.expect_identifier()?;
+        self.expect(TokenKind::RParen)?;
+
+        self.expect_contextual("ON")?;
+        self.expect(TokenKind::LParen)?;
+        let mut properties = Vec::new();
+        loop {
+            let _prop_var = self.expect_identifier()?;
+            self.expect(TokenKind::Dot)?;
+            properties.push(self.expect_identifier()?);
+            if self.current.kind != TokenKind::Comma {
+                break;
+            }
+            self.advance();
+        }
+        self.expect(TokenKind::RParen)?;
+        let (index_kind, options) = self.parse_index_using()?;
+        let name = name.unwrap_or_else(|| format!("{label}_{}_index", properties.join("_")));
+
+        use crate::query::schema as gql;
+        Ok(Statement::Schema(gql::SchemaStatement::CreateIndex(
+            gql::CreateIndexStatement {
+                name,
+                index_kind,
+                label,
+                properties,
+                options,
+                if_not_exists,
+                span: None,
+            },
+        )))
+    }
+
+    /// `USING TEXT|VECTOR|BTREE [{name: value, ...}]` after CREATE INDEX, as
+    /// in GQL: the kind and its options, which [`IndexOptions::set`] checks
+    /// for both languages. Without USING, a property index.
+    ///
+    /// [`IndexOptions::set`]: crate::query::schema::IndexOptions::set
+    fn parse_index_using(
+        &mut self,
+    ) -> Result<(
+        crate::query::schema::IndexKind,
+        crate::query::schema::IndexOptions,
+    )> {
+        use crate::query::schema::{IndexKind, IndexOptions};
+
+        let mut options = IndexOptions::default();
+        if !self.is_contextual("USING") {
+            return Ok((IndexKind::Property, options));
+        }
+        self.advance();
+        let kind_text = self
+            .expect_identifier()
+            .map_err(|_| self.error("Expected TEXT, VECTOR, or BTREE after USING"))?;
+        let kind = IndexKind::from_using_name(&kind_text)
+            .ok_or_else(|| self.error(&format!("Unknown index type '{kind_text}'")))?;
+        if matches!(kind, IndexKind::Text | IndexKind::Vector)
+            && self.current.kind == TokenKind::LBrace
+        {
+            self.advance();
+            while self.current.kind != TokenKind::RBrace {
+                let name = self
+                    .expect_identifier()
+                    .map_err(|_| self.error("Expected option name"))?;
+                self.expect(TokenKind::Colon)?;
+                let value = index_option_value(self.parse_expression()?);
+                options
+                    .set(kind, &name, value)
+                    .map_err(|message| self.error(&message))?;
+                if self.current.kind != TokenKind::Comma {
+                    break;
+                }
+                self.advance();
+            }
+            self.expect(TokenKind::RBrace)?;
+        }
+        Ok((kind, options))
+    }
+
+    /// CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE n.property
+    /// IS UNIQUE: a constraint without a name gets the default name GQL gives
+    /// one (`Label_property_unique`).
+    fn parse_create_constraint(&mut self) -> Result<Statement> {
+        let name = self.parse_optional_schema_name()?;
+        let if_not_exists = self.parse_if_not_exists();
+
+        self.expect_contextual("FOR")?;
+        self.expect(TokenKind::LParen)?;
+        let var = self.expect_identifier()?;
+        self.expect(TokenKind::Colon)?;
+        let label = self.expect_identifier()?;
+        self.expect(TokenKind::RParen)?;
+
+        self.expect_contextual("REQUIRE")?;
+
+        // Parse property references: n.prop1, n.prop2, ...
+        // or (n.prop1, n.prop2, ...)
+        let has_parens = self.current.kind == TokenKind::LParen;
+        if has_parens {
+            self.advance();
+        }
+        let mut properties = Vec::new();
+        loop {
+            // Expect var.prop or just prop
+            if self.can_be_identifier()
+                && self.get_identifier_text().eq_ignore_ascii_case(&var)
+                && self.peek_kind() == TokenKind::Dot
+            {
+                self.advance(); // skip var
+                self.advance(); // skip dot
+            }
+            properties.push(self.expect_identifier()?);
+            if self.current.kind != TokenKind::Comma {
+                break;
+            }
+            self.advance();
+        }
+        if has_parens {
+            self.expect(TokenKind::RParen)?;
+        }
+
+        // Parse constraint kind: IS UNIQUE, IS NOT NULL, IS NODE KEY
+        use crate::query::schema as gql;
+        let constraint_kind = if self.current.kind == TokenKind::Is {
+            self.advance();
+            if self.is_contextual("UNIQUE") {
+                self.advance();
+                gql::ConstraintKind::Unique
+            } else if self.current.kind == TokenKind::Not {
+                self.advance();
+                self.expect(TokenKind::Null)?;
+                gql::ConstraintKind::NotNull
+            } else if self.is_contextual("NODE") {
+                self.advance();
+                self.expect_contextual("KEY")?;
+                gql::ConstraintKind::NodeKey
+            } else {
+                return Err(self.error("Expected UNIQUE, NOT NULL, or NODE KEY after IS"));
+            }
+        } else {
+            return Err(self.error("Expected IS after property reference"));
+        };
+
+        Ok(Statement::Schema(gql::SchemaStatement::CreateConstraint(
+            gql::CreateConstraintStatement {
+                name,
+                constraint_kind,
+                label,
+                properties,
+                if_not_exists,
+                span: None,
+            },
+        )))
+    }
+
+    /// The name of a `CREATE INDEX` or `CREATE CONSTRAINT`, which may be left
+    /// out: none when `FOR` or `IF NOT EXISTS` follows.
+    fn parse_optional_schema_name(&mut self) -> Result<Option<String>> {
+        let unnamed = self.is_contextual("FOR")
+            || (self.is_contextual("IF") && self.peek_kind() == TokenKind::Not);
+        if unnamed {
+            return Ok(None);
+        }
+        self.expect_identifier().map(Some)
+    }
+
+    /// DROP INDEX name [IF EXISTS] / DROP CONSTRAINT name [IF EXISTS]
+    fn try_parse_schema_drop(&mut self) -> Result<Option<Statement>> {
+        // Current token is "DROP" identifier
+        let saved_lexer = self.lexer.clone();
+        let saved_cur = self.current.clone();
+        self.advance(); // consume DROP
+
+        use crate::query::schema as gql;
+
+        if self.is_contextual("INDEX") {
+            self.advance();
+            let name = self.expect_identifier()?;
+            let if_exists = self.parse_if_exists();
+            Ok(Some(Statement::Schema(gql::SchemaStatement::DropIndex {
+                name,
+                if_exists,
+            })))
+        } else if self.is_contextual("CONSTRAINT") {
+            self.advance();
+            let name = self.expect_identifier()?;
+            let if_exists = self.parse_if_exists();
+            Ok(Some(Statement::Schema(
+                gql::SchemaStatement::DropConstraint { name, if_exists },
+            )))
+        } else {
+            // Not a schema DROP, rewind
+            self.lexer = saved_lexer;
+            self.current = saved_cur;
+            Ok(None)
+        }
+    }
+
+    /// SHOW INDEXES / SHOW CONSTRAINTS / SHOW CURRENT GRAPH TYPE
+    fn try_parse_show(&mut self) -> Result<Option<Statement>> {
+        let saved_lexer = self.lexer.clone();
+        let saved_cur = self.current.clone();
+        self.advance(); // consume SHOW
+
+        if self.is_contextual("INDEXES") || self.is_contextual("INDEX") {
+            self.advance();
+            Ok(Some(Statement::ShowIndexes))
+        } else if self.is_contextual("CONSTRAINTS") || self.is_contextual("CONSTRAINT") {
+            self.advance();
+            Ok(Some(Statement::ShowConstraints))
+        } else if self.is_contextual("CURRENT") {
+            // SHOW CURRENT GRAPH TYPE
+            self.advance(); // consume CURRENT
+            self.expect_contextual("GRAPH")?;
+            self.expect_contextual("TYPE")?;
+            Ok(Some(Statement::ShowCurrentGraphType))
+        } else {
+            // Not a SHOW command, rewind
+            self.lexer = saved_lexer;
+            self.current = saved_cur;
+            Ok(None)
+        }
+    }
+
+    /// ALTER CURRENT GRAPH TYPE SET/ADD/DROP { ... }
+    ///
+    /// Neo4j uses `ALTER CURRENT GRAPH TYPE` instead of GQL's `ALTER GRAPH TYPE <name>`.
+    /// Maps to `AlterGraphTypeStatement` with the sentinel name `__current__`.
+    ///
+    /// - `SET { ... }` replaces the entire graph type (or_replace CREATE).
+    /// - `ADD { ... }` adds node/edge types via AlterGraphType alterations.
+    /// - `DROP { ... }` removes node/edge types via AlterGraphType alterations.
+    fn try_parse_alter_current_graph_type(&mut self) -> Result<Option<Statement>> {
+        let saved_lexer = self.lexer.clone();
+        let saved_cur = self.current.clone();
+        self.advance(); // consume ALTER
+
+        // Check for CURRENT GRAPH TYPE sequence
+        if !self.is_contextual("CURRENT") {
+            self.lexer = saved_lexer;
+            self.current = saved_cur;
+            return Ok(None);
+        }
+        self.advance(); // consume CURRENT
+
+        if !self.is_contextual("GRAPH") {
+            self.lexer = saved_lexer;
+            self.current = saved_cur;
+            return Ok(None);
+        }
+        self.advance(); // consume GRAPH
+
+        self.expect_contextual("TYPE")?;
+
+        use crate::query::schema as gql;
+
+        // Determine the operation: SET, ADD, or DROP
+        if self.current.kind == TokenKind::Set {
+            self.advance(); // consume SET
+            let (node_types, edge_types) = self.parse_inline_graph_type_body()?;
+            // SET replaces the entire graph type: map to CreateGraphType with or_replace=true
+            Ok(Some(Statement::Schema(
+                gql::SchemaStatement::CreateGraphType(gql::CreateGraphTypeStatement {
+                    name: "__current__".to_string(),
+                    node_types: node_types.iter().map(|t| t.name().to_string()).collect(),
+                    edge_types: edge_types.iter().map(|t| t.name().to_string()).collect(),
+                    inline_types: node_types.into_iter().chain(edge_types).collect(),
+                    like_graph: None,
+                    open: false,
+                    if_not_exists: false,
+                    or_replace: true,
+                    span: None,
+                }),
+            )))
+        } else if self.is_contextual("ADD") {
+            self.advance(); // consume ADD
+            let (node_types, edge_types) = self.parse_inline_graph_type_body()?;
+            let mut alterations = Vec::new();
+            for nt in &node_types {
+                alterations.push(gql::GraphTypeAlteration::AddNodeType(nt.name().to_string()));
+            }
+            for et in &edge_types {
+                alterations.push(gql::GraphTypeAlteration::AddEdgeType(et.name().to_string()));
+            }
+            Ok(Some(Statement::Schema(
+                gql::SchemaStatement::AlterGraphType(gql::AlterGraphTypeStatement {
+                    name: "__current__".to_string(),
+                    alterations,
+                    span: None,
+                }),
+            )))
+        } else if self.current.kind == TokenKind::Identifier
+            && self.current.text.eq_ignore_ascii_case("DROP")
+        {
+            self.advance(); // consume DROP
+            let (node_types, edge_types) = self.parse_inline_graph_type_body()?;
+            let mut alterations = Vec::new();
+            for nt in &node_types {
+                alterations.push(gql::GraphTypeAlteration::DropNodeType(
+                    nt.name().to_string(),
+                ));
+            }
+            for et in &edge_types {
+                alterations.push(gql::GraphTypeAlteration::DropEdgeType(
+                    et.name().to_string(),
+                ));
+            }
+            Ok(Some(Statement::Schema(
+                gql::SchemaStatement::AlterGraphType(gql::AlterGraphTypeStatement {
+                    name: "__current__".to_string(),
+                    alterations,
+                    span: None,
+                }),
+            )))
+        } else {
+            Err(self.error("Expected SET, ADD, or DROP after ALTER CURRENT GRAPH TYPE"))
+        }
+    }
+
+    /// Parses the Neo4j inline graph type body: `{ type_elements, ... }`.
+    ///
+    /// Each element is one of:
+    /// - `(:Label { prop TYPE [NOT NULL], ... })` for a node type
+    /// - `(:Src)-[:Type { prop TYPE, ... }]->(:Dst)` for an edge type with endpoints
+    /// - `(:Label)` for a node type without properties
+    ///
+    /// Property types support both `prop TYPE` (GQL) and `prop :: TYPE` (Neo4j) syntax.
+    fn parse_inline_graph_type_body(
+        &mut self,
+    ) -> Result<(
+        Vec<crate::query::schema::InlineElementType>,
+        Vec<crate::query::schema::InlineElementType>,
+    )> {
+        use crate::query::schema::InlineElementType;
+
+        self.expect(TokenKind::LBrace)?;
+
+        let mut node_types = Vec::new();
+        let mut edge_types = Vec::new();
+
+        while self.current.kind != TokenKind::RBrace && self.current.kind != TokenKind::Eof {
+            // Each element starts with a node pattern: (...)
+            let element = self.parse_inline_type_element()?;
+            match element {
+                InlineElementType::Node { .. } => node_types.push(element),
+                InlineElementType::Edge { .. } => edge_types.push(element),
+            }
+
+            // Optional comma between elements
+            if self.current.kind == TokenKind::Comma {
+                self.advance();
+            }
+        }
+
+        self.expect(TokenKind::RBrace)?;
+        Ok((node_types, edge_types))
+    }
+
+    /// Parses a single inline type element.
+    ///
+    /// Starting from `(`, determines whether it is a node type or an edge type
+    /// by looking for a following `-[` pattern.
+    fn parse_inline_type_element(&mut self) -> Result<crate::query::schema::InlineElementType> {
+        use crate::query::schema::InlineElementType;
+
+        self.expect(TokenKind::LParen)?;
+
+        // Parse the node label: :Label
+        self.expect(TokenKind::Colon)?;
+        let label = self.expect_identifier()?;
+
+        // Parse optional properties: { prop TYPE [NOT NULL], ... }
+        let properties = if self.current.kind == TokenKind::LBrace {
+            self.parse_inline_property_defs()?
+        } else {
+            Vec::new()
+        };
+
+        self.expect(TokenKind::RParen)?;
+
+        // Check if this is an edge pattern: (...)-[:TYPE]->(...) or (...)<-[:TYPE]-(...)
+        if self.current.kind == TokenKind::Minus
+            || self.current.kind == TokenKind::Arrow
+            || self.current.kind == TokenKind::LeftArrow
+            || self.current.kind == TokenKind::DoubleDash
+        {
+            // This node is the source of an edge type
+            let source_label = label;
+            let source_props = properties;
+
+            // Parse the edge direction and type
+            self.parse_inline_edge_type(source_label, source_props)
+        } else {
+            // Stand-alone node type
+            Ok(InlineElementType::Node {
+                name: label,
+                properties,
+                key_labels: Vec::new(),
+                is_reference: false,
+            })
+        }
+    }
+
+    /// Parses an inline edge type pattern after the source node has been parsed.
+    ///
+    /// Handles: `(...)-[:TYPE { props }]->(:Dst)` and `(...)<-[:TYPE { props }]-(:Dst)`
+    fn parse_inline_edge_type(
+        &mut self,
+        source_label: String,
+        _source_props: Vec<crate::query::schema::PropertyDefinition>,
+    ) -> Result<crate::query::schema::InlineElementType> {
+        use crate::query::schema::InlineElementType;
+
+        // Determine direction and consume leading arrow part
+        let (is_outgoing, _is_undirected) = match self.current.kind {
+            TokenKind::Minus => {
+                // - followed by [ => outgoing: -[:TYPE]-> or undirected: -[:TYPE]-
+                self.advance(); // consume -
+                (true, false)
+            }
+            TokenKind::LeftArrow => {
+                // <- is incoming: <-[:TYPE]-
+                self.advance(); // consume <-
+                (false, false)
+            }
+            TokenKind::DoubleDash => {
+                // -- undirected (edge without brackets)
+                self.advance();
+                (true, true)
+            }
+            _ => return Err(self.error("Expected edge pattern (-, <-, or --)")),
+        };
+
+        // Parse edge type: [:TYPE { props }]
+        self.expect(TokenKind::LBracket)?;
+        self.expect(TokenKind::Colon)?;
+        let edge_label = self.expect_identifier()?;
+
+        let edge_props = if self.current.kind == TokenKind::LBrace {
+            self.parse_inline_property_defs()?
+        } else {
+            Vec::new()
+        };
+
+        self.expect(TokenKind::RBracket)?;
+
+        // Consume trailing arrow
+        if self.current.kind == TokenKind::Arrow {
+            self.advance(); // consume ->
+        } else if self.current.kind == TokenKind::Minus {
+            self.advance(); // consume - (undirected or incoming closing)
+        }
+
+        // Parse target node: (:Label)
+        self.expect(TokenKind::LParen)?;
+        self.expect(TokenKind::Colon)?;
+        let target_label = self.expect_identifier()?;
+        self.expect(TokenKind::RParen)?;
+
+        let (src_types, tgt_types) = if is_outgoing {
+            (vec![source_label], vec![target_label])
+        } else {
+            (vec![target_label], vec![source_label])
+        };
+
+        Ok(InlineElementType::Edge {
+            name: edge_label,
+            properties: edge_props,
+            key_labels: Vec::new(),
+            source_node_types: src_types,
+            target_node_types: tgt_types,
+            is_reference: false,
+        })
+    }
+
+    /// Reads the same scalar, temporal and nested list property types as GQL,
+    /// by the rules of `query::schema` (the depth of `LIST<...>` levels, the
+    /// two-word `DATETIME` types). List levels are counted rather than
+    /// recursed into. A quoted name stays one name.
+    fn parse_property_type_name(&mut self) -> Result<String> {
+        use crate::query::schema::{
+            datetime_type_prefix, list_type_depth_error, property_type_kind, unknown_property_type,
+        };
+
+        let mut levels = 0;
+        let mut data_type = loop {
+            let quoted = self.current.kind == TokenKind::QuotedIdentifier;
+            let mut name = self.expect_identifier()?;
+            if !quoted && name.eq_ignore_ascii_case("LIST") && self.current.kind == TokenKind::Lt {
+                levels += 1;
+                if let Some(message) = list_type_depth_error(levels) {
+                    return Err(self.error(&message));
+                }
+                self.advance(); // <
+                continue;
+            }
+            if !quoted && let Some(prefix) = datetime_type_prefix(&name) {
+                if !self.is_contextual("DATETIME") {
+                    return Err(self.error(&format!("Expected DATETIME after {prefix}")));
+                }
+                self.advance();
+                break format!("{prefix} DATETIME");
+            }
+            if property_type_kind(&name).is_none() {
+                return Err(self.error(&unknown_property_type(&name)));
+            }
+            // DECIMAL(precision[, scale]), spelled as the catalog prints it.
+            if self.current.kind == TokenKind::LParen
+                && grafeo_common::types::DecimalType::from_name(&name) == Some(None)
+            {
+                let mut written = format!("{name}(");
+                self.advance();
+                while !matches!(self.current.kind, TokenKind::RParen | TokenKind::Eof) {
+                    written.push_str(&self.current.text);
+                    self.advance();
+                }
+                self.expect(TokenKind::RParen)?;
+                written.push(')');
+                name = match grafeo_common::types::DecimalType::from_name(&written) {
+                    Some(Some(decimal)) => decimal.to_string(),
+                    _ => {
+                        return Err(self.error(&format!(
+                            "{written}: {}",
+                            grafeo_common::types::DecimalError::InvalidPrecision
+                        )));
+                    }
+                };
+            }
+            break name;
+        };
+        for _ in 0..levels {
+            if self.current.kind != TokenKind::Gt {
+                return Err(self.error(&format!("Expected '>' to close LIST<{data_type}")));
+            }
+            self.advance();
+            data_type = format!("LIST<{data_type}>");
+        }
+        Ok(data_type)
+    }
+
+    /// Parses inline property definitions: `{ prop TYPE [NOT NULL], ... }`
+    ///
+    /// Supports both GQL-style (`prop TYPE`) and Neo4j-style (`prop :: TYPE`).
+    fn parse_inline_property_defs(
+        &mut self,
+    ) -> Result<Vec<crate::query::schema::PropertyDefinition>> {
+        use crate::query::schema::PropertyDefinition;
+
+        self.expect(TokenKind::LBrace)?;
+
+        let mut props = Vec::new();
+
+        while self.current.kind != TokenKind::RBrace && self.current.kind != TokenKind::Eof {
+            let prop_name = self.expect_identifier()?;
+
+            // Support both `prop TYPE` and `prop :: TYPE` syntax
+            if self.current.kind == TokenKind::Colon && self.peek_kind() == TokenKind::Colon {
+                self.advance(); // consume first :
+                self.advance(); // consume second :
+            }
+
+            let data_type = self.parse_property_type_name()?;
+
+            // Optional NOT NULL
+            let nullable = if self.current.kind == TokenKind::Not {
+                self.advance();
+                self.expect(TokenKind::Null)?;
+                false
+            } else {
+                true
+            };
+
+            props.push(PropertyDefinition {
+                name: prop_name,
+                data_type,
+                nullable,
+                default_value: None,
+            });
+
+            // Optional comma
+            if self.current.kind == TokenKind::Comma {
+                self.advance();
+            }
+        }
+
+        self.expect(TokenKind::RBrace)?;
+        Ok(props)
+    }
+
+    fn error(&self, message: &str) -> grafeo_common::utils::error::Error {
+        QueryError::new(QueryErrorKind::Syntax, format!("[Cypher] {message}"))
+            .with_span(self.current.span)
+            .with_source(self.source.to_string())
+            .into()
+    }
+
+    /// The value of the float literal at the current token. openCypher
+    /// refuses a literal outside the FLOAT range, as `1e400`, when it parses
+    /// the query ("floating point number is too large"), so it is no
+    /// infinity.
+    fn float_literal(&self) -> Result<f64> {
+        let text = &self.current.text;
+        let value: f64 = text.parse().map_err(|_: std::num::ParseFloatError| {
+            self.error(&format!("Invalid float literal: '{text}'"))
+        })?;
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(self.error(&format!(
+                "Float literal '{text}' is too large: it is outside the FLOAT range"
+            )))
+        }
+    }
+}
+
+/// The comparison a token stands for (`=`, `<>`, `<`, `<=`, `>`, `>=`): the
+/// operators a chain of comparisons links.
+fn comparison_op(kind: TokenKind) -> Option<BinaryOp> {
+    match kind {
+        TokenKind::Eq => Some(BinaryOp::Eq),
+        TokenKind::Ne => Some(BinaryOp::Ne),
+        TokenKind::Lt => Some(BinaryOp::Lt),
+        TokenKind::Le => Some(BinaryOp::Le),
+        TokenKind::Gt => Some(BinaryOp::Gt),
+        TokenKind::Ge => Some(BinaryOp::Ge),
+        _ => None,
+    }
+}
+
+/// The value written for an index option: a literal, a negated number or a
+/// list of them; anything else is [`IndexOptionValue::Other`], which
+/// `IndexOptions::set` refuses with the type the option wants.
+fn index_option_value(expression: Expression) -> IndexOptionValue {
+    match expression {
+        Expression::Literal(Literal::Integer(n)) => IndexOptionValue::Integer(n),
+        Expression::Literal(Literal::Float(f)) => IndexOptionValue::Float(f),
+        Expression::Literal(Literal::String(s)) => IndexOptionValue::String(s),
+        Expression::Unary {
+            op: UnaryOp::Neg,
+            operand,
+            ..
+        } => match index_option_value(*operand) {
+            IndexOptionValue::Integer(n) => n
+                .checked_neg()
+                .map_or(IndexOptionValue::Other, IndexOptionValue::Integer),
+            IndexOptionValue::Float(f) => IndexOptionValue::Float(-f),
+            _ => IndexOptionValue::Other,
+        },
+        Expression::List(items) => {
+            IndexOptionValue::List(items.into_iter().map(index_option_value).collect())
+        }
+        _ => IndexOptionValue::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to parse and expect success
+    fn parse_ok(query: &str) -> Statement {
+        let mut parser = Parser::new(query);
+        parser
+            .parse()
+            .unwrap_or_else(|_| panic!("Failed to parse: {query}"))
+    }
+
+    // Helper to parse and expect failure
+    fn parse_err(query: &str) {
+        let mut parser = Parser::new(query);
+        assert!(
+            parser.parse().is_err(),
+            "Expected parse error for: {}",
+            query
+        );
+    }
+
+    // ==================== MATCH Clause Tests ====================
+
+    #[test]
+    fn test_parse_simple_match() {
+        let stmt = parse_ok("MATCH (n) RETURN n");
+        assert!(matches!(stmt, Statement::Query(_)));
+    }
+
+    #[test]
+    fn test_parse_match_with_label() {
+        let stmt = parse_ok("MATCH (n:Person) RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[0], Clause::Match(_)));
+        } else {
+            panic!("Expected Query");
+        }
+    }
+
+    #[test]
+    fn test_parse_match_with_multiple_labels() {
+        let stmt = parse_ok("MATCH (n:Person:Employee) RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Node(node) = &patterns[0] {
+                assert_eq!(node.labels.len(), 2);
+                assert_eq!(node.labels[0], "Person");
+                assert_eq!(node.labels[1], "Employee");
+            } else {
+                panic!("Expected Node pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_match_with_properties() {
+        let stmt = parse_ok("MATCH (n:Person {name: 'Alix', age: 30}) RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Node(node) = &patterns[0] {
+                assert_eq!(node.properties.len(), 2);
+                assert_eq!(node.properties[0].0, "name");
+                assert_eq!(node.properties[1].0, "age");
+            } else {
+                panic!("Expected Node pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_match_with_variable() {
+        let stmt = parse_ok("MATCH (person:Person) RETURN person");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Node(node) = &patterns[0] {
+                assert_eq!(node.variable, Some("person".to_string()));
+            } else {
+                panic!("Expected Node pattern");
+            }
+        }
+    }
+
+    // ==================== Path Pattern Tests ====================
+
+    #[test]
+    fn test_parse_outgoing_edge() {
+        let stmt = parse_ok("MATCH (a)-[:KNOWS]->(b) RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Path(path) = &patterns[0] {
+                assert_eq!(path.chain.len(), 1);
+                assert_eq!(path.chain[0].direction, Direction::Outgoing);
+                assert_eq!(path.chain[0].types, vec!["KNOWS"]);
+            } else {
+                panic!("Expected Path pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_incoming_edge() {
+        let stmt = parse_ok("MATCH (a)<-[:KNOWS]-(b) RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Path(path) = &patterns[0] {
+                assert_eq!(path.chain[0].direction, Direction::Incoming);
+            } else {
+                panic!("Expected Path pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_undirected_edge() {
+        let stmt = parse_ok("MATCH (a)-[:KNOWS]-(b) RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Path(path) = &patterns[0] {
+                assert_eq!(path.chain[0].direction, Direction::Undirected);
+            } else {
+                panic!("Expected Path pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_variable_length_edge() {
+        let stmt = parse_ok("MATCH (a)-[:KNOWS*1..3]->(b) RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Path(path) = &patterns[0] {
+                let length = path.chain[0].length.as_ref().unwrap();
+                assert_eq!(length.min, Some(1));
+                assert_eq!(length.max, Some(3));
+            } else {
+                panic!("Expected Path pattern");
+            }
+        }
+    }
+
+    /// `*3..1` parses, keeping both bounds: openCypher reads it as an empty
+    /// range, which matches no path (the translator plans no rows for it).
+    #[test]
+    fn a_reversed_length_range_keeps_both_bounds() {
+        for (query, min, max) in [
+            ("MATCH (a)-[:KNOWS*3..1]->(b) RETURN b", Some(3), Some(1)),
+            ("MATCH (a)-[*..0]->(b) RETURN b", None, Some(0)),
+        ] {
+            let Statement::Query(Query { clauses, .. }) = parse_ok(query) else {
+                panic!("{query}: expected a query");
+            };
+            let Clause::Match(MatchClause { patterns, .. }) = &clauses[0] else {
+                panic!("{query}: expected a MATCH");
+            };
+            let Pattern::Path(path) = &patterns[0] else {
+                panic!("{query}: expected a path pattern");
+            };
+            let length = path.chain[0].length.as_ref().unwrap();
+            assert_eq!((length.min, length.max), (min, max), "{query}");
+        }
+    }
+
+    #[test]
+    fn test_parse_variable_length_unbounded() {
+        let stmt = parse_ok("MATCH (a)-[:KNOWS*]->(b) RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Path(path) = &patterns[0] {
+                let length = path.chain[0].length.as_ref().unwrap();
+                assert_eq!(length.min, None);
+                assert_eq!(length.max, None);
+            } else {
+                panic!("Expected Path pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_relationship_where() {
+        let stmt = parse_ok("MATCH (a)-[r:KNOWS WHERE r.since > 2020]->(b) RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Path(path) = &patterns[0] {
+                assert!(
+                    path.chain[0].where_clause.is_some(),
+                    "Expected inline WHERE on relationship"
+                );
+                assert!(
+                    path.chain[0].variable.as_deref() == Some("r"),
+                    "Expected variable 'r'"
+                );
+            } else {
+                panic!("Expected Path pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_relationship_where_no_type() {
+        let stmt = parse_ok("MATCH (a)-[r WHERE r.weight > 0.5]->(b) RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Path(path) = &patterns[0] {
+                assert!(path.chain[0].where_clause.is_some());
+                assert!(path.chain[0].types.is_empty(), "expected empty");
+            } else {
+                panic!("Expected Path pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_multiple_edge_types() {
+        let stmt = parse_ok("MATCH (a)-[:KNOWS|LIKES|FOLLOWS]->(b) RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Path(path) = &patterns[0] {
+                assert_eq!(path.chain[0].types.len(), 3);
+            } else {
+                panic!("Expected Path pattern");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_chain_pattern() {
+        let stmt = parse_ok("MATCH (a)-[:KNOWS]->(b)-[:WORKS_AT]->(c) RETURN a, c");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+        {
+            if let Pattern::Path(path) = &patterns[0] {
+                assert_eq!(path.chain.len(), 2);
+            } else {
+                panic!("Expected Path pattern");
+            }
+        }
+    }
+
+    // ==================== WHERE Clause Tests ====================
+
+    #[test]
+    fn test_parse_where_simple() {
+        let stmt = parse_ok("MATCH (n) WHERE n.age > 30 RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[1], Clause::Where(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_where_and() {
+        let stmt = parse_ok("MATCH (n) WHERE n.age > 30 AND n.name = 'Alix' RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+        {
+            assert!(matches!(
+                predicate,
+                Expression::Binary {
+                    op: BinaryOp::And,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_where_or() {
+        let stmt = parse_ok("MATCH (n) WHERE n.age < 20 OR n.age > 60 RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+        {
+            assert!(matches!(
+                predicate,
+                Expression::Binary {
+                    op: BinaryOp::Or,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_where_not() {
+        let stmt = parse_ok("MATCH (n) WHERE NOT n.active RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+        {
+            assert!(matches!(
+                predicate,
+                Expression::Unary {
+                    op: UnaryOp::Not,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_where_is_null() {
+        let stmt = parse_ok("MATCH (n) WHERE n.email IS NULL RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+        {
+            assert!(matches!(
+                predicate,
+                Expression::Unary {
+                    op: UnaryOp::IsNull,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_where_is_not_null() {
+        let stmt = parse_ok("MATCH (n) WHERE n.email IS NOT NULL RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+        {
+            assert!(matches!(
+                predicate,
+                Expression::Unary {
+                    op: UnaryOp::IsNotNull,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_where_in() {
+        let stmt = parse_ok("MATCH (n) WHERE n.status IN ['active', 'pending'] RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+        {
+            assert!(matches!(
+                predicate,
+                Expression::Binary {
+                    op: BinaryOp::In,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_where_starts_with() {
+        let stmt = parse_ok("MATCH (n) WHERE n.name STARTS WITH 'A' RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+        {
+            assert!(matches!(
+                predicate,
+                Expression::Binary {
+                    op: BinaryOp::StartsWith,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_where_ends_with() {
+        let stmt = parse_ok("MATCH (n) WHERE n.email ENDS WITH '.com' RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+        {
+            assert!(matches!(
+                predicate,
+                Expression::Binary {
+                    op: BinaryOp::EndsWith,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_where_contains() {
+        let stmt = parse_ok("MATCH (n) WHERE n.bio CONTAINS 'engineer' RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+        {
+            assert!(matches!(
+                predicate,
+                Expression::Binary {
+                    op: BinaryOp::Contains,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_chain_of_comparisons_parses_as_the_conjunction_of_its_comparisons() {
+        let stmt = parse_ok("MATCH (n) WHERE 3 < n.age <= 19 > n.min RETURN n");
+        let Statement::Query(Query { clauses, .. }) = stmt else {
+            panic!("expected a query");
+        };
+        let Clause::Where(WhereClause { predicate, .. }) = &clauses[1] else {
+            panic!("expected a WHERE clause, got {:?}", clauses[1]);
+        };
+        // (3 < n.age AND n.age <= 19) AND 19 > n.min
+        let Expression::Binary {
+            left: first_two,
+            op: BinaryOp::And,
+            right: last,
+        } = predicate
+        else {
+            panic!("expected a conjunction, got {predicate:?}");
+        };
+        let Expression::Binary {
+            left: first,
+            op: BinaryOp::And,
+            right: second,
+        } = first_two.as_ref()
+        else {
+            panic!("expected a conjunction, got {first_two:?}");
+        };
+        let is_age = |expression: &Expression| matches!(expression, Expression::PropertyAccess { property, .. } if property == "age");
+        assert!(
+            matches!(first.as_ref(), Expression::Binary { op: BinaryOp::Lt, right, .. } if is_age(right)),
+            "3 < n.age: {first:?}"
+        );
+        assert!(
+            matches!(second.as_ref(), Expression::Binary { op: BinaryOp::Le, left, .. } if is_age(left)),
+            "n.age <= 19: {second:?}"
+        );
+        assert!(
+            matches!(
+                last.as_ref(),
+                Expression::Binary {
+                    op: BinaryOp::Gt,
+                    left,
+                    ..
+                } if matches!(left.as_ref(), Expression::Literal(Literal::Integer(19)))
+            ),
+            "19 > n.min: {last:?}"
+        );
+    }
+
+    // ==================== RETURN Clause Tests ====================
+
+    #[test]
+    fn test_parse_return_all() {
+        let stmt = parse_ok("MATCH (n) RETURN *");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause { items, .. }) = &clauses[1]
+        {
+            assert!(matches!(items, ReturnItems::All));
+        }
+    }
+
+    /// `*` takes more items after it (openCypher 9 grammar, ProjectionItems),
+    /// in RETURN and in WITH; `*` after an item does not.
+    #[test]
+    fn star_followed_by_more_items() {
+        let Statement::Query(Query { clauses, .. }) =
+            parse_ok("MATCH (a)-[r]->(c) RETURN *, r.years AS y, c")
+        else {
+            panic!("expected a query");
+        };
+        let Clause::Return(ReturnClause {
+            items: ReturnItems::AllAnd(items),
+            ..
+        }) = &clauses[1]
+        else {
+            panic!("expected RETURN *, ...: {:?}", clauses[1]);
+        };
+        let aliases: Vec<Option<&str>> = items.iter().map(|item| item.alias.as_deref()).collect();
+        assert_eq!(aliases, [Some("y"), None]);
+
+        let Statement::Query(Query { clauses, .. }) =
+            parse_ok("MATCH (a)-[r]->(c) WITH *, r.years AS y RETURN y")
+        else {
+            panic!("expected a query");
+        };
+        let Clause::With(with) = &clauses[1] else {
+            panic!("expected WITH: {:?}", clauses[1]);
+        };
+        assert!(with.is_wildcard);
+        assert_eq!(with.items.len(), 1);
+        assert_eq!(with.items[0].alias.as_deref(), Some("y"));
+
+        parse_err("MATCH (a) RETURN a, *");
+        parse_err("MATCH (a) RETURN *, ");
+    }
+
+    #[test]
+    fn test_parse_return_distinct() {
+        let stmt = parse_ok("MATCH (n) RETURN DISTINCT n.name");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause { distinct, .. }) = &clauses[1]
+        {
+            assert!(*distinct);
+        }
+    }
+
+    #[test]
+    fn test_parse_return_with_alias() {
+        let stmt = parse_ok("MATCH (n) RETURN n.name AS name");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[1]
+        {
+            assert_eq!(items[0].alias, Some("name".to_string()));
+        }
+    }
+
+    // ==================== CREATE Clause Tests ====================
+
+    #[test]
+    fn test_parse_create_node() {
+        let stmt = parse_ok("CREATE (n:Person {name: 'Alix'})");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[0], Clause::Create(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_create_relationship() {
+        let stmt = parse_ok("MATCH (a:Person), (b:Person) CREATE (a)-[:KNOWS]->(b)");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[1], Clause::Create(_)));
+        }
+    }
+
+    // ==================== MERGE Clause Tests ====================
+
+    #[test]
+    fn test_parse_merge() {
+        let stmt = parse_ok("MERGE (n:Person {name: 'Alix'})");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[0], Clause::Merge(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_merge_on_create() {
+        let stmt =
+            parse_ok("MERGE (n:Person {name: 'Alix'}) ON CREATE SET n.created = timestamp()");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Merge(MergeClause { on_create, .. }) = &clauses[0]
+        {
+            assert!(on_create.is_some());
+        }
+    }
+
+    #[test]
+    fn test_parse_merge_on_match() {
+        let stmt = parse_ok("MERGE (n:Person {name: 'Alix'}) ON MATCH SET n.seen = true");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Merge(MergeClause { on_match, .. }) = &clauses[0]
+        {
+            assert!(on_match.is_some());
+        }
+    }
+
+    // ==================== DELETE Clause Tests ====================
+
+    #[test]
+    fn test_parse_delete() {
+        let stmt = parse_ok("MATCH (n) DELETE n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Delete(DeleteClause { detach, .. }) = &clauses[1]
+        {
+            assert!(!*detach);
+        }
+    }
+
+    #[test]
+    fn test_parse_detach_delete() {
+        let stmt = parse_ok("MATCH (n) DETACH DELETE n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Delete(DeleteClause { detach, .. }) = &clauses[1]
+        {
+            assert!(*detach);
+        }
+    }
+
+    // ==================== SET Clause Tests ====================
+
+    #[test]
+    fn test_parse_set_property() {
+        let stmt = parse_ok("MATCH (n) SET n.name = 'Gus'");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Set(SetClause { items, .. }) = &clauses[1]
+        {
+            assert!(matches!(&items[0], SetItem::Property { .. }));
+        }
+    }
+
+    #[test]
+    fn test_parse_set_labels() {
+        let stmt = parse_ok("MATCH (n) SET n:Admin:Manager");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Set(SetClause { items, .. }) = &clauses[1]
+            && let SetItem::Labels { labels, .. } = &items[0]
+        {
+            assert_eq!(labels.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_parse_set_all_properties() {
+        let stmt = parse_ok("MATCH (n) SET n = {name: 'Alix', age: 30}");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Set(SetClause { items, .. }) = &clauses[1]
+        {
+            assert!(matches!(&items[0], SetItem::AllProperties { .. }));
+        }
+    }
+
+    #[test]
+    fn test_parse_set_merge_properties() {
+        let stmt = parse_ok("MATCH (n) SET n += {updated: true}");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Set(SetClause { items, .. }) = &clauses[1]
+        {
+            assert!(matches!(&items[0], SetItem::MergeProperties { .. }));
+        }
+    }
+
+    // ==================== REMOVE Clause Tests ====================
+
+    #[test]
+    fn test_parse_remove_property() {
+        let stmt = parse_ok("MATCH (n) REMOVE n.temp");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Remove(RemoveClause { items, .. }) = &clauses[1]
+        {
+            assert!(matches!(&items[0], RemoveItem::Property { .. }));
+        }
+    }
+
+    #[test]
+    fn test_parse_remove_labels() {
+        let stmt = parse_ok("MATCH (n) REMOVE n:Temp:Staging");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Remove(RemoveClause { items, .. }) = &clauses[1]
+            && let RemoveItem::Labels { labels, .. } = &items[0]
+        {
+            assert_eq!(labels.len(), 2);
+        }
+    }
+
+    // ==================== WITH Clause Tests ====================
+
+    #[test]
+    fn test_parse_with() {
+        let stmt = parse_ok("MATCH (n) WITH n.name AS name RETURN name");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[1], Clause::With(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_with_distinct() {
+        let stmt = parse_ok("MATCH (n) WITH DISTINCT n.city AS city RETURN city");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::With(WithClause { distinct, .. }) = &clauses[1]
+        {
+            assert!(*distinct);
+        }
+    }
+
+    #[test]
+    fn test_parse_with_where() {
+        let stmt = parse_ok("MATCH (n) WITH n WHERE n.age > 30 RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::With(WithClause { where_clause, .. }) = &clauses[1]
+        {
+            assert!(where_clause.is_some());
+        }
+    }
+
+    // ==================== OPTIONAL MATCH Tests ====================
+
+    #[test]
+    fn test_parse_optional_match() {
+        let stmt = parse_ok("MATCH (a) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[0], Clause::Match(_)));
+            assert!(matches!(&clauses[1], Clause::OptionalMatch(_)));
+        }
+    }
+
+    // ==================== UNWIND Tests ====================
+
+    #[test]
+    fn test_parse_unwind() {
+        let stmt = parse_ok("UNWIND [1, 2, 3] AS x RETURN x");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Unwind(UnwindClause { variable, .. }) = &clauses[0]
+        {
+            assert_eq!(variable, "x");
+        }
+    }
+
+    // ==================== ORDER BY Tests ====================
+
+    #[test]
+    fn test_parse_order_by_asc() {
+        let stmt = parse_ok("MATCH (n) RETURN n ORDER BY n.name ASC");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::OrderBy(OrderByClause { items, .. }) = &clauses[2]
+        {
+            assert_eq!(items[0].direction, SortDirection::Asc);
+        }
+    }
+
+    #[test]
+    fn test_parse_order_by_desc() {
+        let stmt = parse_ok("MATCH (n) RETURN n ORDER BY n.age DESC");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::OrderBy(OrderByClause { items, .. }) = &clauses[2]
+        {
+            assert_eq!(items[0].direction, SortDirection::Desc);
+        }
+    }
+
+    #[test]
+    fn test_parse_order_by_multiple() {
+        let stmt = parse_ok("MATCH (n) RETURN n ORDER BY n.name, n.age DESC");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::OrderBy(OrderByClause { items, .. }) = &clauses[2]
+        {
+            assert_eq!(items.len(), 2);
+        }
+    }
+
+    // ==================== SKIP and LIMIT Tests ====================
+
+    #[test]
+    fn test_parse_skip() {
+        let stmt = parse_ok("MATCH (n) RETURN n SKIP 10");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[2], Clause::Skip(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_limit() {
+        let stmt = parse_ok("MATCH (n) RETURN n LIMIT 5");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[2], Clause::Limit(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_skip_and_limit() {
+        let stmt = parse_ok("MATCH (n) RETURN n SKIP 10 LIMIT 5");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[2], Clause::Skip(_)));
+            assert!(matches!(&clauses[3], Clause::Limit(_)));
+        }
+    }
+
+    // ==================== Expression Tests ====================
+
+    #[test]
+    fn test_parse_literal_integer() {
+        let stmt = parse_ok("RETURN 42");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+        {
+            assert!(matches!(
+                &items[0].expression,
+                Expression::Literal(Literal::Integer(42))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_literal_float() {
+        let stmt = parse_ok("RETURN 2.78");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+            && let Expression::Literal(Literal::Float(val)) = &items[0].expression
+        {
+            assert!((val - 2.78).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn test_parse_literal_string() {
+        let stmt = parse_ok("RETURN 'hello'");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+            && let Expression::Literal(Literal::String(s)) = &items[0].expression
+        {
+            assert_eq!(s, "hello");
+        }
+    }
+
+    #[test]
+    fn test_parse_literal_bool() {
+        let stmt = parse_ok("RETURN true, false");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+        {
+            assert!(matches!(
+                &items[0].expression,
+                Expression::Literal(Literal::Bool(true))
+            ));
+            assert!(matches!(
+                &items[1].expression,
+                Expression::Literal(Literal::Bool(false))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_literal_null() {
+        let stmt = parse_ok("RETURN null");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+        {
+            assert!(matches!(
+                &items[0].expression,
+                Expression::Literal(Literal::Null)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_list_literal() {
+        let stmt = parse_ok("RETURN [1, 2, 3]");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+            && let Expression::List(list) = &items[0].expression
+        {
+            assert_eq!(list.len(), 3);
+        }
+    }
+
+    #[test]
+    fn test_parse_map_literal() {
+        let stmt = parse_ok("RETURN {name: 'Alix', age: 30}");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+            && let Expression::Map(map) = &items[0].expression
+        {
+            assert_eq!(map.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_parse_parameter() {
+        let stmt = parse_ok("MATCH (n) WHERE n.id = $id RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Where(WhereClause { predicate, .. }) = &clauses[1]
+            && let Expression::Binary { right, .. } = predicate
+            && let Expression::Parameter(name) = right.as_ref()
+        {
+            assert_eq!(name, "id");
+        }
+    }
+
+    #[test]
+    fn test_parse_function_call() {
+        let stmt = parse_ok("RETURN count(n)");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+            && let Expression::FunctionCall { name, .. } = &items[0].expression
+        {
+            assert_eq!(name, "count");
+        }
+    }
+
+    #[test]
+    fn test_parse_function_call_distinct() {
+        let stmt = parse_ok("RETURN count(DISTINCT n)");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+            && let Expression::FunctionCall { distinct, .. } = &items[0].expression
+        {
+            assert!(*distinct);
+        }
+    }
+
+    #[test]
+    fn test_parse_arithmetic() {
+        let stmt = parse_ok("RETURN 1 + 2 * 3");
+        assert!(matches!(stmt, Statement::Query(_)));
+    }
+
+    #[test]
+    fn test_parse_property_access() {
+        let stmt = parse_ok("MATCH (n) RETURN n.name");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[1]
+        {
+            assert!(matches!(
+                &items[0].expression,
+                Expression::PropertyAccess { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_index_access() {
+        let stmt = parse_ok("RETURN list[0]");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+        {
+            assert!(matches!(
+                &items[0].expression,
+                Expression::IndexAccess { .. }
+            ));
+        }
+    }
+
+    // ==================== CASE Expression Tests ====================
+
+    #[test]
+    fn test_parse_case_simple() {
+        let stmt = parse_ok("RETURN CASE n.status WHEN 'active' THEN 1 ELSE 0 END");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+            && let Expression::Case {
+                input,
+                whens,
+                else_clause,
+            } = &items[0].expression
+        {
+            assert!(input.is_some());
+            assert_eq!(whens.len(), 1);
+            assert!(else_clause.is_some());
+        }
+    }
+
+    #[test]
+    fn test_parse_case_searched() {
+        let stmt = parse_ok(
+            "RETURN CASE WHEN n.age < 18 THEN 'minor' WHEN n.age < 65 THEN 'adult' ELSE 'senior' END",
+        );
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ReturnClause {
+                items: ReturnItems::Explicit(items),
+                ..
+            }) = &clauses[0]
+            && let Expression::Case { input, whens, .. } = &items[0].expression
+        {
+            assert!(input.is_none());
+            assert_eq!(whens.len(), 2);
+        }
+    }
+
+    // ==================== Named Path Tests ====================
+
+    #[test]
+    fn test_parse_named_path() {
+        let stmt = parse_ok("MATCH p = (a)-[:KNOWS]->(b) RETURN p");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+            && let Pattern::NamedPath { name, .. } = &patterns[0]
+        {
+            assert_eq!(name, "p");
+        }
+    }
+
+    #[test]
+    fn test_parse_shortest_path() {
+        let stmt = parse_ok("MATCH p = shortestPath((a)-[:KNOWS*]->(b)) RETURN p");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Match(MatchClause { patterns, .. }) = &clauses[0]
+            && let Pattern::NamedPath { path_function, .. } = &patterns[0]
+        {
+            assert_eq!(*path_function, Some(PathFunction::ShortestPath));
+        }
+    }
+
+    // ==================== Error Cases ====================
+
+    #[test]
+    fn test_parse_error_empty() {
+        parse_err("");
+    }
+
+    #[test]
+    fn test_parse_error_invalid_syntax() {
+        parse_err("MATCH");
+    }
+
+    #[test]
+    fn test_parse_error_unclosed_paren() {
+        parse_err("MATCH (n RETURN n");
+    }
+
+    #[test]
+    fn test_parse_error_missing_return() {
+        // This is a valid Cypher query without RETURN (for side effects)
+        // so we test something else
+        parse_err("RETURN RETURN");
+    }
+
+    // ==================== Cypher Compatibility Tests ====================
+
+    #[test]
+    fn test_parse_exists_as_alias() {
+        // Issue: `exists` should be usable as an alias name
+        parse_ok("MATCH (n) RETURN count(n) as exists");
+    }
+
+    #[test]
+    fn test_parse_multiple_match_clauses() {
+        // Issue: sequential MATCH clauses should parse
+        let stmt = parse_ok("MATCH (a) WHERE a.id = 'x' MATCH (b) WHERE b.id = 'y' RETURN a, b");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[0], Clause::Match(_)));
+            assert!(matches!(&clauses[1], Clause::Where(_)));
+            assert!(matches!(&clauses[2], Clause::Match(_)));
+            assert!(matches!(&clauses[3], Clause::Where(_)));
+            assert!(matches!(&clauses[4], Clause::Return(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_merge_with_relationship() {
+        // Issue: MERGE with path patterns should parse
+        let stmt = parse_ok("MATCH (a {id: 'x'}), (b {id: 'y'}) MERGE (a)-[r:KNOWS]->(b) RETURN r");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[0], Clause::Match(_)));
+            assert!(matches!(&clauses[1], Clause::Merge(_)));
+            assert!(matches!(&clauses[2], Clause::Return(_)));
+        }
+    }
+
+    // ==================== EXISTS Subquery Tests ====================
+
+    #[test]
+    fn test_parse_exists_subquery() {
+        let stmt = parse_ok("MATCH (n) WHERE EXISTS { MATCH (n)-[:KNOWS]->() } RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            assert!(matches!(&clauses[0], Clause::Match(_)));
+            // WHERE clause should contain an Exists expression
+            if let Clause::Where(w) = &clauses[1] {
+                assert!(matches!(&w.predicate, Expression::Exists(_)));
+            } else {
+                panic!("expected WHERE clause");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_not_exists_subquery() {
+        let stmt = parse_ok("MATCH (n) WHERE NOT EXISTS { MATCH (n)-[:KNOWS]->() } RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            if let Clause::Where(w) = &clauses[1] {
+                assert!(matches!(
+                    &w.predicate,
+                    Expression::Unary {
+                        op: UnaryOp::Not,
+                        ..
+                    }
+                ));
+            } else {
+                panic!("expected WHERE clause");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_exists_with_inner_where() {
+        parse_ok("MATCH (n) WHERE EXISTS { MATCH (n)-[:KNOWS]->(m) WHERE m.age > 30 } RETURN n");
+    }
+
+    #[test]
+    fn test_parse_exists_function_still_works() {
+        // exists(n.prop) should still parse as a function call
+        let stmt = parse_ok("MATCH (n) WHERE exists(n.name) RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            if let Clause::Where(w) = &clauses[1] {
+                assert!(matches!(&w.predicate, Expression::FunctionCall { .. }));
+            } else {
+                panic!("expected WHERE clause");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_exists_bare_pattern() {
+        // Bare pattern without MATCH keyword
+        let stmt = parse_ok("MATCH (n) WHERE EXISTS { (n)-[:KNOWS]->() } RETURN n");
+        if let Statement::Query(Query { clauses, .. }) = stmt {
+            if let Clause::Where(w) = &clauses[1] {
+                assert!(matches!(&w.predicate, Expression::Exists(_)));
+            } else {
+                panic!("expected WHERE clause");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_exists_bare_pattern_with_where() {
+        // Bare pattern with WHERE inside EXISTS
+        parse_ok(
+            "MATCH (a), (b) WHERE NOT EXISTS { (a)-[r]->(b) WHERE type(r) = 'KNOWS' } RETURN a",
+        );
+    }
+
+    #[test]
+    fn test_parse_count_bare_pattern() {
+        // COUNT { bare pattern } should also work
+        parse_ok("MATCH (n) RETURN COUNT { (n)-[:KNOWS]->() } AS friend_count");
+    }
+
+    #[test]
+    fn test_parse_hex_integer_literal() {
+        let stmt = parse_ok("RETURN 0xFF");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ret) = &clauses[0]
+            && let ReturnItems::Explicit(items) = &ret.items
+            && let Expression::Literal(Literal::Integer(val)) = &items[0].expression
+        {
+            assert_eq!(*val, 255, "0xFF should parse to 255");
+        } else {
+            panic!("Expected integer literal in RETURN");
+        }
+    }
+
+    #[test]
+    fn test_parse_octal_integer_literal() {
+        let stmt = parse_ok("RETURN 0o77");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ret) = &clauses[0]
+            && let ReturnItems::Explicit(items) = &ret.items
+            && let Expression::Literal(Literal::Integer(val)) = &items[0].expression
+        {
+            assert_eq!(*val, 63, "0o77 should parse to 63");
+        } else {
+            panic!("Expected integer literal in RETURN");
+        }
+    }
+
+    #[test]
+    fn test_parse_scientific_float_literal() {
+        let stmt = parse_ok("RETURN 1.5e10");
+        if let Statement::Query(Query { clauses, .. }) = stmt
+            && let Clause::Return(ret) = &clauses[0]
+            && let ReturnItems::Explicit(items) = &ret.items
+            && let Expression::Literal(Literal::Float(val)) = &items[0].expression
+        {
+            assert!((*val - 1.5e10).abs() < 1.0, "1.5e10 should parse correctly");
+        } else {
+            panic!("Expected float literal in RETURN");
+        }
+    }
+
+    #[test]
+    fn test_trailing_semicolons() {
+        // Single trailing semicolon
+        parse_ok("RETURN 1;");
+        // Multiple trailing semicolons
+        parse_ok("RETURN 1;;;");
+        // Semicolon after full query
+        parse_ok("MATCH (n) RETURN n;");
+    }
+
+    fn parse_error_message(query: &str) -> String {
+        Parser::new(query).parse().expect_err(query).to_string()
+    }
+
+    #[test]
+    fn test_union_and_schema_statements_check_end_of_input() {
+        // A trailing ';' after a UNION used to fail; trailing input after a
+        // schema statement used to be ignored (#380).
+        parse_ok("MATCH (n) RETURN n.a AS a UNION MATCH (m) RETURN m.a AS a;");
+        parse_ok("CREATE INDEX idx_name FOR (n:Person) ON (n.name);");
+        let err = parse_error_message("CREATE INDEX idx_name FOR (n:Person) ON (n.name) garbage");
+        assert!(err.contains("Expected end of query"), "{err}");
+        let err = parse_error_message("SHOW INDEXES garbage");
+        assert!(err.contains("Expected end of query"), "{err}");
+    }
+
+    /// A RETURN ends its query part: a clause after it is an error that names
+    /// the clause, where it replaced the RETURN; ORDER BY, SKIP and LIMIT
+    /// belong to it, and UNION and WITH go on as before.
+    #[test]
+    fn a_clause_after_return_is_rejected() {
+        for (query, clause) in [
+            ("RETURN 1 AS a RETURN 2 AS b", "RETURN"),
+            ("MATCH (n) RETURN n RETURN 1", "RETURN"),
+            ("MATCH (n) RETURN n.name MATCH (m) RETURN m", "MATCH"),
+            ("MATCH (n) RETURN n OPTIONAL MATCH (m) RETURN m", "OPTIONAL"),
+            ("RETURN 1 AS x WITH x RETURN x", "WITH"),
+            ("RETURN 1 UNWIND [1] AS x RETURN x", "UNWIND"),
+            ("RETURN 1 CREATE (:Person)", "CREATE"),
+            ("RETURN 1 MERGE (:Person)", "MERGE"),
+            ("MATCH (n) RETURN n DETACH DELETE n", "DETACH"),
+            ("MATCH (n) RETURN n SET n.x = 1", "SET"),
+            ("MATCH (n) RETURN n REMOVE n.x", "REMOVE"),
+            ("MATCH (n) RETURN n WHERE n.x = 1", "WHERE"),
+            ("MATCH (n) RETURN n ORDER BY n.x LIMIT 1 RETURN 1", "RETURN"),
+            ("RETURN 1 CALL db.labels()", "CALL"),
+            ("RETURN 1 FOREACH (x IN [1] | CREATE (:Person))", "FOREACH"),
+            ("CALL { RETURN 1 AS a RETURN 2 AS b } RETURN b", "RETURN"),
+        ] {
+            let err = parse_error_message(query);
+            assert!(
+                err.contains(&format!(
+                    "{clause} after RETURN: RETURN must be the last clause"
+                )),
+                "{query}: {err}"
+            );
+        }
+        parse_ok("UNWIND [3, 1, 2] AS x RETURN x ORDER BY x SKIP 1 LIMIT 1");
+        parse_ok("RETURN 1 AS x UNION RETURN 2 AS x");
+        parse_ok("RETURN 1 AS x;");
+        parse_ok("MATCH (n) WITH n RETURN n");
+        parse_ok("CALL { RETURN 1 AS a } RETURN a");
+    }
+
+    #[test]
+    fn test_statements_separated_by_semicolon_are_rejected() {
+        let err = parse_error_message("RETURN 1; RETURN 2");
+        assert!(
+            err.contains("multiple statements separated by ';' are not supported in one call"),
+            "{err}"
+        );
+    }
+
+    /// The types of the first relationship of `query`'s first MATCH.
+    fn first_relationship_types(query: &str) -> Vec<String> {
+        let Statement::Query(Query { clauses, .. }) = parse_ok(query) else {
+            panic!("{query}: expected a query");
+        };
+        let Clause::Match(MatchClause { patterns, .. }) = &clauses[0] else {
+            panic!("{query}: expected a MATCH first");
+        };
+        let Pattern::Path(path) = &patterns[0] else {
+            panic!("{query}: expected a path");
+        };
+        path.chain[0].types.clone()
+    }
+
+    #[test]
+    fn a_relationship_has_one_type_or_alternatives() {
+        // openCypher 9 RelationshipTypes: `:A`, `:A|B`, and `:A|:B`
+        assert_eq!(
+            first_relationship_types("MATCH (a)-[:A]->(b) RETURN b"),
+            ["A"]
+        );
+        assert_eq!(
+            first_relationship_types("MATCH (a)-[r:A|B*1..3]->(b) RETURN b"),
+            ["A", "B"]
+        );
+        assert_eq!(
+            first_relationship_types("MATCH (a)-[:A|:`Graph:CONTAINS`|C]-(b) RETURN b"),
+            ["A", "Graph:CONTAINS", "C"]
+        );
+        // A second `:` names a type of its own, which a relationship cannot
+        // have, wherever the pattern is
+        for (query, written) in [
+            (
+                "MATCH (a)-[:Graph:CONTAINS]->(b) RETURN b",
+                "Graph:CONTAINS",
+            ),
+            (
+                "MATCH (a)-[e:Graph:CONTAINS*]->(b) RETURN b",
+                "Graph:CONTAINS",
+            ),
+            (
+                "MATCH (a)<-[:A|Graph:CONTAINS]-(b) RETURN b",
+                "Graph:CONTAINS",
+            ),
+            (
+                "MATCH (a) WHERE (a)-[:Graph:CONTAINS]->() RETURN a",
+                "Graph:CONTAINS",
+            ),
+            (
+                "MATCH (a) RETURN [(a)-[:Graph:CONTAINS]->(b) | b] AS bs",
+                "Graph:CONTAINS",
+            ),
+            (
+                "MATCH (a) WHERE EXISTS { (a)-[:Graph:CONTAINS]->() } RETURN a",
+                "Graph:CONTAINS",
+            ),
+            ("CREATE (a)-[:Graph:CONTAINS]->(b)", "Graph:CONTAINS"),
+            ("MERGE (a)-[:Graph:CONTAINS]->(b)", "Graph:CONTAINS"),
+        ] {
+            let err = parse_error_message(query);
+            let (first, second) = written.split_once(':').unwrap();
+            for advice in [format!(":`{written}`"), format!(":{first}|{second}")] {
+                assert!(err.contains(&advice), "{query}: names {advice}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_created_relationship_has_one_type() {
+        for query in [
+            "CREATE (a)-[:A|B]->(b)",
+            "MATCH (a), (b) CREATE (a)-[:A]->(b), (b)-[:A|B]->(a)",
+            "MERGE (a)-[:A|B]->(b)",
+            "MERGE p = (a)-[:A|:B]->(b)",
+        ] {
+            let err = parse_error_message(query);
+            assert!(
+                err.contains("one type") && err.contains(":A|B"),
+                "{query}: {err}"
+            );
+        }
+        parse_ok("MATCH (a)-[:A|B]->(b) CREATE (a)-[:A]->(b)");
+    }
+
+    // === Schema DDL Tests ===
+
+    #[test]
+    fn test_parse_create_index() {
+        let stmt = parse_ok("CREATE INDEX idx_name FOR (n:Person) ON (n.name)");
+        assert!(matches!(stmt, Statement::Schema(_)));
+    }
+
+    #[test]
+    fn test_parse_create_index_if_not_exists() {
+        let stmt = parse_ok("CREATE INDEX idx_name IF NOT EXISTS FOR (n:Person) ON (n.name)");
+        assert!(matches!(stmt, Statement::Schema(_)));
+    }
+
+    fn create_index(query: &str) -> crate::query::schema::CreateIndexStatement {
+        match parse_ok(query) {
+            Statement::Schema(crate::query::schema::SchemaStatement::CreateIndex(stmt)) => stmt,
+            other => panic!("{query}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unnamed_index_gets_the_label_and_properties_as_its_name() {
+        let stmt = create_index("CREATE INDEX FOR (n:Person) ON (n.name)");
+        assert_eq!(stmt.name, "Person_name_index");
+        assert_eq!(stmt.index_kind, crate::query::schema::IndexKind::Property);
+        let stmt = create_index("CREATE INDEX IF NOT EXISTS FOR (n:Person) ON (n.first, n.last)");
+        assert_eq!(
+            (stmt.name.as_str(), stmt.if_not_exists),
+            ("Person_first_last_index", true)
+        );
+    }
+
+    #[test]
+    fn create_index_using_a_kind_takes_gql_options() {
+        use crate::query::schema::IndexKind;
+
+        let text = create_index(
+            "CREATE INDEX notes FOR (n:Note) ON (n.body) USING TEXT \
+             {K1: 1.5, b: 0.5, tokenizer: 'standard', stop_words: ['and', 'or']}",
+        );
+        assert_eq!(text.index_kind, IndexKind::Text);
+        assert_eq!(
+            (
+                text.options.k1,
+                text.options.b,
+                text.options.tokenizer.as_deref(),
+                text.options.stop_words
+            ),
+            (
+                Some(1.5),
+                Some(0.5),
+                Some("standard"),
+                Some(vec!["and".to_string(), "or".to_string()])
+            )
+        );
+        let vector = create_index(
+            "CREATE INDEX FOR (d:Doc) ON (d.emb) USING vector {dimensions: 384, metric: 'cosine'}",
+        );
+        assert_eq!(
+            (
+                vector.name.as_str(),
+                vector.index_kind,
+                vector.options.dimensions,
+                vector.options.metric.as_deref()
+            ),
+            (
+                "Doc_emb_index",
+                IndexKind::Vector,
+                Some(384),
+                Some("cosine")
+            )
+        );
+        // A negative BM25 parameter parses; the engine refuses it, naming it.
+        let negative = create_index("CREATE INDEX FOR (n:Note) ON (n.body) USING TEXT {k1: -1}");
+        assert_eq!(negative.options.k1, Some(-1.0));
+        let btree = create_index("CREATE INDEX FOR (p:Person) ON (p.age) USING BTREE");
+        assert_eq!(btree.index_kind, IndexKind::BTree);
+    }
+
+    #[test]
+    fn create_index_options_of_the_wrong_name_or_type_are_errors() {
+        for (clause, says) in [
+            (
+                "USING TEXT {analyzer: 'standard'}",
+                "Unknown text index option 'analyzer'",
+            ),
+            ("USING TEXT {k1: 'high'}", "Expected a number for k1"),
+            (
+                "USING TEXT {tokenizer: standard}",
+                "Expected string for tokenizer",
+            ),
+            (
+                "USING TEXT {stop_words: ['and', 3]}",
+                "Expected string in stop_words",
+            ),
+            (
+                "USING VECTOR {dimensions: 'two'}",
+                "Expected integer for dimensions",
+            ),
+            ("USING VECTOR {dimensions: -3}", "Invalid dimension value"),
+            ("USING VECTOR {metric: 3}", "Expected string for metric"),
+            ("USING VECTOR {k1: 1.2}", "Unknown index option 'k1'"),
+            ("USING HASH", "Unknown index type 'HASH'"),
+        ] {
+            let message =
+                parse_error_message(&format!("CREATE INDEX FOR (n:Note) ON (n.body) {clause}"));
+            assert!(message.contains(says), "{clause}: {message}");
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_index() {
+        let stmt = parse_ok("DROP INDEX idx_name");
+        assert!(matches!(stmt, Statement::Schema(_)));
+    }
+
+    #[test]
+    fn test_parse_drop_index_if_exists() {
+        let stmt = parse_ok("DROP INDEX idx_name IF EXISTS");
+        assert!(matches!(stmt, Statement::Schema(_)));
+    }
+
+    #[test]
+    fn test_parse_create_constraint_unique() {
+        let stmt = parse_ok("CREATE CONSTRAINT uniq FOR (n:Person) REQUIRE n.email IS UNIQUE");
+        assert!(matches!(stmt, Statement::Schema(_)));
+    }
+
+    #[test]
+    fn test_parse_create_constraint_not_null() {
+        let stmt = parse_ok("CREATE CONSTRAINT nn FOR (n:Person) REQUIRE n.name IS NOT NULL");
+        assert!(matches!(stmt, Statement::Schema(_)));
+    }
+
+    #[test]
+    fn test_parse_drop_constraint() {
+        let stmt = parse_ok("DROP CONSTRAINT uniq");
+        assert!(matches!(stmt, Statement::Schema(_)));
+    }
+
+    #[test]
+    fn test_parse_show_indexes() {
+        let stmt = parse_ok("SHOW INDEXES");
+        assert!(matches!(stmt, Statement::ShowIndexes));
+    }
+
+    #[test]
+    fn test_parse_show_constraints() {
+        let stmt = parse_ok("SHOW CONSTRAINTS");
+        assert!(matches!(stmt, Statement::ShowConstraints));
+    }
+
+    #[test]
+    fn test_parse_load_csv_with_headers() {
+        let stmt = parse_ok("LOAD CSV WITH HEADERS FROM 'data.csv' AS row RETURN row.name");
+        if let Statement::Query(q) = stmt {
+            assert!(
+                matches!(&q.clauses[0], Clause::LoadCsv(lc) if lc.with_headers && lc.path == "data.csv" && lc.variable == "row")
+            );
+        } else {
+            panic!("Expected Query");
+        }
+    }
+
+    #[test]
+    fn test_parse_load_csv_without_headers() {
+        let stmt = parse_ok("LOAD CSV FROM 'data.csv' AS line RETURN line[0]");
+        if let Statement::Query(q) = stmt {
+            assert!(
+                matches!(&q.clauses[0], Clause::LoadCsv(lc) if !lc.with_headers && lc.variable == "line")
+            );
+        } else {
+            panic!("Expected Query");
+        }
+    }
+
+    #[test]
+    fn test_parse_load_csv_fieldterminator() {
+        let stmt = parse_ok(
+            "LOAD CSV WITH HEADERS FROM 'data.tsv' AS row FIELDTERMINATOR '\\t' RETURN row.name",
+        );
+        if let Statement::Query(q) = stmt {
+            assert!(
+                matches!(&q.clauses[0], Clause::LoadCsv(lc) if lc.field_terminator == Some('\t'))
+            );
+        } else {
+            panic!("Expected Query");
+        }
+    }
+
+    #[test]
+    fn test_parse_load_csv_with_create() {
+        let stmt = parse_ok(
+            "LOAD CSV WITH HEADERS FROM 'people.csv' AS row CREATE (p:Person {name: row.name})",
+        );
+        if let Statement::Query(q) = stmt {
+            assert!(matches!(&q.clauses[0], Clause::LoadCsv(_)));
+            assert!(matches!(&q.clauses[1], Clause::Create(_)));
+        } else {
+            panic!("Expected Query");
+        }
+    }
+
+    #[test]
+    fn test_parse_load_csv_file_uri() {
+        let stmt =
+            parse_ok("LOAD CSV WITH HEADERS FROM 'file:///data/people.csv' AS row RETURN row.name");
+        if let Statement::Query(q) = stmt {
+            assert!(
+                matches!(&q.clauses[0], Clause::LoadCsv(lc) if lc.path == "file:///data/people.csv")
+            );
+        } else {
+            panic!("Expected Query");
+        }
+    }
+
+    // ================================================================
+    // SHOW CURRENT GRAPH TYPE
+    // ================================================================
+
+    #[test]
+    fn test_parse_show_current_graph_type() {
+        let stmt = parse_ok("SHOW CURRENT GRAPH TYPE");
+        assert!(matches!(stmt, Statement::ShowCurrentGraphType));
+    }
+
+    #[test]
+    fn test_parse_show_current_graph_type_lowercase() {
+        let stmt = parse_ok("show current graph type");
+        assert!(matches!(stmt, Statement::ShowCurrentGraphType));
+    }
+
+    #[test]
+    fn test_parse_show_current_graph_type_mixed_case() {
+        let stmt = parse_ok("Show Current Graph Type");
+        assert!(matches!(stmt, Statement::ShowCurrentGraphType));
+    }
+
+    // ================================================================
+    // ALTER CURRENT GRAPH TYPE SET
+    // ================================================================
+
+    #[test]
+    fn test_parse_alter_current_graph_type_set_node() {
+        use crate::query::schema::{InlineElementType, SchemaStatement};
+
+        let stmt = parse_ok("ALTER CURRENT GRAPH TYPE SET { (:Person { name STRING NOT NULL }) }");
+        if let Statement::Schema(SchemaStatement::CreateGraphType(create)) = stmt {
+            assert_eq!(create.name, "__current__");
+            assert!(create.or_replace);
+            assert_eq!(create.inline_types.len(), 1);
+            assert!(matches!(
+                &create.inline_types[0],
+                InlineElementType::Node { name, properties, .. }
+                    if name == "Person" && properties.len() == 1
+                       && properties[0].name == "name"
+                       && properties[0].data_type == "STRING"
+                       && !properties[0].nullable
+            ));
+        } else {
+            panic!("Expected Schema(CreateGraphType), got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_set_node_neo4j_type_syntax() {
+        use crate::query::schema::{InlineElementType, SchemaStatement};
+
+        // Neo4j uses :: for type annotations
+        let stmt =
+            parse_ok("ALTER CURRENT GRAPH TYPE SET { (:Person { name :: STRING NOT NULL }) }");
+        if let Statement::Schema(SchemaStatement::CreateGraphType(create)) = stmt {
+            assert_eq!(create.inline_types.len(), 1);
+            assert!(matches!(
+                &create.inline_types[0],
+                InlineElementType::Node { name, properties, .. }
+                    if name == "Person"
+                       && properties[0].data_type == "STRING"
+                       && !properties[0].nullable
+            ));
+        } else {
+            panic!("Expected Schema(CreateGraphType), got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_set_edge() {
+        use crate::query::schema::{InlineElementType, SchemaStatement};
+
+        let stmt = parse_ok("ALTER CURRENT GRAPH TYPE SET { (:Person)-[:KNOWS]->(:Person) }");
+        if let Statement::Schema(SchemaStatement::CreateGraphType(create)) = stmt {
+            assert_eq!(create.name, "__current__");
+            assert!(create.or_replace);
+            // Should have one edge type (no separate node types extracted from patterns)
+            assert_eq!(create.inline_types.len(), 1);
+            assert!(matches!(
+                &create.inline_types[0],
+                InlineElementType::Edge {
+                    name,
+                    source_node_types,
+                    target_node_types,
+                    ..
+                } if name == "KNOWS"
+                     && source_node_types == &["Person"]
+                     && target_node_types == &["Person"]
+            ));
+        } else {
+            panic!("Expected Schema(CreateGraphType), got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_set_mixed() {
+        use crate::query::schema::{InlineElementType, SchemaStatement};
+
+        let stmt = parse_ok(
+            "ALTER CURRENT GRAPH TYPE SET { (:Person { name STRING }), (:Person)-[:KNOWS]->(:Person) }",
+        );
+        if let Statement::Schema(SchemaStatement::CreateGraphType(create)) = stmt {
+            assert_eq!(create.name, "__current__");
+            assert_eq!(create.inline_types.len(), 2);
+            // First is a node type
+            assert!(
+                matches!(&create.inline_types[0], InlineElementType::Node { name, .. } if name == "Person")
+            );
+            // Second is an edge type
+            assert!(
+                matches!(&create.inline_types[1], InlineElementType::Edge { name, .. } if name == "KNOWS")
+            );
+        } else {
+            panic!("Expected Schema(CreateGraphType), got {stmt:?}");
+        }
+    }
+
+    // ================================================================
+    // ALTER CURRENT GRAPH TYPE ADD
+    // ================================================================
+
+    #[test]
+    fn test_parse_alter_current_graph_type_add() {
+        use crate::query::schema::{GraphTypeAlteration, SchemaStatement};
+
+        let stmt = parse_ok("ALTER CURRENT GRAPH TYPE ADD { (:Movie { title STRING }) }");
+        if let Statement::Schema(SchemaStatement::AlterGraphType(alter)) = stmt {
+            assert_eq!(alter.name, "__current__");
+            assert_eq!(alter.alterations.len(), 1);
+            assert!(matches!(
+                &alter.alterations[0],
+                GraphTypeAlteration::AddNodeType(name) if name == "Movie"
+            ));
+        } else {
+            panic!("Expected Schema(AlterGraphType), got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_add_edge() {
+        use crate::query::schema::{GraphTypeAlteration, SchemaStatement};
+
+        let stmt = parse_ok("ALTER CURRENT GRAPH TYPE ADD { (:Person)-[:ACTED_IN]->(:Movie) }");
+        if let Statement::Schema(SchemaStatement::AlterGraphType(alter)) = stmt {
+            assert_eq!(alter.name, "__current__");
+            assert_eq!(alter.alterations.len(), 1);
+            assert!(matches!(
+                &alter.alterations[0],
+                GraphTypeAlteration::AddEdgeType(name) if name == "ACTED_IN"
+            ));
+        } else {
+            panic!("Expected Schema(AlterGraphType), got {stmt:?}");
+        }
+    }
+
+    // ================================================================
+    // ALTER CURRENT GRAPH TYPE DROP
+    // ================================================================
+
+    #[test]
+    fn test_parse_alter_current_graph_type_drop() {
+        use crate::query::schema::{GraphTypeAlteration, SchemaStatement};
+
+        let stmt = parse_ok("ALTER CURRENT GRAPH TYPE DROP { (:Movie) }");
+        if let Statement::Schema(SchemaStatement::AlterGraphType(alter)) = stmt {
+            assert_eq!(alter.name, "__current__");
+            assert_eq!(alter.alterations.len(), 1);
+            assert!(matches!(
+                &alter.alterations[0],
+                GraphTypeAlteration::DropNodeType(name) if name == "Movie"
+            ));
+        } else {
+            panic!("Expected Schema(AlterGraphType), got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_drop_edge() {
+        use crate::query::schema::{GraphTypeAlteration, SchemaStatement};
+
+        let stmt = parse_ok("ALTER CURRENT GRAPH TYPE DROP { (:Person)-[:ACTED_IN]->(:Movie) }");
+        if let Statement::Schema(SchemaStatement::AlterGraphType(alter)) = stmt {
+            assert_eq!(alter.name, "__current__");
+            assert_eq!(alter.alterations.len(), 1);
+            assert!(matches!(
+                &alter.alterations[0],
+                GraphTypeAlteration::DropEdgeType(name) if name == "ACTED_IN"
+            ));
+        } else {
+            panic!("Expected Schema(AlterGraphType), got {stmt:?}");
+        }
+    }
+
+    // ================================================================
+    // Edge cases and error handling
+    // ================================================================
+
+    #[test]
+    fn test_parse_alter_current_graph_type_set_empty_body() {
+        let stmt = parse_ok("ALTER CURRENT GRAPH TYPE SET { }");
+        if let Statement::Schema(crate::query::schema::SchemaStatement::CreateGraphType(create)) =
+            stmt
+        {
+            assert_eq!(create.name, "__current__");
+            assert!(create.or_replace);
+            assert!(create.inline_types.is_empty());
+        } else {
+            panic!("Expected Schema(CreateGraphType) with empty body");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_multiple_properties() {
+        use crate::query::schema::{InlineElementType, SchemaStatement};
+
+        let stmt = parse_ok(
+            "ALTER CURRENT GRAPH TYPE SET { (:Person { name STRING NOT NULL, age INTEGER }) }",
+        );
+        if let Statement::Schema(SchemaStatement::CreateGraphType(create)) = stmt {
+            assert_eq!(create.inline_types.len(), 1);
+            if let InlineElementType::Node { properties, .. } = &create.inline_types[0] {
+                assert_eq!(properties.len(), 2);
+                assert_eq!(properties[0].name, "name");
+                assert!(!properties[0].nullable);
+                assert_eq!(properties[1].name, "age");
+                assert!(properties[1].nullable);
+            } else {
+                panic!("Expected node type");
+            }
+        } else {
+            panic!("Expected Schema(CreateGraphType)");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_edge_with_properties() {
+        use crate::query::schema::{InlineElementType, SchemaStatement};
+
+        let stmt = parse_ok(
+            "ALTER CURRENT GRAPH TYPE SET { (:Person)-[:KNOWS { since INTEGER }]->(:Person) }",
+        );
+        if let Statement::Schema(SchemaStatement::CreateGraphType(create)) = stmt {
+            assert_eq!(create.inline_types.len(), 1);
+            if let InlineElementType::Edge {
+                name, properties, ..
+            } = &create.inline_types[0]
+            {
+                assert_eq!(name, "KNOWS");
+                assert_eq!(properties.len(), 1);
+                assert_eq!(properties[0].name, "since");
+                assert_eq!(properties[0].data_type, "INTEGER");
+            } else {
+                panic!("Expected edge type");
+            }
+        } else {
+            panic!("Expected Schema(CreateGraphType)");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_missing_operation() {
+        let mut parser = Parser::new("ALTER CURRENT GRAPH TYPE INVALID {}");
+        assert!(parser.parse().is_err());
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_case_insensitive() {
+        let stmt = parse_ok("alter current graph type set { (:Label) }");
+        assert!(matches!(stmt, Statement::Schema(_)));
+    }
+
+    #[test]
+    fn test_parse_alter_current_graph_type_with_semicolon() {
+        let stmt = parse_ok("SHOW CURRENT GRAPH TYPE;");
+        assert!(matches!(stmt, Statement::ShowCurrentGraphType));
+    }
+
+    // ==================== Recursion depth limit tests ====================
+
+    #[test]
+    fn test_deeply_nested_parentheses_errors_not_stack_overflow() {
+        let deep = "(".repeat(300) + "1" + &")".repeat(300);
+        let query = format!("MATCH (n) RETURN {deep}");
+        let mut parser = Parser::new(&query);
+        let result = parser.parse();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nesting depth"),
+            "Expected nesting depth error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_long_power_and_sign_chains_error_not_stack_overflow() {
+        for query in [
+            format!("RETURN 2{}", " ^ 2".repeat(50_000)),
+            format!("RETURN {}1", "- ".repeat(50_000)),
+            format!("RETURN {}1", "+ ".repeat(50_000)),
+            format!("RETURN {}true", "NOT ".repeat(50_000)),
+        ] {
+            let err = Parser::new(&query).parse().unwrap_err().to_string();
+            assert!(err.contains("nesting depth"), "got: {err}");
+        }
+        assert!(
+            Parser::new(&format!("RETURN 2{}", " ^ 1".repeat(20)))
+                .parse()
+                .is_ok()
+        );
+        assert!(Parser::new("RETURN NOT NOT true").parse().is_ok());
+    }
+
+    #[test]
+    fn test_moderate_nesting_succeeds() {
+        let depth = 50;
+        let deep = "(".repeat(depth) + "1" + &")".repeat(depth);
+        let query = format!("RETURN {deep}");
+        let mut parser = Parser::new(&query);
+        let result = parser.parse();
+        assert!(result.is_ok(), "50 levels of nesting should succeed");
+    }
+
+    #[test]
+    fn test_explain_recursion_depth_limit() {
+        let query = "EXPLAIN ".repeat(200) + "RETURN 1";
+        let mut parser = Parser::new(&query);
+        let result = parser.parse();
+        assert!(result.is_err(), "Deeply nested EXPLAIN should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nesting depth"),
+            "Expected nesting depth error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_recursion_depth_limit() {
+        let query = "PROFILE ".repeat(200) + "RETURN 1";
+        let mut parser = Parser::new(&query);
+        let result = parser.parse();
+        assert!(result.is_err(), "Deeply nested PROFILE should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nesting depth"),
+            "Expected nesting depth error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_single_explain_succeeds() {
+        let query = "EXPLAIN RETURN 1";
+        let mut parser = Parser::new(query);
+        let result = parser.parse();
+        assert!(result.is_ok(), "Single EXPLAIN should succeed");
+    }
+
+    #[test]
+    fn test_nested_case_expression_depth_limit() {
+        let prefix = "CASE WHEN true THEN ".repeat(300);
+        let suffix = " END".repeat(300);
+        let query = format!("RETURN {prefix}1{suffix}");
+        let mut parser = Parser::new(&query);
+        let result = parser.parse();
+        assert!(
+            result.is_err(),
+            "Deeply nested CASE should error, not stack overflow"
+        );
+    }
+
+    #[test]
+    fn test_nested_list_comprehension_depth_limit() {
+        let deep = "[x IN ".repeat(300) + "[1]" + &" | x]".repeat(300);
+        let query = format!("RETURN {deep}");
+        let mut parser = Parser::new(&query);
+        // Should error or parse, but never stack overflow
+        let _ = parser.parse();
+    }
+
+    #[test]
+    fn test_cypher_error_includes_language_prefix() {
+        let mut parser = Parser::new("INVALID SYNTAX");
+        let result = parser.parse();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("[Cypher]"),
+            "Cypher errors should be prefixed with [Cypher], got: {err}"
+        );
+    }
+
+    /// The variable scope clause of `CALL (a, b) { ... }`: the names, `*` for
+    /// `(*)`, none for `()`, and `None` without a clause. A procedure call
+    /// has its name before any parenthesis.
+    #[test]
+    fn test_call_subquery_scope_clause() {
+        let scope_of = |query: &str| {
+            let Statement::Query(statement) = parse_ok(query) else {
+                panic!("expected a query: {query}");
+            };
+            statement
+                .clauses
+                .iter()
+                .find_map(|clause| match clause {
+                    Clause::CallSubquery { scope, .. } => Some(scope.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("expected a CALL subquery: {query}"))
+        };
+        let names = |names: &[&str]| Some(names.iter().map(ToString::to_string).collect());
+        assert_eq!(
+            scope_of("MATCH (a), (b) CALL (a, b) { RETURN 1 AS x } RETURN x"),
+            names(&["a", "b"])
+        );
+        assert_eq!(
+            scope_of("MATCH (a) CALL (*) { RETURN 1 AS x } RETURN x"),
+            names(&["*"])
+        );
+        assert_eq!(
+            scope_of("MATCH (a) CALL () { RETURN 1 AS x } RETURN x"),
+            names(&[])
+        );
+        assert_eq!(
+            scope_of("MATCH (a) CALL { WITH a RETURN 1 AS x } RETURN x"),
+            None
+        );
+        parse_err("MATCH (a) CALL (1) { RETURN 1 AS x } RETURN x");
+        let Statement::Query(procedure) = parse_ok("CALL db.labels() YIELD label RETURN label")
+        else {
+            panic!("expected a query");
+        };
+        assert!(matches!(procedure.clauses[0], Clause::Call(_)));
+    }
+
+    /// A CALL subquery body takes ORDER BY, SKIP and LIMIT after its RETURN,
+    /// and parts joined by UNION or UNION ALL (one kind per chain).
+    #[test]
+    fn test_call_subquery_body_paging_and_union() {
+        let call_of = |query: &str| {
+            let Statement::Query(statement) = parse_ok(query) else {
+                panic!("expected a query: {query}");
+            };
+            statement
+                .clauses
+                .into_iter()
+                .find_map(|clause| match clause {
+                    Clause::CallSubquery {
+                        query,
+                        unions,
+                        union_all,
+                        ..
+                    } => Some((query, unions, union_all)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("expected a CALL subquery: {query}"))
+        };
+        let (body, unions, _) = call_of(
+            "MATCH (a) CALL (a) { MATCH (a)-->(b) RETURN b ORDER BY b.x DESC SKIP 1 LIMIT 2 } RETURN b",
+        );
+        assert!(unions.is_empty());
+        assert!(matches!(
+            body.clauses[..],
+            [
+                Clause::Match(_),
+                Clause::Return(_),
+                Clause::OrderBy(_),
+                Clause::Skip(_),
+                Clause::Limit(_)
+            ]
+        ));
+        let (_, unions, union_all) =
+            call_of("CALL { RETURN 1 AS x UNION RETURN 2 AS x UNION RETURN 3 AS x } RETURN x");
+        assert_eq!((unions.len(), union_all), (2, false));
+        let (_, unions, union_all) =
+            call_of("CALL { RETURN 1 AS x UNION ALL RETURN 1 AS x } RETURN x");
+        assert_eq!((unions.len(), union_all), (1, true));
+        parse_err("CALL { RETURN 1 AS x UNION RETURN 2 AS x UNION ALL RETURN 3 AS x } RETURN x");
+        parse_err("RETURN 1 AS x UNION ALL RETURN 2 AS x UNION RETURN 3 AS x");
+    }
+
+    /// EXISTS and COUNT subqueries take OPTIONAL MATCH clauses.
+    #[test]
+    fn test_exists_and_count_take_optional_match() {
+        for query in [
+            "MATCH (a) WHERE EXISTS { MATCH (a)-->(b) OPTIONAL MATCH (b)-->(c) } RETURN a",
+            "MATCH (a) RETURN COUNT { MATCH (a)-->(b) OPTIONAL MATCH (b)-->(c) WHERE c.x > 1 } AS n",
+        ] {
+            let Statement::Query(statement) = parse_ok(query) else {
+                panic!("expected a query: {query}");
+            };
+            let text = format!("{statement:?}");
+            assert!(text.contains("OptionalMatch"), "{query}: {text}");
+        }
+    }
+
+    /// The property types the parser refuses: malformed lists, unknown or
+    /// out-of-range element types, quoted keywords, and lists nested deeper
+    /// than a value may be. What it accepts is checked end to end in the
+    /// engine's `cypher_type_ddl` tests.
+    #[test]
+    fn cypher_property_type_errors_and_list_depth_are_bounded() {
+        for data_type in [
+            "ZONED",
+            "LOCAL STRING",
+            "LIST<>",
+            "LIST<STRING",
+            "LIST<STRING>>",
+            "LIST<UNKNOWN_TYPE>",
+            "LIST<DECIMAL(0,0)>",
+            "`LIST<STRING>`",
+            "`LIST`<STRING>",
+            "`ZONED` DATETIME",
+            "`LOCAL` DATETIME",
+        ] {
+            parse_err(&format!(
+                "ALTER CURRENT GRAPH TYPE SET {{ (:T {{a {data_type}}}) }}"
+            ));
+        }
+        let nested = |depth: usize| format!("{}INT64{}", "LIST<".repeat(depth), ">".repeat(depth));
+        for depth in [129, 100_000] {
+            let query = format!(
+                "ALTER CURRENT GRAPH TYPE SET {{ (:T {{a {}}}) }}",
+                nested(depth)
+            );
+            let error = Parser::new(&query).parse().unwrap_err().to_string();
+            assert!(
+                error.contains("A property type nests at most 128 LIST<...> levels"),
+                "depth {depth}: {error}"
+            );
+        }
+    }
+}

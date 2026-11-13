@@ -1,0 +1,636 @@
+//! GQLSTATUS diagnostic codes per ISO/IEC 39075:2024, sec 23.
+//!
+//! Every query result carries a [`GqlStatus`] code (5-character string like `"00000"`)
+//! and, on errors, an optional [`DiagnosticRecord`] with operation context.
+
+use std::fmt;
+
+/// A GQLSTATUS code: 2-character class + 3-character subclass.
+///
+/// Standard classes:
+/// - `00` successful completion
+/// - `01` warning
+/// - `02` no data
+/// - `08` connection exception
+/// - `22` data exception
+/// - `25` invalid transaction state
+/// - `40` transaction rollback
+/// - `42` syntax error or access rule violation
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GqlStatus {
+    code: [u8; 5],
+}
+
+impl GqlStatus {
+    // ── Successful completion (class 00) ──────────────────────────────
+
+    /// `00000` - successful completion, no subclass.
+    pub const SUCCESS: Self = Self::from_bytes(*b"00000");
+
+    /// `00001` - successful completion, omitted result.
+    pub const SUCCESS_OMITTED_RESULT: Self = Self::from_bytes(*b"00001");
+
+    // ── Warning (class 01) ────────────────────────────────────────────
+
+    /// `01000` - warning, no subclass.
+    pub const WARNING: Self = Self::from_bytes(*b"01000");
+
+    /// `01004` - warning: string data, right truncation.
+    pub const WARNING_STRING_TRUNCATION: Self = Self::from_bytes(*b"01004");
+
+    /// `01G03` - warning: graph does not exist.
+    pub const WARNING_GRAPH_NOT_EXIST: Self = Self::from_bytes(*b"01G03");
+
+    /// `01G04` - warning: graph type does not exist.
+    pub const WARNING_GRAPH_TYPE_NOT_EXIST: Self = Self::from_bytes(*b"01G04");
+
+    /// `01G11` - warning: null value eliminated in set function.
+    pub const WARNING_NULL_ELIMINATED: Self = Self::from_bytes(*b"01G11");
+
+    // ── No data (class 02) ────────────────────────────────────────────
+
+    /// `02000` - no data.
+    pub const NO_DATA: Self = Self::from_bytes(*b"02000");
+
+    // ── Connection exception (class 08) ───────────────────────────────
+
+    /// `08000` - connection exception, no subclass: the database cannot be
+    /// opened for this client, such as a database file another handle or
+    /// process holds.
+    pub const CONNECTION_EXCEPTION: Self = Self::from_bytes(*b"08000");
+
+    // ── Data exception (class 22) ─────────────────────────────────────
+
+    /// `22000` - data exception, no subclass.
+    pub const DATA_EXCEPTION: Self = Self::from_bytes(*b"22000");
+
+    /// `22001` - string data, right truncation.
+    pub const DATA_STRING_TRUNCATION: Self = Self::from_bytes(*b"22001");
+
+    /// `22003` - numeric value out of range.
+    pub const DATA_NUMERIC_OUT_OF_RANGE: Self = Self::from_bytes(*b"22003");
+
+    /// `22004` - null value not allowed.
+    pub const DATA_NULL_NOT_ALLOWED: Self = Self::from_bytes(*b"22004");
+
+    /// `22018` - invalid character value for cast.
+    pub const DATA_INVALID_CHARACTER_VALUE_FOR_CAST: Self = Self::from_bytes(*b"22018");
+
+    /// `22009` - invalid time zone displacement value.
+    pub const DATA_INVALID_TIME_ZONE_DISPLACEMENT: Self = Self::from_bytes(*b"22009");
+
+    /// `22012` - division by zero.
+    pub const DATA_DIVISION_BY_ZERO: Self = Self::from_bytes(*b"22012");
+
+    /// `22G02` - negative limit value.
+    pub const DATA_NEGATIVE_LIMIT: Self = Self::from_bytes(*b"22G02");
+
+    /// `22G03` - invalid value type.
+    pub const DATA_INVALID_VALUE_TYPE: Self = Self::from_bytes(*b"22G03");
+
+    /// `22G12` - invalid value type, of a dynamically typed operand (ISO/IEC 39075 4.14.4).
+    pub const DATA_INVALID_OPERAND_TYPE: Self = Self::from_bytes(*b"22G12");
+
+    /// `22G04` - values not comparable.
+    pub const DATA_VALUES_NOT_COMPARABLE: Self = Self::from_bytes(*b"22G04");
+
+    /// `22023` - invalid parameter value (ISO/IEC 9075-2 13.3 General Rule 7).
+    pub const DATA_INVALID_PARAMETER_VALUE: Self = Self::from_bytes(*b"22023");
+
+    // ── Invalid transaction state (class 25) ──────────────────────────
+
+    /// `25000` - invalid transaction state, no subclass.
+    pub const INVALID_TX_STATE: Self = Self::from_bytes(*b"25000");
+
+    /// `25G01` - active GQL-transaction.
+    pub const INVALID_TX_ACTIVE: Self = Self::from_bytes(*b"25G01");
+
+    /// `25G03` - read-only GQL-transaction.
+    pub const INVALID_TX_READ_ONLY: Self = Self::from_bytes(*b"25G03");
+
+    // ── Invalid transaction termination (class 2D) ────────────────────
+
+    /// `2D000` - invalid transaction termination.
+    pub const INVALID_TX_TERMINATION: Self = Self::from_bytes(*b"2D000");
+
+    // ── Transaction rollback (class 40) ───────────────────────────────
+
+    /// `40000` - transaction rollback, no subclass.
+    pub const TX_ROLLBACK: Self = Self::from_bytes(*b"40000");
+
+    /// `40003` - statement completion unknown.
+    pub const TX_COMPLETION_UNKNOWN: Self = Self::from_bytes(*b"40003");
+
+    // ── Syntax error or access rule violation (class 42) ──────────────
+
+    /// `42000` - syntax error or access rule violation, no subclass.
+    pub const SYNTAX_ERROR: Self = Self::from_bytes(*b"42000");
+
+    /// `42001` - invalid syntax.
+    pub const SYNTAX_INVALID: Self = Self::from_bytes(*b"42001");
+
+    /// `42002` - invalid reference.
+    pub const SYNTAX_INVALID_REFERENCE: Self = Self::from_bytes(*b"42002");
+
+    /// `42501` - insufficient privilege: the session may not do what the
+    /// statement does (ISO/IEC 9075-2; GQL leaves an access rule violation
+    /// in class 42 without a subclass of its own).
+    pub const SYNTAX_INSUFFICIENT_PRIVILEGE: Self = Self::from_bytes(*b"42501");
+
+    // ── Dependent object error (class G1) ─────────────────────────────
+
+    /// `G1000` - dependent object error, no subclass.
+    pub const DEPENDENT_OBJECT_ERROR: Self = Self::from_bytes(*b"G1000");
+
+    /// `G1001` - dependent object error: edges still exist.
+    pub const EDGES_STILL_EXIST: Self = Self::from_bytes(*b"G1001");
+
+    // ── Graph type violation (class G2) ───────────────────────────────
+
+    /// `G2000` - graph type violation.
+    pub const GRAPH_TYPE_VIOLATION: Self = Self::from_bytes(*b"G2000");
+
+    // ── Constructors ──────────────────────────────────────────────────
+
+    /// Creates a `GqlStatus` from a 5-byte array. Panics if bytes are not ASCII.
+    #[must_use]
+    pub(crate) const fn from_bytes(bytes: [u8; 5]) -> Self {
+        Self { code: bytes }
+    }
+
+    /// Creates a `GqlStatus` from a 5-character string slice.
+    ///
+    /// Returns `None` if the string is not exactly 5 ASCII characters.
+    #[must_use]
+    pub fn from_str(s: &str) -> Option<Self> {
+        let bytes = s.as_bytes();
+        if bytes.len() != 5 {
+            return None;
+        }
+        if !bytes.iter().all(|b| b.is_ascii_alphanumeric()) {
+            return None;
+        }
+        Some(Self {
+            code: [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]],
+        })
+    }
+
+    /// Returns the 5-character GQLSTATUS code as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Safety: all codes are constructed from ASCII bytes
+        std::str::from_utf8(&self.code).unwrap_or("?????")
+    }
+
+    /// Returns the 2-character class code (e.g., `"00"`, `"42"`).
+    #[must_use]
+    pub fn class_code(&self) -> &str {
+        &self.as_str()[..2]
+    }
+
+    /// Returns the 3-character subclass code (e.g., `"000"`, `"001"`).
+    #[must_use]
+    pub fn subclass_code(&self) -> &str {
+        &self.as_str()[2..]
+    }
+
+    /// True if this is a successful completion (class `00`).
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.code[0] == b'0' && self.code[1] == b'0'
+    }
+
+    /// True if this is a warning (class `01`).
+    #[must_use]
+    pub fn is_warning(&self) -> bool {
+        self.code[0] == b'0' && self.code[1] == b'1'
+    }
+
+    /// True if this is a no-data condition (class `02`).
+    #[must_use]
+    pub fn is_no_data(&self) -> bool {
+        self.code[0] == b'0' && self.code[1] == b'2'
+    }
+
+    /// True if this is an exception condition (not success, warning, or no-data).
+    #[must_use]
+    pub fn is_exception(&self) -> bool {
+        !self.is_success() && !self.is_warning() && !self.is_no_data()
+    }
+}
+
+impl fmt::Display for GqlStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Maps a Grafeo [`super::error::Error`] to a GQLSTATUS code.
+impl From<&super::error::Error> for GqlStatus {
+    fn from(err: &super::error::Error) -> Self {
+        use super::error::{ConstraintKind, Error, QueryErrorKind, StorageError, TransactionError};
+
+        match err {
+            Error::Query(q) => match q.kind {
+                QueryErrorKind::Lexer | QueryErrorKind::Syntax => GqlStatus::SYNTAX_INVALID,
+                // ISO/IEC 39075 §4: a violated syntax rule without a
+                // condition of its own is 42000.
+                QueryErrorKind::Semantic => GqlStatus::SYNTAX_ERROR,
+                QueryErrorKind::InvalidReference => GqlStatus::SYNTAX_INVALID_REFERENCE,
+                QueryErrorKind::Optimization => GqlStatus::SYNTAX_ERROR,
+                QueryErrorKind::Execution => GqlStatus::DATA_EXCEPTION,
+                QueryErrorKind::Timeout => GqlStatus::DATA_EXCEPTION,
+                QueryErrorKind::NumericOutOfRange => GqlStatus::DATA_NUMERIC_OUT_OF_RANGE,
+                QueryErrorKind::InvalidCharacterValueForCast => {
+                    GqlStatus::DATA_INVALID_CHARACTER_VALUE_FOR_CAST
+                }
+                QueryErrorKind::DivisionByZero => GqlStatus::DATA_DIVISION_BY_ZERO,
+                QueryErrorKind::NegativeLimit => GqlStatus::DATA_NEGATIVE_LIMIT,
+                QueryErrorKind::InvalidValueType => GqlStatus::DATA_INVALID_VALUE_TYPE,
+                QueryErrorKind::WrongKind => GqlStatus::DATA_INVALID_OPERAND_TYPE,
+                QueryErrorKind::InvalidTimeZoneDisplacement => {
+                    GqlStatus::DATA_INVALID_TIME_ZONE_DISPLACEMENT
+                }
+                QueryErrorKind::ValuesNotComparable => GqlStatus::DATA_VALUES_NOT_COMPARABLE,
+                QueryErrorKind::InvalidParameterValue => GqlStatus::DATA_INVALID_PARAMETER_VALUE,
+                // GQL defines no class for a feature an implementation lacks.
+                QueryErrorKind::Unsupported => GqlStatus::SYNTAX_ERROR,
+                QueryErrorKind::PermissionDenied | QueryErrorKind::ExternalAccessDenied => {
+                    GqlStatus::SYNTAX_INSUFFICIENT_PRIVILEGE
+                }
+            },
+            Error::Transaction(t) => match t {
+                TransactionError::ReadOnly => GqlStatus::INVALID_TX_READ_ONLY,
+                TransactionError::ActiveTransaction(_) => GqlStatus::INVALID_TX_ACTIVE,
+                TransactionError::InvalidState(_) => GqlStatus::INVALID_TX_STATE,
+                TransactionError::Aborted
+                | TransactionError::Conflict
+                | TransactionError::WriteConflict(_) => GqlStatus::TX_ROLLBACK,
+                TransactionError::SerializationFailure(_) => GqlStatus::TX_ROLLBACK,
+                TransactionError::Deadlock => GqlStatus::TX_ROLLBACK,
+                TransactionError::Timeout | TransactionError::DatabaseClosed => {
+                    GqlStatus::INVALID_TX_STATE
+                }
+                // The status flags the database, not the refused operation
+                // (which did not happen): it holds an earlier commit whose
+                // completion is unknown, and must be reopened.
+                TransactionError::IncompleteCommit => GqlStatus::TX_COMPLETION_UNKNOWN,
+                // Rolled back, or never started: nothing of the commit remains.
+                TransactionError::LogWriteFailed(_) | TransactionError::LogUnavailable(_) => {
+                    GqlStatus::TX_ROLLBACK
+                }
+                // The one case the class was made for.
+                TransactionError::CommitOutcomeUnknown(_) => GqlStatus::TX_COMPLETION_UNKNOWN,
+            },
+            Error::TypeMismatch(_) => GqlStatus::DATA_INVALID_VALUE_TYPE,
+            Error::InvalidValue(_) => GqlStatus::DATA_EXCEPTION,
+            Error::Constraint { kind, .. } => match kind {
+                ConstraintKind::Schema => GqlStatus::GRAPH_TYPE_VIOLATION,
+                ConstraintKind::EdgesStillExist => GqlStatus::EDGES_STILL_EXIST,
+                ConstraintKind::Limit => GqlStatus::DATA_EXCEPTION,
+            },
+            Error::NodeNotFound(_) | Error::EdgeNotFound(_) => GqlStatus::NO_DATA,
+            Error::PropertyNotFound(_) | Error::LabelNotFound(_) => {
+                GqlStatus::SYNTAX_INVALID_REFERENCE
+            }
+            // Opening a database is where the client connects to it.
+            Error::Storage(storage) if matches!(**storage, StorageError::Locked(_)) => {
+                GqlStatus::CONNECTION_EXCEPTION
+            }
+            Error::Storage(_) => GqlStatus::DATA_EXCEPTION,
+            Error::Serialization(_) | Error::Corruption(_) => GqlStatus::DATA_EXCEPTION,
+            Error::Io(_) => GqlStatus::DATA_EXCEPTION,
+            Error::Internal(_) => GqlStatus::DATA_EXCEPTION,
+        }
+    }
+}
+
+/// Diagnostic record attached to error conditions (ISO sec 23.2).
+///
+/// Contains contextual information about the operation that raised the condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticRecord {
+    /// Identifier of the operation executed (e.g., `"MATCH STATEMENT"`).
+    pub operation: String,
+    /// Numeric operation code per Table 9 of the spec.
+    pub operation_code: i32,
+    /// Current working schema reference, if any.
+    pub current_schema: Option<String>,
+    /// Invalid reference identifier (only for GQLSTATUS `42002`).
+    pub invalid_reference: Option<String>,
+}
+
+impl DiagnosticRecord {
+    /// Creates a diagnostic record for a query operation.
+    #[must_use]
+    pub fn for_query(operation: impl Into<String>, operation_code: i32) -> Self {
+        Self {
+            operation: operation.into(),
+            operation_code,
+            current_schema: None,
+            invalid_reference: None,
+        }
+    }
+}
+
+/// Operation codes from ISO Table 9.
+pub mod operation_codes {
+    /// SESSION SET SCHEMA.
+    pub const SESSION_SET_SCHEMA: i32 = 1;
+    /// SESSION SET GRAPH.
+    pub const SESSION_SET_GRAPH: i32 = 2;
+    /// SESSION SET TIME ZONE.
+    pub const SESSION_SET_TIME_ZONE: i32 = 3;
+    /// SESSION RESET.
+    pub const SESSION_RESET: i32 = 7;
+    /// SESSION CLOSE.
+    pub const SESSION_CLOSE: i32 = 8;
+    /// START TRANSACTION.
+    pub const START_TRANSACTION: i32 = 50;
+    /// ROLLBACK.
+    pub const ROLLBACK: i32 = 51;
+    /// COMMIT.
+    pub const COMMIT: i32 = 52;
+    /// CREATE SCHEMA.
+    pub const CREATE_SCHEMA: i32 = 100;
+    /// DROP SCHEMA.
+    pub const DROP_SCHEMA: i32 = 101;
+    /// CREATE GRAPH.
+    pub const CREATE_GRAPH: i32 = 200;
+    /// DROP GRAPH.
+    pub const DROP_GRAPH: i32 = 201;
+    /// CREATE GRAPH TYPE.
+    pub const CREATE_GRAPH_TYPE: i32 = 300;
+    /// DROP GRAPH TYPE.
+    pub const DROP_GRAPH_TYPE: i32 = 301;
+    /// INSERT.
+    pub const INSERT: i32 = 500;
+    /// SET.
+    pub const SET: i32 = 501;
+    /// REMOVE.
+    pub const REMOVE: i32 = 502;
+    /// DELETE.
+    pub const DELETE: i32 = 503;
+    /// MATCH.
+    pub const MATCH: i32 = 600;
+    /// FILTER.
+    pub const FILTER: i32 = 601;
+    /// LET.
+    pub const LET: i32 = 602;
+    /// FOR.
+    pub const FOR: i32 = 603;
+    /// ORDER BY / LIMIT / SKIP.
+    pub const ORDER_BY_AND_PAGE: i32 = 604;
+    /// RETURN.
+    pub const RETURN: i32 = 605;
+    /// SELECT.
+    pub const SELECT: i32 = 606;
+    /// CALL procedure.
+    pub const CALL_PROCEDURE: i32 = 800;
+    /// Unrecognized operation.
+    pub const UNRECOGNIZED: i32 = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gqlstatus_constants() {
+        assert_eq!(GqlStatus::SUCCESS.as_str(), "00000");
+        assert_eq!(GqlStatus::NO_DATA.as_str(), "02000");
+        assert_eq!(GqlStatus::SYNTAX_INVALID.as_str(), "42001");
+        assert_eq!(GqlStatus::TX_ROLLBACK.as_str(), "40000");
+    }
+
+    #[test]
+    fn test_gqlstatus_classification() {
+        assert!(GqlStatus::SUCCESS.is_success());
+        assert!(!GqlStatus::SUCCESS.is_warning());
+        assert!(!GqlStatus::SUCCESS.is_exception());
+
+        assert!(GqlStatus::WARNING.is_warning());
+        assert!(!GqlStatus::WARNING.is_success());
+        assert!(!GqlStatus::WARNING.is_exception());
+
+        assert!(GqlStatus::NO_DATA.is_no_data());
+        assert!(!GqlStatus::NO_DATA.is_exception());
+
+        assert!(GqlStatus::SYNTAX_ERROR.is_exception());
+        assert!(GqlStatus::DATA_EXCEPTION.is_exception());
+        assert!(GqlStatus::TX_ROLLBACK.is_exception());
+    }
+
+    #[test]
+    fn test_gqlstatus_class_subclass() {
+        assert_eq!(GqlStatus::SUCCESS.class_code(), "00");
+        assert_eq!(GqlStatus::SUCCESS.subclass_code(), "000");
+
+        assert_eq!(GqlStatus::SYNTAX_INVALID.class_code(), "42");
+        assert_eq!(GqlStatus::SYNTAX_INVALID.subclass_code(), "001");
+
+        assert_eq!(GqlStatus::DATA_DIVISION_BY_ZERO.class_code(), "22");
+        assert_eq!(GqlStatus::DATA_DIVISION_BY_ZERO.subclass_code(), "012");
+    }
+
+    #[test]
+    fn test_gqlstatus_from_str() {
+        assert_eq!(GqlStatus::from_str("00000"), Some(GqlStatus::SUCCESS));
+        assert_eq!(GqlStatus::from_str("0000"), None); // too short
+        assert_eq!(GqlStatus::from_str("000000"), None); // too long
+        assert_eq!(GqlStatus::from_str("00 00"), None); // has space
+    }
+
+    #[test]
+    fn test_gqlstatus_display() {
+        assert_eq!(format!("{}", GqlStatus::SUCCESS), "00000");
+        assert_eq!(format!("{}", GqlStatus::SYNTAX_INVALID), "42001");
+    }
+
+    #[test]
+    fn test_error_to_gqlstatus() {
+        use super::super::error::{Error, QueryError, QueryErrorKind, TransactionError};
+
+        let syntax_err = Error::from(QueryError::new(QueryErrorKind::Syntax, "bad syntax"));
+        assert_eq!(GqlStatus::from(&syntax_err), GqlStatus::SYNTAX_INVALID);
+
+        let tx_err = Error::Transaction(TransactionError::ReadOnly);
+        assert_eq!(GqlStatus::from(&tx_err), GqlStatus::INVALID_TX_READ_ONLY);
+
+        let conflict = Error::Transaction(TransactionError::Conflict);
+        assert_eq!(GqlStatus::from(&conflict), GqlStatus::TX_ROLLBACK);
+
+        let type_err = Error::type_mismatch("INT64", "STRING");
+        assert_eq!(
+            GqlStatus::from(&type_err),
+            GqlStatus::DATA_INVALID_VALUE_TYPE
+        );
+    }
+
+    /// Each kind of query error has one GQLSTATUS, decided here: a name
+    /// that resolves to nothing is 42002 (invalid reference), any other
+    /// violated rule beyond the grammar 42000 (ISO/IEC 39075 §4), a feature
+    /// Grafeo lacks 42000, and the data exceptions their own subclass.
+    #[test]
+    fn every_query_error_kind_has_its_gqlstatus() {
+        use super::super::error::{Error, ErrorCode, QueryError, QueryErrorKind};
+
+        /// The decided status and error code of each kind, by an exhaustive match: a kind
+        /// added to `QueryErrorKind` fails to compile here until it has its row (and a place in
+        /// `KINDS` below).
+        fn decided(kind: QueryErrorKind) -> (&'static str, ErrorCode) {
+            match kind {
+                QueryErrorKind::Lexer | QueryErrorKind::Syntax => ("42001", ErrorCode::QuerySyntax),
+                QueryErrorKind::Semantic => ("42000", ErrorCode::QuerySemantic),
+                QueryErrorKind::InvalidReference => ("42002", ErrorCode::QuerySemantic),
+                QueryErrorKind::Optimization => ("42000", ErrorCode::QueryOptimization),
+                QueryErrorKind::Unsupported => ("42000", ErrorCode::QueryUnsupported),
+                QueryErrorKind::Execution => ("22000", ErrorCode::QueryExecution),
+                QueryErrorKind::Timeout => ("22000", ErrorCode::QueryTimeout),
+                QueryErrorKind::NumericOutOfRange => ("22003", ErrorCode::QueryExecution),
+                QueryErrorKind::InvalidCharacterValueForCast => {
+                    ("22018", ErrorCode::QueryExecution)
+                }
+                QueryErrorKind::DivisionByZero => ("22012", ErrorCode::QueryExecution),
+                QueryErrorKind::NegativeLimit => ("22G02", ErrorCode::QueryExecution),
+                QueryErrorKind::InvalidValueType => ("22G03", ErrorCode::QueryExecution),
+                QueryErrorKind::WrongKind => ("22G12", ErrorCode::QueryExecution),
+                QueryErrorKind::InvalidTimeZoneDisplacement => ("22009", ErrorCode::QueryExecution),
+                QueryErrorKind::ValuesNotComparable => ("22G04", ErrorCode::QueryExecution),
+                QueryErrorKind::InvalidParameterValue => ("22023", ErrorCode::QueryExecution),
+                QueryErrorKind::PermissionDenied => ("42501", ErrorCode::QueryPermissionDenied),
+                QueryErrorKind::ExternalAccessDenied => {
+                    ("42501", ErrorCode::QueryExternalAccessDenied)
+                }
+            }
+        }
+
+        /// The kind after `kind` (the first after `None`), by an exhaustive match: a kind added
+        /// to `QueryErrorKind` fails to compile here until it has its place, so the loop below
+        /// reaches every kind.
+        fn next(kind: Option<QueryErrorKind>) -> Option<QueryErrorKind> {
+            use QueryErrorKind as K;
+            match kind {
+                None => Some(K::Lexer),
+                Some(K::Lexer) => Some(K::Syntax),
+                Some(K::Syntax) => Some(K::Semantic),
+                Some(K::Semantic) => Some(K::InvalidReference),
+                Some(K::InvalidReference) => Some(K::Optimization),
+                Some(K::Optimization) => Some(K::Unsupported),
+                Some(K::Unsupported) => Some(K::Execution),
+                Some(K::Execution) => Some(K::Timeout),
+                Some(K::Timeout) => Some(K::NumericOutOfRange),
+                Some(K::NumericOutOfRange) => Some(K::InvalidCharacterValueForCast),
+                Some(K::InvalidCharacterValueForCast) => Some(K::DivisionByZero),
+                Some(K::DivisionByZero) => Some(K::NegativeLimit),
+                Some(K::NegativeLimit) => Some(K::InvalidValueType),
+                Some(K::InvalidValueType) => Some(K::WrongKind),
+                Some(K::WrongKind) => Some(K::InvalidTimeZoneDisplacement),
+                Some(K::InvalidTimeZoneDisplacement) => Some(K::ValuesNotComparable),
+                Some(K::ValuesNotComparable) => Some(K::InvalidParameterValue),
+                Some(K::InvalidParameterValue) => Some(K::PermissionDenied),
+                Some(K::PermissionDenied) => Some(K::ExternalAccessDenied),
+                Some(K::ExternalAccessDenied) => None,
+            }
+        }
+
+        let mut kinds = Vec::new();
+        let mut at = next(None);
+        while let Some(kind) = at {
+            assert!(!kinds.contains(&kind), "{kind:?} twice: `next` loops");
+            kinds.push(kind);
+            at = next(Some(kind));
+        }
+        assert_eq!(kinds.len(), 19, "{kinds:?}");
+        for kind in kinds {
+            let (status, code) = decided(kind);
+            let error = QueryError::new(kind, "message");
+            assert_eq!(error.error_code(), code, "{kind:?}");
+            assert_eq!(
+                GqlStatus::from(&Error::from(error)).as_str(),
+                status,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A computation that leaves its type's range or divides by zero is a
+    /// data exception of its own subclass (ISO GQL 22003 and 22012), under the
+    /// code of a statement that failed on its data (#639).
+    #[test]
+    fn numeric_errors_have_their_data_exception_subclass() {
+        use super::super::error::{Error, ErrorCode, QueryError, QueryErrorKind};
+
+        for (kind, status, shown) in [
+            (
+                QueryErrorKind::NumericOutOfRange,
+                GqlStatus::DATA_NUMERIC_OUT_OF_RANGE,
+                "numeric value out of range",
+            ),
+            (
+                QueryErrorKind::DivisionByZero,
+                GqlStatus::DATA_DIVISION_BY_ZERO,
+                "division by zero",
+            ),
+        ] {
+            let error = QueryError::new(kind, "integer overflow in 9223372036854775807 + 1");
+            assert_eq!(error.error_code(), ErrorCode::QueryExecution, "{kind}");
+            assert_eq!(kind.to_string(), shown);
+            assert_eq!(GqlStatus::from(&Error::from(error)), status, "{kind}");
+        }
+    }
+
+    /// After a commit that did not complete, the database holds a commit
+    /// whose completion is unknown and must be reopened: every operation it
+    /// refuses for that reason gets `40003` ("completion unknown"), so a
+    /// client knows to reopen, not the generic invalid state of a closed
+    /// database.
+    /// A commit that was rolled back for its log (the write failed, or the
+    /// log takes no more writes) is a rollback; one whose log could not be
+    /// made durable is the case `40003` exists for.
+    #[test]
+    fn the_commit_log_errors_say_whether_the_commit_may_exist() {
+        use super::super::error::{Error, TransactionError};
+
+        for gone in [
+            TransactionError::LogWriteFailed("disk full".into()),
+            TransactionError::LogUnavailable("an earlier sync failed".into()),
+        ] {
+            assert_eq!(
+                GqlStatus::from(&Error::Transaction(gone)),
+                GqlStatus::TX_ROLLBACK
+            );
+        }
+        assert_eq!(
+            GqlStatus::from(&Error::Transaction(TransactionError::CommitOutcomeUnknown(
+                "fsync failed".into()
+            ))),
+            GqlStatus::TX_COMPLETION_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn an_incomplete_commit_is_completion_unknown() {
+        use super::super::error::{Error, TransactionError};
+
+        assert_eq!(
+            GqlStatus::from(&Error::Transaction(TransactionError::IncompleteCommit)),
+            GqlStatus::TX_COMPLETION_UNKNOWN
+        );
+        assert_eq!(GqlStatus::TX_COMPLETION_UNKNOWN.as_str(), "40003");
+        assert_eq!(
+            GqlStatus::from(&Error::Transaction(TransactionError::DatabaseClosed)),
+            GqlStatus::INVALID_TX_STATE,
+            "a closed database keeps its status"
+        );
+    }
+
+    #[test]
+    fn test_diagnostic_record() {
+        let record = DiagnosticRecord::for_query("MATCH STATEMENT", operation_codes::MATCH);
+        assert_eq!(record.operation, "MATCH STATEMENT");
+        assert_eq!(record.operation_code, 600);
+        assert!(record.current_schema.is_none());
+        assert!(record.invalid_reference.is_none());
+    }
+}
