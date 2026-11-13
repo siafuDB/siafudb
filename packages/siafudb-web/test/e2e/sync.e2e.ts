@@ -1002,7 +1002,7 @@ describe.skipIf(!relayBin)("sync between two browser contexts", () => {
     await converged(
       [r1, r2],
       "the two devices on the closed relay",
-      (g) => g.includes('"r1"') && g.includes('"r2"'),
+      (g) => g.includes("registered") && g.includes("joined"),
     );
     for (const d of [r1, r2])
       expect(await status(d)).toMatchObject({

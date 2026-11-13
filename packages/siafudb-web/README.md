@@ -58,11 +58,16 @@ await db.sync.join({ relayUrl: 'https://relay.example.org', code });
 
 const off = db.sync.onRemoteChange(({ changes }) => rerunQueries()); // another device's writes were applied
 await db.sync.syncNow();              // optional: upload and download now, rejects if the relay is unreachable
-const s = await db.sync.status();     // { enabled, running, connected, pendingUploads, devices, lastSyncAt, lastError, … }
+const s = await db.sync.status();     // { enabled, running, connected, pendingUploads, needsRejoin, deviceList, … }
 ```
 
-- `db.sync.create({ relayUrl })` → pairing code; `db.sync.join({ relayUrl, code })`. Data already in the
-  database is uploaded. After that sync runs by itself and resumes on the next `open()`; nothing to call.
+- `db.sync.create({ relayUrl, registrationToken? })` → pairing code; `db.sync.join({ relayUrl, code })`. Data
+  already in the database is uploaded. After that sync runs by itself and resumes on the next `open()`.
+  `relayUrl` must be `https://`; plain `http://` is accepted for `localhost`, `127.0.0.1` and `[::1]` only.
+- `registrationToken`: for a relay that only accepts new groups from holders of its registration secret.
+  Only `create` needs it (joining never registers); without it such a relay makes `create` reject and no group
+  is made. It is kept in memory, never stored or logged; if the group still has to be registered after a reload,
+  `status().lastError` says so and `db.sync.start({ registrationToken })` supplies it again.
 - `db.sync.status()`, `db.sync.syncNow()`, `db.sync.onRemoteChange(listener)` (returns an unsubscribe function).
 - `db.sync.stop()` / `db.sync.start()`: pause and resume talking to the relay (remembered across reloads).
   `db.sync.leave()`: forget the group on this device; the data stays. `db.sync.pairingCode()`: the code again,
@@ -73,11 +78,30 @@ const s = await db.sync.status();     // { enabled, running, connected, pendingU
   change to the same node or edge, and deleting a node removes its edges on every device.
 - Synced nodes and edges carry a reserved property `_gid` (their id across devices). Do not write it.
 
+**When something is wrong**, `status()` says what:
+
+- `needsRejoin`: this device's storage was rolled back (restored from a backup, a browser profile copied back)
+  and no longer matches what it had uploaded. It keeps receiving, and local writes keep working, but nothing
+  is uploaded until you call `db.sync.rejoinAsNewDevice()`. That gives the device a new identity; everything it
+  wrote in the meantime is then uploaded and counts as written at that moment. It is never done automatically.
+- `deviceList`: one entry per device, `{ id, own, appliedSeq, pending, gap, clockLeadMs, equivocated }`.
+  `clockLeadMs > 0` means that device's writes were ahead of this device's clock: held if under 24 hours,
+  refused if over (one of the two clocks is wrong). `gap` means it is stuck until a resync; `equivocated`
+  means its storage was rolled back at some point.
+- `relayResets`: how often the relay was found to have lost its data. Devices that were up to date carry on;
+  what only the relay held is gone, so a device that joins afterwards cannot read the others' later writes
+  (they show as `pendingDownloads`). Create a new group to recover.
+- `needsResync`: too many received changes were waiting; the relay's log is read again, with growing delays.
+- `notUploaded` / `notApplied` / `lastProblem`: changes that could not be sent or applied, and why.
+- Opening a database whose sync state was written by an older pre-release format fails with code
+  `sync-state-version`. There is no migration.
+
 **What the relay sees.** Everything sent is encrypted and signed on the device with keys derived from the
 pairing code. The relay stores ciphertext and hands it back. It can see: a random id for the group, how many
 items there are, their sizes and timing, and client network addresses. It cannot see: node or edge contents,
 labels, property names or values, which device wrote what, or the pairing code. It can withhold or delay
-items; it cannot forge or alter them unnoticed.
+items; it cannot forge or alter them unnoticed. The access token a device presents is derived for that one
+relay's address, so a relay operator cannot use it on another relay.
 
 **Limits of v0.**
 
@@ -86,8 +110,14 @@ items; it cannot forge or alter them unnoticed.
   new group and re-pair the others. The code is stored in the (encrypted) database on each device.
 - Deleted items are remembered forever so that deletes win, and so is merge bookkeeping per property: the
   sync state only grows, on the devices and on the relay.
-- A new device downloads the group's whole history from the relay; there is no snapshot transfer.
-- The protocol adds no transport security of its own: use `https://` for the relay.
+- A new device downloads the group's whole history from the relay; there is no snapshot transfer. A relay
+  that loses its data loses that history for good.
+- At most 64 devices per group. Each `rejoinAsNewDevice()` counts as one more.
+- A device that was rolled back and wrote before noticing leaves a permanent trace: the other devices may
+  disagree about a few of that device's own writes from around the rollback. Nobody else's data is affected.
+- A device whose clock is more than 24 hours ahead cannot get its writes accepted until its clock is fixed;
+  a device whose clock is far behind refuses everyone else's.
+- The protocol adds no transport security of its own: hence `https://` only.
 - The first device to upload to a relay claims the group's id there.
 - One write (one op) can carry at most 64 KiB. A larger write is split; a single property value over that
   size is not synced and is counted in `status().notUploaded`.
@@ -111,6 +141,6 @@ npm test                       # vitest on Node 24 (crypto, rollback, tamper, sy
 npm run test:e2e               # headless Chromium via Playwright (OPFS, IDB fallback, reload, two tabs, sync)
 ```
 
-The sync e2e test starts a real relay. Build `gsp-relay` from the protocol repository
-(`cargo build -p gsp-relay --release`) and set `GSP_RELAY_BIN` to the binary; without it that one suite
-is skipped with a warning.
+The sync e2e suite starts real relays. Build `gsp-relay` from the protocol repository at the commit pinned in
+the workspace `Cargo.toml` (`cargo build -p gsp-relay --release`) and set `GSP_RELAY_BIN` to the binary.
+Without it that suite is skipped with a warning locally, and fails in CI.
