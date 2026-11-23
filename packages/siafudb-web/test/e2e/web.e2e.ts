@@ -3,12 +3,8 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type Page,
-} from "playwright";
+import { type Browser, type BrowserContext, type Page } from "playwright";
+import { browserName, browserType } from "./browser.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { SiafuDB } from "../../src/index.js";
 
@@ -59,7 +55,7 @@ beforeAll(async () => {
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  browser = await chromium.launch();
+  browser = await browserType.launch();
   ctx = await browser.newContext();
 });
 
@@ -158,7 +154,7 @@ function openIn(
   );
 }
 
-describe("@bundu/siafudb-web in headless Chromium", () => {
+describe(`@bundu/siafudb-web in a headless browser (${browserName})`, () => {
   it("create + query with hostile parameters, typed results, persist() and estimate()", async () => {
     const page = await newPage();
     const opened = await openIn(page, "hostile");
