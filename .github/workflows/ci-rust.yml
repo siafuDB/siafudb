@@ -9,7 +9,7 @@ name: CI / Rust
 on:
   pull_request:
   push:
-    branches: [main, staging]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:

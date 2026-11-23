@@ -21,7 +21,6 @@
 version: 2
 updates:
   - package-ecosystem: "github-actions"
-    target-branch: "staging"
     directory: "/"
     cooldown:
       default-days: 7
@@ -43,7 +42,6 @@ updates:
         update-types: ["major", "minor", "patch"]
 
   - package-ecosystem: "cargo"
-    target-branch: "staging"
     directory: "/"
     cooldown:
       default-days: 7
@@ -70,7 +68,6 @@ updates:
   # JavaScript/TypeScript workspaces (packages/*, apps/*). Node >= 24 only.
   # The root package.json owns the workspace lockfile, so "/" covers both.
   - package-ecosystem: "npm"
-    target-branch: "staging"
     directory: "/"
     cooldown:
       default-days: 7
