@@ -408,7 +408,7 @@ async function doInit(a: InitArgs): Promise<InitResult> {
   await wasmReady;
   const release = await acquireLock(a.name, a.lock, a.lockTimeoutMs);
   try {
-    const backend = chooseBackend(a.name, a.backend);
+    const backend = await chooseBackend(a.name, a.backend);
     const store = new EncryptedSnapshotStore(
       a.name,
       backend,

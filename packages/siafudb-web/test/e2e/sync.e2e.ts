@@ -29,12 +29,8 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type Page,
-} from "playwright";
+import { type Browser, type BrowserContext, type Page } from "playwright";
+import { browserName, browserType } from "./browser.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { SiafuDB, SyncStatus } from "../../src/index.js";
 
@@ -171,7 +167,7 @@ beforeAll(async () => {
   const started = await startRelay(relayDir);
   mainRelay = started.child;
   relayUrl = started.url;
-  browser = await chromium.launch();
+  browser = await browserType.launch();
 });
 
 afterAll(async () => {
@@ -859,7 +855,7 @@ describe.skipIf(!relayBin)("sync between two browser contexts", () => {
     const backup = `${profile}.backup`;
     return {
       async launch() {
-        const ctx = await chromium.launchPersistentContext(profile);
+        const ctx = await browserType.launchPersistentContext(profile);
         const d = await newDevice(label, ctx);
         const opened = await openDb(d, dbName);
         return { d, opened };

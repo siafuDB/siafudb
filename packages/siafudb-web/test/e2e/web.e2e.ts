@@ -3,12 +3,13 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { type Browser, type BrowserContext, type Page } from "playwright";
 import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type Page,
-} from "playwright";
+  browserName,
+  browserType,
+  defaultBackend,
+  hasOpfs,
+} from "./browser.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { SiafuDB } from "../../src/index.js";
 
@@ -59,7 +60,7 @@ beforeAll(async () => {
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  browser = await chromium.launch();
+  browser = await browserType.launch();
   ctx = await browser.newContext();
 });
 
@@ -158,13 +159,13 @@ function openIn(
   );
 }
 
-describe("@bundu/siafudb-web in headless Chromium", () => {
+describe(`@bundu/siafudb-web in a headless browser (${browserName})`, () => {
   it("create + query with hostile parameters, typed results, persist() and estimate()", async () => {
     const page = await newPage();
     const opened = await openIn(page, "hostile");
     expect(isFailure(opened)).toBe(false);
     if (isFailure(opened)) return;
-    expect(opened.backend).toBe("opfs");
+    expect(opened.backend).toBe(defaultBackend);
     expect(opened.restored).toBe(false);
     expect([true, false, null]).toContain(opened.persisted);
 
@@ -236,42 +237,48 @@ describe("@bundu/siafudb-web in headless Chromium", () => {
     await page.close();
   });
 
-  it("persists to OPFS, survives reload, and the raw OPFS bytes are ciphertext", async () => {
-    const page = await newPage();
-    await openIn(page, "persist1", { autosaveMs: 0 });
-    await page.evaluate(async (marker) => {
-      const db = (window as unknown as { db: SiafuDB }).db;
-      for (let i = 0; i < 50; i++)
-        await db.execute("CREATE (:Doc {id: $i, note: $m})", { i, m: marker });
-      await db.flush();
-      await db.close();
-    }, MARKER);
+  it.skipIf(!hasOpfs)(
+    "persists to OPFS, survives reload, and the raw OPFS bytes are ciphertext",
+    async () => {
+      const page = await newPage();
+      await openIn(page, "persist1", { autosaveMs: 0 });
+      await page.evaluate(async (marker) => {
+        const db = (window as unknown as { db: SiafuDB }).db;
+        for (let i = 0; i < 50; i++)
+          await db.execute("CREATE (:Doc {id: $i, note: $m})", {
+            i,
+            m: marker,
+          });
+        await db.flush();
+        await db.close();
+      }, MARKER);
 
-    const raw = await readOpfs(page, "persist1");
-    const present = raw.filter((b) => b.length > 0);
-    expect(present.length).toBeGreaterThan(0);
-    for (const b of present) {
-      expect(hasMarker(b)).toBe(false);
-      expect(Buffer.from(b.slice(0, 4)).toString()).toBe("SFDB");
-    }
+      const raw = await readOpfs(page, "persist1");
+      const present = raw.filter((b) => b.length > 0);
+      expect(present.length).toBeGreaterThan(0);
+      for (const b of present) {
+        expect(hasMarker(b)).toBe(false);
+        expect(Buffer.from(b.slice(0, 4)).toString()).toBe("SFDB");
+      }
 
-    await page.reload();
-    const again = await openIn(page, "persist1");
-    expect(isFailure(again)).toBe(false);
-    if (isFailure(again)) return;
-    expect(again.backend).toBe("opfs");
-    expect(again.restored).toBe(true);
-    const q = await page.evaluate(async () => {
-      const db = (window as unknown as { db: SiafuDB }).db;
-      return {
-        count: await db.query("MATCH (d:Doc) RETURN count(d)"),
-        one: await db.query("MATCH (d:Doc {id: $i}) RETURN d.note", { i: 7 }),
-      };
-    });
-    expect(q.count.rows).toEqual([[50]]);
-    expect(q.one.rows).toEqual([[MARKER]]);
-    await page.close();
-  });
+      await page.reload();
+      const again = await openIn(page, "persist1");
+      expect(isFailure(again)).toBe(false);
+      if (isFailure(again)) return;
+      expect(again.backend).toBe(defaultBackend);
+      expect(again.restored).toBe(true);
+      const q = await page.evaluate(async () => {
+        const db = (window as unknown as { db: SiafuDB }).db;
+        return {
+          count: await db.query("MATCH (d:Doc) RETURN count(d)"),
+          one: await db.query("MATCH (d:Doc {id: $i}) RETURN d.note", { i: 7 }),
+        };
+      });
+      expect(q.count.rows).toEqual([[50]]);
+      expect(q.one.rows).toEqual([[MARKER]]);
+      await page.close();
+    },
+  );
 
   it("debounced autosave persists without flush() or close()", async () => {
     const page = await newPage();
@@ -310,53 +317,59 @@ describe("@bundu/siafudb-web in headless Chromium", () => {
     await page.close();
   });
 
-  it("rejects tampered bytes in OPFS (every slot) with TamperError", async () => {
-    const page = await newPage();
-    await openIn(page, "tamper1", { autosaveMs: 0 });
-    await page.evaluate(async (m) => {
-      const db = (window as unknown as { db: SiafuDB }).db;
-      await db.execute("CREATE (:Doc {note: $m})", { m });
-      await db.flush();
-      await db.close();
-    }, MARKER);
-    const raw = await readOpfs(page, "tamper1");
-    const evil = raw.map((b) => {
-      const c = b.slice();
-      if (c.length) c[c.length >> 1] = c[c.length >> 1]! ^ 1;
-      return c;
-    });
-    await writeOpfs(page, "tamper1", evil);
-    const res = await openIn(page, "tamper1");
-    expect(isFailure(res) && res.failed.name).toBe("TamperError");
-    expect(isFailure(res) && res.failed.code).toBe("tamper");
-    // the failed open must not leave the single-writer lock held
-    await writeOpfs(page, "tamper1", raw);
-    const ok = await openIn(page, "tamper1");
-    expect(isFailure(ok)).toBe(false);
-    await page.close();
-  });
-
-  it("rejects a rolled-back (older, perfectly valid) snapshot with RollbackError", async () => {
-    const page = await newPage();
-    await openIn(page, "rollback1", { autosaveMs: 0 });
-    const save = (v: string) =>
-      page.evaluate(async (v) => {
+  it.skipIf(!hasOpfs)(
+    "rejects tampered bytes in OPFS (every slot) with TamperError",
+    async () => {
+      const page = await newPage();
+      await openIn(page, "tamper1", { autosaveMs: 0 });
+      await page.evaluate(async (m) => {
         const db = (window as unknown as { db: SiafuDB }).db;
-        await db.execute("CREATE (:V {v: $v})", { v });
+        await db.execute("CREATE (:Doc {note: $m})", { m });
         await db.flush();
-      }, v);
-    await save("v1");
-    const old = await readOpfs(page, "rollback1");
-    await save("v2");
-    await save("v3");
-    await page.evaluate(() =>
-      (window as unknown as { db: SiafuDB }).db.close(),
-    );
-    await writeOpfs(page, "rollback1", old); // attacker restores the old, authentic files
-    const res = await openIn(page, "rollback1");
-    expect(isFailure(res) && res.failed.name).toBe("RollbackError");
-    await page.close();
-  });
+        await db.close();
+      }, MARKER);
+      const raw = await readOpfs(page, "tamper1");
+      const evil = raw.map((b) => {
+        const c = b.slice();
+        if (c.length) c[c.length >> 1] = c[c.length >> 1]! ^ 1;
+        return c;
+      });
+      await writeOpfs(page, "tamper1", evil);
+      const res = await openIn(page, "tamper1");
+      expect(isFailure(res) && res.failed.name).toBe("TamperError");
+      expect(isFailure(res) && res.failed.code).toBe("tamper");
+      // the failed open must not leave the single-writer lock held
+      await writeOpfs(page, "tamper1", raw);
+      const ok = await openIn(page, "tamper1");
+      expect(isFailure(ok)).toBe(false);
+      await page.close();
+    },
+  );
+
+  it.skipIf(!hasOpfs)(
+    "rejects a rolled-back (older, perfectly valid) snapshot with RollbackError",
+    async () => {
+      const page = await newPage();
+      await openIn(page, "rollback1", { autosaveMs: 0 });
+      const save = (v: string) =>
+        page.evaluate(async (v) => {
+          const db = (window as unknown as { db: SiafuDB }).db;
+          await db.execute("CREATE (:V {v: $v})", { v });
+          await db.flush();
+        }, v);
+      await save("v1");
+      const old = await readOpfs(page, "rollback1");
+      await save("v2");
+      await save("v3");
+      await page.evaluate(() =>
+        (window as unknown as { db: SiafuDB }).db.close(),
+      );
+      await writeOpfs(page, "rollback1", old); // attacker restores the old, authentic files
+      const res = await openIn(page, "rollback1");
+      expect(isFailure(res) && res.failed.name).toBe("RollbackError");
+      await page.close();
+    },
+  );
 
   it("falls back to IndexedDB when OPFS is unavailable; ciphertext only; survives reload; tamper rejected", async () => {
     const page = await newPage();
@@ -429,6 +442,43 @@ describe("@bundu/siafudb-web in headless Chromium", () => {
     );
     const bad = await openIn(page, "idb1", { workerUrl });
     expect(isFailure(bad) && bad.failed.name).toBe("TamperError");
+    await page.close();
+  });
+
+  it("falls back to IndexedDB when OPFS is present but refuses to work; asking for OPFS says why", async () => {
+    const page = await newPage();
+    const workerUrl = `${origin}/test/e2e/site/worker-opfs-refuses.js`;
+    const opened = await openIn(page, "refuse1", { workerUrl, autosaveMs: 0 });
+    expect(isFailure(opened) ? opened.failed.message : opened.backend).toBe(
+      "idb",
+    );
+    await page.evaluate(async () => {
+      const db = (window as unknown as { db: SiafuDB }).db;
+      await db.execute("CREATE (:Doc {id: 1})");
+      await db.close();
+    });
+
+    await page.reload();
+    const again = await openIn(page, "refuse1", { workerUrl });
+    expect(isFailure(again) ? again.failed.message : again.backend).toBe("idb");
+    const q = await page.evaluate(() =>
+      (window as unknown as { db: SiafuDB }).db.query(
+        "MATCH (d:Doc) RETURN count(d)",
+      ),
+    );
+    expect(q.rows).toEqual([[1]]);
+    await page.evaluate(() =>
+      (window as unknown as { db: SiafuDB }).db.close(),
+    );
+
+    // An explicit request for OPFS is not silently redirected.
+    const forced = await openIn(page, "refuse2", {
+      workerUrl,
+      backend: "opfs",
+    });
+    expect(isFailure(forced) && forced.failed.message).toMatch(
+      /OPFS is present but cannot be used/,
+    );
     await page.close();
   });
 
