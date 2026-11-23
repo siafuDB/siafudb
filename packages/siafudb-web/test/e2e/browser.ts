@@ -17,3 +17,14 @@ if (!chosen) {
 }
 
 export const browserType: BrowserType = chosen;
+
+/**
+ * Whether the engine under test has a usable OPFS. Playwright's WebKit build
+ * exposes the OPFS API but refuses to open files in it, which is also what
+ * Safari does in private browsing; the package then stores in IndexedDB.
+ * Safari itself has a working OPFS outside private browsing.
+ */
+export const hasOpfs = browserName !== "webkit";
+
+/** The storage backend `open()` is expected to pick on this engine. */
+export const defaultBackend = hasOpfs ? "opfs" : "idb";

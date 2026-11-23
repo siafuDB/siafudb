@@ -134,17 +134,48 @@ export class IdbBackend implements BlobBackend {
   async close(): Promise<void> {}
 }
 
-/** Pick a backend: OPFS when available and allowed, else IndexedDB. */
-export function chooseBackend(
+/**
+ * True when OPFS can actually be used here, not merely that its API exists.
+ *
+ * Some contexts expose the API and then refuse every call: Safari in private
+ * browsing, WebKit contexts without persistent storage, origins whose storage
+ * is blocked by policy. The only reliable test is to do what the backend
+ * does: get the directory, create a file and open a sync access handle on it.
+ */
+export async function opfsUsable(): Promise<boolean> {
+  if (!opfsAvailable()) return false;
+  const probe = `siafudb-probe-${Math.random().toString(36).slice(2)}`;
+  try {
+    const root = await navigator.storage.getDirectory();
+    const fh = await root.getFileHandle(probe, { create: true });
+    const h = await fh.createSyncAccessHandle();
+    h.close();
+    await root.removeEntry(probe).catch(() => undefined);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pick a backend: OPFS when it works and is allowed, else IndexedDB.
+ *
+ * `auto` falls back to IndexedDB when OPFS is missing or unusable. A database
+ * that was stored in OPFS before is not silently opened empty from IndexedDB:
+ * the store's rollback check refuses that with `RollbackError`.
+ */
+export async function chooseBackend(
   name: string,
   want: "auto" | "opfs" | "idb",
-): BlobBackend {
+): Promise<BlobBackend> {
   if (want === "idb") return new IdbBackend(name);
-  if (opfsAvailable()) return new OpfsBackend(name);
+  if (await opfsUsable()) return new OpfsBackend(name);
   if (want === "opfs")
     throw new SiafuError(
       "storage",
-      "OPFS with sync access handles is not available in this context",
+      opfsAvailable()
+        ? "OPFS is present but cannot be used in this context (private browsing, or storage is blocked)"
+        : "OPFS with sync access handles is not available in this context",
     );
   return new IdbBackend(name);
 }
