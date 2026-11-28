@@ -16,4 +16,4 @@ permissions:
 
 jobs:
   lint:
-    uses: nyuchi/.github/.github/workflows/reusable-pr-title-lint.yml@0e026639ad69fef58704e114e1db4401a1c5f0ba  # v0.18.0
+    uses: nyuchi/.github/.github/workflows/reusable-pr-title-lint.yml@ef07da8dfce087c16ea643607a49d8ecdbe1907e  # v0.40.0
