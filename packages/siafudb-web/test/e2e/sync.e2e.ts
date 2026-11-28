@@ -444,7 +444,14 @@ describe.skipIf(!relayBin)("sync between two browser contexts", () => {
       await rows(b, "MATCH (n:Pinned) RETURN n.text, n.stars, labels(n)"),
     ).toEqual([[`it's "quoted" \\ 🐜`, 3, ["Note", "Pinned"]]]);
 
-    // B was told, so an app could re-run its queries.
+    // B was told, so an app could re-run its queries. The notice reaches the
+    // page just after the data is readable, so wait for it instead of reading
+    // the counters the instant the graphs match (it raced, in WebKit).
+    await until(
+      "B to be told of the four remote changes",
+      async () => (await remote(b)).changes >= 4,
+      async () => remote(b),
+    );
     const told = await remote(b);
     expect(told.events).toBeGreaterThan(0);
     expect(told.changes).toBe(4);
