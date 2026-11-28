@@ -248,27 +248,23 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before participating in an
 
 ## Versioning
 
-Releases follow the org versioning policy
-([nyuchi/.github#80](https://github.com/nyuchi/.github/issues/80)). The
-branch decides the bump, and there are no version labels:
+Every release follows the org policy
+([#80](https://github.com/nyuchi/.github/issues/80)):
 
-- **A merge into `staging`** (the live beta) is tagged as the next
-  **patch** automatically, by `staging-version.yml`.
-- **A release to `main`** is the next **minor** above the highest tag. The
-  PR that releases sets `[workspace.package] version` in `Cargo.toml` to it. CI refuses any other version
-  and names the right one.
-- **A major** is only ever made by hand: the owner runs the release
-  workflow from the Actions tab with `bump: major`.
-- Each segment holds 0–999. Patch 999 rolls into the next minor; minor 999
-  stops and asks for a manual major.
+- **Trunk-based, `main` only.** There is no `staging` branch.
+- **A merge to `main` titled `fix:`, `chore:`, `docs:` or `ci:` is a
+  PATCH** (x.y.z → x.y.z+1). It is tagged automatically.
+- **A merge to `main` titled `feat:` is a MINOR** (x.y.z → x.y+1.0).
+- **A MAJOR is manual only**: the owner runs the release workflow with
+  `bump: major`. Automation never makes one.
+- Minor and patch have no upper limit: patch 999 is followed by patch
+  1000, minor 999 by minor 1000. Only a major is manual.
+- `workflow_dispatch` on a release workflow takes
+  `bump: patch|minor|major` as a manual override.
 
-Versions released before 2026-10-04 are not renumbered.
-
-## Licence
-
-By contributing to SiafuDB, you agree that your contributions will be licensed under the [Apache License, Version 2.0](LICENSE). You retain copyright over your contributions.
-
-The Apache 2.0 licence will never change. This is structurally guaranteed by the Bundu Foundation's charter — not a corporate promise that can be reversed.
+There are no version labels. Released versions are never renumbered.
+The calculator is
+[`.github/actions/next-version`](./.github/actions/next-version).
 
 ---
 
