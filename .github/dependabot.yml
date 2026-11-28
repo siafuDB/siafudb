@@ -71,6 +71,10 @@ updates:
     directory: "/"
     cooldown:
       default-days: 7
+    # Until Astro and typescript-eslint support TS 7; remove then.
+    ignore:
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
     schedule:
       interval: "weekly"
       day: "monday"

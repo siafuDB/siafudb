@@ -42,7 +42,7 @@
   "devDependencies": {
     "@types/node": "^26",
     "playwright": "1.65.1",
-    "typescript": "^7",
+    "typescript": "^6.0.3",
     "vitest": "^5"
   }
 }
